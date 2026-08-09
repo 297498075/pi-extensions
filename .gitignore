@@ -1,0 +1,23 @@
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Pi local state and installed package caches
+.pi/npm/
+.pi/git/
+.pi/sessions/
+.pi/settings.json
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

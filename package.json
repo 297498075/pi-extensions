@@ -1,0 +1,58 @@
+{
+  "name": "pi-extensions",
+  "version": "0.1.0",
+  "description": "Extensions, skills, prompt templates, and themes for the Pi coding agent",
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "validate": "node ./scripts/validate-package.mjs",
+    "test": "npm run check && npm run validate"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "coding-agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/297498075/pi-extensions.git"
+  },
+  "bugs": {
+    "url": "https://github.com/297498075/pi-extensions/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "extensions",
+    "skills",
+    "prompts",
+    "themes",
+    "README.md",
+    "docs",
+    "AGENTS.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ],
+    "prompts": [
+      "./prompts"
+    ],
+    "themes": [
+      "./themes"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.84.1"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}
