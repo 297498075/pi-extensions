@@ -82,6 +82,16 @@ function maxFollowups(pi: ExtensionAPI): number {
 	return Number.isSafeInteger(max) && max >= 0 ? max : DEFAULT_MAX_FOLLOWUPS;
 }
 
+function operationAborted(message: unknown): boolean {
+	if (!isRecord(message) || message.role !== "assistant") return false;
+	if (message.stopReason === "aborted") return true;
+
+	const details = [assistantText(message), message.errorMessage]
+		.filter((value): value is string => typeof value === "string")
+		.join("\n");
+	return /\boperation aborted\b/i.test(details);
+}
+
 function explicitlyCannotContinue(message: unknown): boolean {
 	const text = assistantText(message);
 	if (!text) return false;
@@ -110,6 +120,7 @@ export default function todoLoop(pi: ExtensionAPI): void {
 		if (!state || state.remaining === 0) return;
 
 		const lastAssistant = [...event.messages].reverse().find((message) => assistantText(message) !== undefined);
+		if (operationAborted(lastAssistant)) return;
 		if (explicitlyCannotContinue(lastAssistant)) return;
 
 		const used = followupCount(ctx);

@@ -75,7 +75,7 @@ Keep agent-level retry enabled in `settings.json` (the default), and configure i
 
 `extensions/todo-loop.ts` continues the agent when the latest structured todo state still contains unfinished items. It reads `details.tasks` from `@juicesharp/rpiv-todo` and also accepts the `details.todos` format used by Pi's example todo extension. It also understands the `plan-mode` execution state used by Pi's example extension.
 
-When an agent run ends, the extension queues a follow-up user message if Pi is not already retrying or compacting. It stops when all todos are complete, the final assistant text explicitly says it cannot continue, or the follow-up limit is reached. The default limit is 20 automatic follow-ups; configure it with a CLI flag:
+When an agent run ends, the extension queues a follow-up user message if Pi is not already retrying or compacting. It stops when all todos are complete, the final assistant text explicitly says it cannot continue, the operation was aborted by the user, or the follow-up limit is reached. The default limit is 20 automatic follow-ups; configure it with a CLI flag:
 
 ```bash
 pi --todo-loop-max-followups 50
