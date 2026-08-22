@@ -1,5 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
+const DEFAULT_MAX_FOLLOWUPS = 20;
+const MAX_FOLLOWUPS_FLAG = "todo-loop-max-followups";
+
 const CONTINUE_PROMPT =
 	"Continue working on the remaining todo items. Start with the first unfinished item, update the todo list as you progress, and do not stop while any todo remains unfinished. If you truly cannot continue, explicitly say that you cannot continue.";
 
@@ -56,6 +59,29 @@ function assistantText(message: unknown): string | undefined {
 		.join("\n");
 }
 
+function userText(message: unknown): string | undefined {
+	if (!isRecord(message) || message.role !== "user") return undefined;
+	if (typeof message.content === "string") return message.content;
+	if (!Array.isArray(message.content)) return undefined;
+
+	return message.content
+		.filter((block): block is Record<string, unknown> => isRecord(block) && block.type === "text")
+		.map((block) => (typeof block.text === "string" ? block.text : ""))
+		.join("\n");
+}
+
+function followupCount(ctx: ExtensionContext): number {
+	return [...ctx.sessionManager.getBranch()].filter(
+		(entry) => entry.type === "message" && userText(entry.message) === CONTINUE_PROMPT,
+	).length;
+}
+
+function maxFollowups(pi: ExtensionAPI): number {
+	const value = pi.getFlag(MAX_FOLLOWUPS_FLAG);
+	const max = typeof value === "string" ? Number(value) : Number.NaN;
+	return Number.isSafeInteger(max) && max >= 0 ? max : DEFAULT_MAX_FOLLOWUPS;
+}
+
 function explicitlyCannotContinue(message: unknown): boolean {
 	const text = assistantText(message);
 	if (!text) return false;
@@ -67,6 +93,14 @@ function explicitlyCannotContinue(message: unknown): boolean {
 }
 
 export default function todoLoop(pi: ExtensionAPI): void {
+	pi.registerFlag(MAX_FOLLOWUPS_FLAG, {
+		description: "Maximum automatic todo follow-ups (0 disables)",
+		type: "string",
+		default: String(DEFAULT_MAX_FOLLOWUPS),
+	});
+
+	let limitNotified = false;
+
 	pi.on("agent_end", (event, ctx) => {
 		// Pi will handle its own retry or compaction retry; wait for that first.
 		if ((event as typeof event & { willRetry?: boolean }).willRetry) return;
@@ -78,7 +112,16 @@ export default function todoLoop(pi: ExtensionAPI): void {
 		const lastAssistant = [...event.messages].reverse().find((message) => assistantText(message) !== undefined);
 		if (explicitlyCannotContinue(lastAssistant)) return;
 
-		// ponytail: intentionally unbounded by request; add a retry budget if runaway loops become a problem.
+		const used = followupCount(ctx);
+		const limit = maxFollowups(pi);
+		if (used >= limit) {
+			if (!limitNotified) {
+				ctx.ui.notify(`todo-loop stopped after ${limit} automatic follow-ups`, "warning");
+				limitNotified = true;
+			}
+			return;
+		}
+
 		pi.sendUserMessage(CONTINUE_PROMPT, { deliverAs: "followUp" });
 	});
 }
