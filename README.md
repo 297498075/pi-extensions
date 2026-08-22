@@ -73,11 +73,11 @@ Keep agent-level retry enabled in `settings.json` (the default), and configure i
 
 ## Todo Loop
 
-`extensions/todo-loop.ts` continues the agent when the latest structured todo state still contains unfinished items. It reads `todo`/`todos` tool results from the current session branch, and also understands the `plan-mode` execution state used by Pi's example extension.
+`extensions/todo-loop.ts` continues the agent when the latest structured todo state still contains unfinished items. It reads `details.tasks` from `@juicesharp/rpiv-todo` and also accepts the `details.todos` format used by Pi's example todo extension. It also understands the `plan-mode` execution state used by Pi's example extension.
 
 When an agent run ends, the extension queues a follow-up user message if Pi is not already retrying or compacting. It stops only when all todos are complete or the final assistant text explicitly says it cannot continue, cannot proceed, or cannot complete the work. The loop has no retry limit by design, so use it with a finite todo list and keep agent-level retry settings enabled.
 
-The extension has no network, file, command, or external state side effects. The todo extension that owns the `todo` tool must be loaded separately; this extension only observes its persisted `details.todos` state.
+The extension has no network, file, command, or external state side effects. The todo extension that owns the `todo` tool must be loaded separately; this extension only observes its persisted task state (`details.tasks` or `details.todos`).
 
 ## Pi package
 

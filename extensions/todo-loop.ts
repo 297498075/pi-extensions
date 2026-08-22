@@ -15,7 +15,13 @@ function remainingTodos(value: unknown): number | undefined {
 	if (!Array.isArray(value) || value.some((item) => !isRecord(item))) return undefined;
 
 	return value.filter((item) => {
-		return item.done !== true && item.completed !== true && item.status !== "done" && item.status !== "completed";
+		return (
+			item.status !== "deleted" &&
+			item.done !== true &&
+			item.completed !== true &&
+			item.status !== "done" &&
+			item.status !== "completed"
+		);
 	}).length;
 }
 
@@ -26,7 +32,7 @@ function latestTodoState(ctx: ExtensionContext): TodoState | undefined {
 		if (entry.type === "message" && entry.message.role === "toolResult") {
 			if (entry.message.toolName !== "todo" && entry.message.toolName !== "todos") continue;
 			const details = isRecord(entry.message.details) ? entry.message.details : undefined;
-			const remaining = remainingTodos(details?.todos);
+			const remaining = remainingTodos(details?.tasks ?? details?.todos);
 			if (remaining !== undefined) state = { remaining };
 		}
 
