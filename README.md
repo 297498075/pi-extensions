@@ -46,6 +46,31 @@ pi --extension ./extensions/example.ts
 
 命名使用小写 kebab-case；运行时依赖放在 `dependencies`，Pi core 依赖放在 `peerDependencies`。完整规则见 [`AGENTS.md`](AGENTS.md) 和 [`docs/development.md`](docs/development.md)。
 
+## Stream Read Retry
+
+`extensions/stream-read-retry.ts` fixes a gap in Pi's built-in retry classification. Pi already has agent-level retry with exponential backoff, but `stream_read_error` is not included in the transient-error matcher, so the run ends immediately. This extension rewrites only that assistant error to include `Network error`, which lets Pi's existing retry flow handle it while preserving the original text.
+
+Load the package or the extension directly:
+
+```bash
+pi --extension .
+pi --extension ./extensions/stream-read-retry.ts
+```
+
+Keep agent-level retry enabled in `settings.json` (the default), and configure its budget if needed:
+
+```json
+{
+  "retry": {
+    "enabled": true,
+    "maxRetries": 3,
+    "baseDelayMs": 2000
+  }
+}
+```
+
+`retry.provider.maxRetries` controls provider SDK retries and does not enable Pi's agent-level retry. The extension has no network, file, or command side effects; it only changes the final assistant error text, which Pi may persist in session history.
+
 ## Pi package
 
 ```bash
