@@ -163,7 +163,10 @@ class RollingToolsWidgetComponent implements Component {
 
 		// 1. Thinking 状态块（仅在思考中展示动画与秒表；思考完成保持常驻，直到正文流式输出才退场）
 		if (this.state.thinkingStatus === "thinking") {
-			const elapsedSec = ((Date.now() - this.state.thinkingStartTime) / 1000).toFixed(1);
+			const elapsedMs = this.state.thinkingDurationMs > 0
+				? this.state.thinkingDurationMs
+				: Math.max(0, Date.now() - this.state.thinkingStartTime);
+			const elapsedSec = (elapsedMs / 1000).toFixed(1);
 			const spinner = SPINNER_FRAMES[Math.floor(Date.now() / 150) % SPINNER_FRAMES.length];
 			lines.push(` ${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", `${spinner} 思考中...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`);
 			this.lineMap.push(null);
@@ -358,15 +361,24 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				syncWidget(ctx);
 			}
 		} else if (ev.type === "thinking_end") {
-			const elapsed = Date.now() - state.thinkingStartTime;
-			const remaining = Math.max(0, MIN_THINKING_DISPLAY_MS - elapsed);
-			setTimeout(() => {
-				stopThinkingTimer();
-				// 思考结束更新为“思考完成”，绝不提前退场，继续常驻！
+			// 立即捕获模型真实的思考耗时，秒表严格定格在真实耗时，绝不把动画延迟算入思考时间！
+			const actualDuration = Math.max(100, Date.now() - (state.thinkingStartTime || Date.now()));
+			state.thinkingDurationMs = actualDuration;
+			stopThinkingTimer();
+
+			// 检查是否需要补足最小可见动画时间（仅为了人眼能看见动画帧，时间数值严格不变）
+			const elapsedSoFar = Date.now() - state.thinkingStartTime;
+			const remainingAnimDelay = Math.max(0, MIN_THINKING_DISPLAY_MS - elapsedSoFar);
+
+			if (remainingAnimDelay > 0) {
+				setTimeout(() => {
+					state.thinkingStatus = "completed";
+					syncWidget(ctx);
+				}, remainingAnimDelay);
+			} else {
 				state.thinkingStatus = "completed";
-				state.thinkingDurationMs = Date.now() - (state.thinkingStartTime || Date.now());
 				syncWidget(ctx);
-			}, remaining);
+			}
 		}
 
 		// 正文流式输出时：思考状态才正式退场让位给正文！
