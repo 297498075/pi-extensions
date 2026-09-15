@@ -2,7 +2,6 @@ import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
-	createBashTool,
 	createFindTool,
 	createGrepTool,
 	createLsTool,
@@ -54,63 +53,6 @@ interface WidgetState {
 const MAX_RECENT_TOOLS = 3;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MIN_THINKING_DISPLAY_MS = 1500; // 保证思考动画至少展示 1.5 秒
-
-/**
- * 纯只读命令集合
- */
-const SAFE_READONLY_COMMANDS = new Set([
-	"cat", "head", "tail", "more", "less",
-	"ls", "dir", "pwd", "cd",
-	"grep", "egrep", "fgrep", "find", "sort", "uniq", "wc", "cut",
-	"which", "where", "type", "whoami", "uname", "date",
-	"echo", "printf",
-	"git", "node", "npm", "dotnet", "python", "python3", "pnpm", "yarn",
-]);
-
-const SAFE_GIT_SUBCOMMANDS = new Set([
-	"status", "diff", "log", "branch", "show", "tag", "remote", "rev-parse", "describe",
-]);
-
-/**
- * 判断 Bash 命令是否属于纯只读探测（按换行符和运算符全面拆解）
- */
-function isSafeReadOnlyBashCommand(command?: string): boolean {
-	if (!command) return false;
-	const cmd = command.trim();
-
-	// 1. 任何重定向（> 或 >> 或 | tee）均为写操作
-	if (/>{1,2}/.test(cmd) || /\btee\b/.test(cmd)) {
-		return false;
-	}
-
-	// 2. 切割所有运算符和多行换行符（&&, ||, ;, |, \n）
-	const subCommands = cmd.split(/&&|\|\||;|\||\r?\n/).map((c) => c.trim()).filter(Boolean);
-	if (subCommands.length === 0) return false;
-
-	for (const sub of subCommands) {
-		const parts = sub.replace(/^[A-Za-z_][A-Za-z0-9_]*=\S*\s+/, "").split(/\s+/);
-		const mainBin = parts[0]?.toLowerCase();
-		if (!mainBin || !SAFE_READONLY_COMMANDS.has(mainBin)) {
-			return false;
-		}
-
-		if (mainBin === "git") {
-			const gitSub = parts[1]?.toLowerCase();
-			if (!gitSub || !SAFE_GIT_SUBCOMMANDS.has(gitSub)) {
-				return false;
-			}
-		}
-
-		if (["node", "npm", "dotnet", "python", "python3", "pnpm", "yarn"].includes(mainBin)) {
-			const isVersionOrHelp = parts.some((p) => /^-{1,2}(v|version|h|help|info)$/i.test(p));
-			if (!isVersionOrHelp) {
-				return false;
-			}
-		}
-	}
-
-	return true;
-}
 
 /**
  * 跨平台剪贴板复制
@@ -197,7 +139,7 @@ function extractSummaryAndMetadata(
 }
 
 /**
- * 原生动态组件：每一帧实时感知状态与鼠标位置，0ms 响应悬停展开与左右键复制
+ * 原生动态组件：0ms 响应鼠标悬停与点击，纯净展示
  */
 class RollingToolsWidgetComponent implements Component {
 	private tui: any;
@@ -219,7 +161,7 @@ class RollingToolsWidgetComponent implements Component {
 		const lines: string[] = [];
 		const theme = this.theme;
 
-		// 1. Thinking 状态（思考中动态转轮；思考完成保持常驻，直到正文流式输出）
+		// 1. Thinking 状态块（仅在思考中展示动画与秒表；思考完成保持常驻，直到正文流式输出才退场）
 		if (this.state.thinkingStatus === "thinking") {
 			const elapsedSec = ((Date.now() - this.state.thinkingStartTime) / 1000).toFixed(1);
 			const spinner = SPINNER_FRAMES[Math.floor(Date.now() / 150) % SPINNER_FRAMES.length];
@@ -245,7 +187,7 @@ class RollingToolsWidgetComponent implements Component {
 			lines.push(` ${icon} ${badge} ${name} ${summary}${time}`);
 			this.lineMap.push(t);
 
-			// 鼠标悬停展开：直接展示完整路径或完整命令，绝无“提示：[左右键...”教学行
+			// 鼠标悬停展开：直接展示完整路径或完整命令，无任何多余教学字样
 			if (this.state.hoveredItemId === t.id) {
 				if (t.fullPath) {
 					lines.push(`   ${theme.fg("accent", `↳ ${t.fullPath}`)}`);
@@ -260,7 +202,7 @@ class RollingToolsWidgetComponent implements Component {
 			}
 		}
 
-		// 3. 复制成功反馈（在组件内部优雅淡入淡出，0 污染正文）
+		// 3. 复制成功反馈（仅在 Widget 内部优雅提示，绝对不向下方状态栏或正文打多余字）
 		if (this.state.copyFeedbackMessage) {
 			lines.push(`   ${theme.fg("success", `↳ ${this.state.copyFeedbackMessage}`)}`);
 			this.lineMap.push(null);
@@ -276,7 +218,7 @@ class RollingToolsWidgetComponent implements Component {
 			this.lineMap.push(null);
 		}
 
-		// 5. 主要回复完成标识（仅在整个回合结束时附加展示）
+		// 5. 主回复完成标识（仅在整个 Agent 回复完全生成完毕后才附带显示）
 		if (this.state.completedMessage) {
 			lines.push(` ${theme.fg("success", `✓ ${this.state.completedMessage}`)}`);
 			this.lineMap.push(null);
@@ -286,7 +228,7 @@ class RollingToolsWidgetComponent implements Component {
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-		// 鼠标移动：根据 y 坐标精准匹配工具项，0ms 立即更新悬停项并重绘
+		// 鼠标移动：0ms 瞬间根据坐标匹配并展开
 		if (event.type === "move") {
 			const target = event.y >= 0 && event.y < this.lineMap.length ? this.lineMap[event.y] : null;
 			const targetId = target ? target.id : null;
@@ -298,7 +240,7 @@ class RollingToolsWidgetComponent implements Component {
 			return undefined;
 		}
 
-		// 鼠标点击（左键或右键）
+		// 鼠标点击（左键或右键）：复制到剪贴板，仅在 Widget 内部给反馈，不碰状态栏！
 		if (event.type === "click") {
 			const target = event.y >= 0 && event.y < this.lineMap.length ? this.lineMap[event.y] : null;
 			if (!target) return undefined;
@@ -306,24 +248,19 @@ class RollingToolsWidgetComponent implements Component {
 			// Ctrl + 左键：打开文件
 			if (event.ctrl && target.fullPath) {
 				openFile(target.fullPath);
-				this.ctx.ui.setStatus("clipboard", this.theme.fg("accent", `正在打开文件: ${truncate(target.fullPath, 40)}`));
-				setTimeout(() => this.ctx.ui.setStatus("clipboard", undefined), 2500);
 				return { handled: true };
 			}
 
-			// 左右键点击：复制文件完整路径或完整命令（绝不向正文输出任何提示文字！）
+			// 左右键点击：复制文件完整路径或完整命令
 			const textToCopy = target.fullPath || target.fullCommand;
 			if (textToCopy) {
 				copyToClipboard(textToCopy);
 				const label = target.fullPath ? "完整路径" : "完整命令";
 				this.state.copyFeedbackMessage = `✓ 已复制${label}至剪贴板: ${truncate(textToCopy, 45)}`;
 
-				this.ctx.ui.setStatus("clipboard", this.theme.fg("success", `✓ 已复制${label}到剪贴板`));
-
 				if (this.copyFeedbackTimer) clearTimeout(this.copyFeedbackTimer);
 				this.copyFeedbackTimer = setTimeout(() => {
 					this.state.copyFeedbackMessage = null;
-					this.ctx.ui.setStatus("clipboard", undefined);
 					this.tui?.requestRender?.();
 				}, 2500);
 
@@ -383,7 +320,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		);
 	}
 
-	// 1. 用户提问（新一轮交互开始）时重置所有状态
+	// 1. 用户提问开始（新一轮 Agent 运行）时重置
 	pi.on("agent_start", async (_event, ctx) => {
 		stopThinkingTimer();
 		state.recentTools = [];
@@ -400,8 +337,8 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 	// 2. 消息流式事件：
 	// - 保证思考动画最少可见 1.5 秒
-	// - 思考完成更新为“思考完成”并常驻，直到正文流式输出才退场
-	// - 彻底过滤正文中的 thinking 块，消除占位符与空行！
+	// - 思考完成就更新为“思考完成”并常驻，直到正文流式输出才退场
+	// - 绝不在 turn_end 或工具之间把思考状态删掉！
 	pi.on("message_update", async (event, ctx) => {
 		if (event.message?.role === "assistant" && Array.isArray(event.message.content)) {
 			event.message.content = event.message.content.filter((c: any) => c.type !== "thinking");
@@ -421,19 +358,18 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				syncWidget(ctx);
 			}
 		} else if (ev.type === "thinking_end") {
-			// 保证思考动画至少展示 MIN_THINKING_DISPLAY_MS，避免一闪而过
 			const elapsed = Date.now() - state.thinkingStartTime;
 			const remaining = Math.max(0, MIN_THINKING_DISPLAY_MS - elapsed);
 			setTimeout(() => {
 				stopThinkingTimer();
-				// 思考结束更新为“思考完成”，绝不提前退场，继续在 Widget 顶部常驻
+				// 思考结束更新为“思考完成”，绝不提前退场，继续常驻！
 				state.thinkingStatus = "completed";
 				state.thinkingDurationMs = Date.now() - (state.thinkingStartTime || Date.now());
 				syncWidget(ctx);
 			}, remaining);
 		}
 
-		// 正文流式输出时：思考状态才正式退场让位！
+		// 正文流式输出时：思考状态才正式退场让位给正文！
 		const isTextStreaming =
 			ev.type === "text_start" ||
 			(ev.type === "text_delta" && typeof ev.delta === "string" && ev.delta.trim().length > 0);
@@ -457,15 +393,16 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		}
 	});
 
-	// 3. 回合执行结束：主要回复已全部生成完成，展示 Completed
-	pi.on("turn_end", async (_event, ctx) => {
+	// 3. 只有当整个 Agent 任务全部结束（正文生成完毕）后，才在底部展示 Completed！
+	// 绝不在 turn_end 中过早展示 Completed！
+	pi.on("agent_end", async (_event, ctx) => {
 		stopThinkingTimer();
 		state.thinkingStatus = "idle";
 		state.completedMessage = "Completed";
 		syncWidget(ctx);
 	});
 
-	// 4. 工具调用开始：工具常驻加入队列，如果有下一次思考，后续事件会再次激活思考中
+	// 4. 工具调用开始
 	pi.on("tool_call", async (event, ctx) => {
 		totalToolCount++;
 
@@ -521,31 +458,24 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			if (args === "off") {
 				enabled = false;
 				syncWidget(ctx);
-				ctx.ui.setStatus("rolling-tools", "Rolling tools disabled");
-				setTimeout(() => ctx.ui.setStatus("rolling-tools", undefined), 2000);
 			} else if (args === "on") {
 				enabled = true;
 				syncWidget(ctx);
-				ctx.ui.setStatus("rolling-tools", "Rolling tools enabled");
-				setTimeout(() => ctx.ui.setStatus("rolling-tools", undefined), 2000);
 			} else {
 				enabled = !enabled;
 				syncWidget(ctx);
-				ctx.ui.setStatus("rolling-tools", `Rolling tools: ${enabled ? "enabled" : "disabled"}`);
-				setTimeout(() => ctx.ui.setStatus("rolling-tools", undefined), 2000);
 			}
 		},
 	});
 
-	// 7. 注册流控工具：read, bash, grep, find, ls
-	// edit 和 write 绝不在此覆写（由 pi-tool-display 进行 OpenCode 差分渲染）
+	// 7. 纯只读工具（read, grep, find, ls）在正文中做 0 行静音
+	// 【核心设计】：bash, edit, write 绝不覆写！100% 交由 pi-tool-display 独占进行正统 OpenCode 渲染！
 	const toolCache = new Map<string, any>();
 	function getTools(cwd: string) {
 		let tools = toolCache.get(cwd);
 		if (!tools) {
 			tools = {
 				read: createReadTool(cwd),
-				bash: createBashTool(cwd),
 				grep: createGrepTool(cwd),
 				find: createFindTool(cwd),
 				ls: createLsTool(cwd),
@@ -555,9 +485,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		return tools;
 	}
 
-	const managedTools = ["read", "bash", "grep", "find", "ls"] as const;
+	const readOnlyTools = ["read", "grep", "find", "ls"] as const;
 
-	for (const name of managedTools) {
+	for (const name of readOnlyTools) {
 		const initialTools = getTools(process.cwd());
 		const original = initialTools[name];
 
@@ -576,17 +506,6 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			renderShell: "self",
 
 			renderCall(args, theme, context) {
-				if (name === "bash") {
-					const isSafe = isSafeReadOnlyBashCommand(args?.command);
-					if (!context.expanded && isSafe) {
-						return new EmptyComponent();
-					}
-					// 仅渲染单行调用头，绝不包装冗余独立 Box
-					const title = theme.fg("toolTitle", theme.bold("$"));
-					const cmdDisplay = args?.command?.trim() || "";
-					return new Text(`${title} ${theme.fg("accent", truncate(cmdDisplay, 80))}`, 1, 0);
-				}
-
 				if (!context.expanded) {
 					return new EmptyComponent();
 				}
@@ -595,34 +514,10 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				return new Text(`${title} ${theme.fg("accent", summaryDisplay)}`, 0, 0);
 			},
 
-			renderResult(result, { expanded }, theme, context) {
-				// 报错绝不在正文留永久卡片（报错全由 Widget 临时 Alert 负责）
-				if (!expanded && result.isError) {
-					return new EmptyComponent();
-				}
-
-				if (name === "bash") {
-					const isSafe = isSafeReadOnlyBashCommand(context?.args?.command);
-					if (!expanded && isSafe) {
-						return new EmptyComponent();
-					}
-
-					// 仅渲染单次输出内容，与 renderCall 顺畅衔接在同一块区域，彻底杜绝重复打两次框！
-					const textContent = result.content?.find((c: any) => c.type === "text");
-					const raw = textContent?.text || "";
-					const maxLines = expanded ? 40 : 5;
-					const lines = raw.split("\n").slice(0, maxLines);
-					let text = lines.map((l: string) => theme.fg("toolOutput", l)).join("\n");
-					if (raw.split("\n").length > maxLines) {
-						text += `\n${theme.fg("muted", `... (${raw.split("\n").length - maxLines} more lines)`)}`;
-					}
-					return new Text(text, 1, 0);
-				}
-
+			renderResult(result, { expanded }, theme) {
 				if (!expanded) {
 					return new EmptyComponent();
 				}
-
 				const textContent = result.content?.find((c: any) => c.type === "text");
 				const raw = textContent?.text || "";
 				const lines = raw.split("\n").slice(0, 20);
