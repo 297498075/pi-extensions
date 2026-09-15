@@ -85,6 +85,21 @@ The count is derived from follow-up messages in the current session branch, so i
 
 The extension has no network, file, command, or external state side effects. The todo extension that owns the `todo` tool must be loaded separately; this extension only observes its persisted task state (`details.tasks` or `details.todos`).
 
+## Rolling Tools
+
+`extensions/rolling-tools.ts` displays a compact rolling widget for tool executions above the input editor while silencing verbose read-only and execution calls (`read`, `bash`, `grep`, `find`, `ls`) in the chat transcript.
+
+- **Non-intrusive transcript**: Read and execution tools occupy 0 lines when collapsed, preventing terminal scroll floods. Press `Ctrl+O` to expand if full outputs are needed.
+- **Diffs preserved**: File modifications (`edit`, `write`) keep their rich diff and content view in the transcript.
+- **Fixed-dock rolling widget**: Shows the latest 3 running/completed tools in a fixed dock above the editor with status, duration, and arguments summary. The widget persists after completion and clears once assistant text output begins.
+- **Toggle command**: Use `/rolling-tools` (or `/rolling-tools on|off`) to toggle.
+
+Load directly:
+
+```bash
+pi --extension ./extensions/rolling-tools.ts
+```
+
 ## Pi package
 
 ```bash
