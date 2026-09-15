@@ -4,6 +4,7 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- feat(extensions): unified single OpenCode box for bash with strict 5-line limit, full silence for read-only tools and allowlisted bash, and completed on agent end.
 - feat(extensions): add waiting server response state sharing top line with thinking, with globe icon and dynamic request timer.
 - fix(extensions): decouple actual thinking duration from visual animation buffer to reflect genuine model thinking time.
 - feat(extensions): fix turn_end premature completed label, thinking persistence until text streaming, in-widget only copy feedback, and 100% pi-tool-display ownership for bash/edit/write.

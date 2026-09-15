@@ -2,13 +2,14 @@ import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+	createBashTool,
 	createFindTool,
 	createGrepTool,
 	createLsTool,
 	createReadTool,
 } from "@earendil-works/pi-coding-agent";
 import type { Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { Text } from "@earendil-works/pi-tui";
+import { Box, Text } from "@earendil-works/pi-tui";
 
 /**
  * 空组件：在正文中占用 0 行
@@ -56,6 +57,63 @@ interface WidgetState {
 
 const MAX_RECENT_TOOLS = 3;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/**
+ * 纯只读命令集合
+ */
+const SAFE_READONLY_COMMANDS = new Set([
+	"cat", "head", "tail", "more", "less",
+	"ls", "dir", "pwd", "cd",
+	"grep", "egrep", "fgrep", "find", "sort", "uniq", "wc", "cut",
+	"which", "where", "type", "whoami", "uname", "date",
+	"echo", "printf",
+	"git", "node", "npm", "dotnet", "python", "python3", "pnpm", "yarn",
+]);
+
+const SAFE_GIT_SUBCOMMANDS = new Set([
+	"status", "diff", "log", "branch", "show", "tag", "remote", "rev-parse", "describe",
+]);
+
+/**
+ * 判断 Bash 命令是否属于纯只读探测（按换行符和运算符全面拆解）
+ */
+function isSafeReadOnlyBashCommand(command?: string): boolean {
+	if (!command) return false;
+	const cmd = command.trim();
+
+	// 1. 任何重定向（> 或 >> 或 | tee）均为写操作
+	if (/>{1,2}/.test(cmd) || /\btee\b/.test(cmd)) {
+		return false;
+	}
+
+	// 2. 切割所有运算符和多行换行符（&&, ||, ;, |, \n）
+	const subCommands = cmd.split(/&&|\|\||;|\||\r?\n/).map((c) => c.trim()).filter(Boolean);
+	if (subCommands.length === 0) return false;
+
+	for (const sub of subCommands) {
+		const parts = sub.replace(/^[A-Za-z_][A-Za-z0-9_]*=\S*\s+/, "").split(/\s+/);
+		const mainBin = parts[0]?.toLowerCase();
+		if (!mainBin || !SAFE_READONLY_COMMANDS.has(mainBin)) {
+			return false;
+		}
+
+		if (mainBin === "git") {
+			const gitSub = parts[1]?.toLowerCase();
+			if (!gitSub || !SAFE_GIT_SUBCOMMANDS.has(gitSub)) {
+				return false;
+			}
+		}
+
+		if (["node", "npm", "dotnet", "python", "python3", "pnpm", "yarn"].includes(mainBin)) {
+			const isVersionOrHelp = parts.some((p) => /^-{1,2}(v|version|h|help|info)$/i.test(p));
+			if (!isVersionOrHelp) {
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
 
 /**
  * 跨平台剪贴板复制
@@ -372,7 +430,6 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			const thinkingStartTime = state.headerStatus.type === "thinking" ? state.headerStatus.startTime : Date.now();
 			const actualDuration = Math.max(100, Date.now() - thinkingStartTime);
 			stopStatusTimer();
-			// 思考结束更新为“思考完成”，绝不提前退场，继续在顶层同一行常驻！
 			state.headerStatus = { type: "thinking_completed", durationMs: actualDuration };
 			syncWidget(ctx);
 		}
@@ -409,7 +466,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		syncWidget(ctx);
 	});
 
-	// 5. 工具调用开始：若仍处于等待响应状态，清空顶层状态行，工具入队
+	// 5. 工具调用开始
 	pi.on("tool_call", async (event, ctx) => {
 		totalToolCount++;
 		if (state.headerStatus.type === "waiting_server") {
@@ -479,14 +536,15 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		},
 	});
 
-	// 8. 纯只读工具（read, grep, find, ls）在正文中做 0 行静音
-	// 【核心设计】：bash, edit, write 绝不在此覆写！100% 交由 pi-tool-display 独占进行正统 OpenCode 渲染！
+	// 8. 注册流控工具：read, bash, grep, find, ls
+	// edit 和 write 绝不在此覆写（由 pi-tool-display 进行 OpenCode 差分渲染）
 	const toolCache = new Map<string, any>();
 	function getTools(cwd: string) {
 		let tools = toolCache.get(cwd);
 		if (!tools) {
 			tools = {
 				read: createReadTool(cwd),
+				bash: createBashTool(cwd),
 				grep: createGrepTool(cwd),
 				find: createFindTool(cwd),
 				ls: createLsTool(cwd),
@@ -496,9 +554,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		return tools;
 	}
 
-	const readOnlyTools = ["read", "grep", "find", "ls"] as const;
+	const managedTools = ["read", "bash", "grep", "find", "ls"] as const;
 
-	for (const name of readOnlyTools) {
+	for (const name of managedTools) {
 		const initialTools = getTools(process.cwd());
 		const original = initialTools[name];
 
@@ -517,6 +575,11 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			renderShell: "self",
 
 			renderCall(args, theme, context) {
+				if (name === "bash") {
+					// renderCall 总是返回 EmptyComponent，由 renderResult 统一输出单个完整的 OpenCode Box，彻底杜绝两个框！
+					return new EmptyComponent();
+				}
+
 				if (!context.expanded) {
 					return new EmptyComponent();
 				}
@@ -525,10 +588,56 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				return new Text(`${title} ${theme.fg("accent", summaryDisplay)}`, 0, 0);
 			},
 
-			renderResult(result, { expanded }, theme) {
+			renderResult(result, { expanded }, theme, context) {
+				if (name === "bash") {
+					// 1. 如果是折叠状态且属于只读白名单：0行静音
+					const isSafe = isSafeReadOnlyBashCommand(context?.args?.command);
+					if (!expanded && isSafe) {
+						return new EmptyComponent();
+					}
+
+					// 2. 如果是折叠状态且出错了：0行静音（报错由 Widget Alert 负责）
+					if (!expanded && result.isError) {
+						return new EmptyComponent();
+					}
+
+					// 3. 变更型命令或展开状态：以正宗 OpenCode 风格单个 Box 完整呈现
+					const bgFn = (text: string) =>
+						result.isError ? theme.bg("toolErrorBg", text) : theme.bg("toolSuccessBg", text);
+					const box = new Box(1, 1, bgFn);
+
+					// 命令行头
+					const title = theme.fg("toolTitle", theme.bold("$"));
+					const rawCmd = typeof context?.args?.command === "string" ? context.args.command.trim() : "";
+					box.addChild(new Text(`${title} ${theme.fg("accent", truncate(rawCmd, 80))}`, 0, 0));
+
+					// 命令输出
+					const textContent = result.content?.find((c: any) => c.type === "text");
+					const raw = textContent?.text || "";
+					const lines = raw.split("\n").filter((l: string, idx: number, arr: string[]) => idx < arr.length - 1 || l.trim().length > 0);
+
+					if (lines.length === 0) {
+						box.addChild(new Text(theme.fg("muted", "↳ (no output)"), 0, 0));
+					} else {
+						// 严格遵从最多 5 行折叠配置
+						const maxLines = expanded ? lines.length : 5;
+						const shown = lines.slice(0, maxLines);
+						const remaining = lines.length - shown.length;
+
+						let text = shown.map((l: string) => theme.fg("toolOutput", l)).join("\n");
+						if (remaining > 0) {
+							text += `\n${theme.fg("muted", `... (${remaining} more lines • Ctrl+O to expand)`)}`;
+						}
+						box.addChild(new Text(text, 0, 0));
+					}
+
+					return box;
+				}
+
 				if (!expanded) {
 					return new EmptyComponent();
 				}
+
 				const textContent = result.content?.find((c: any) => c.type === "text");
 				const raw = textContent?.text || "";
 				const lines = raw.split("\n").slice(0, 20);
