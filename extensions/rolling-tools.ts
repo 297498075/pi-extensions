@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+	createBashTool,
 	createFindTool,
 	createGrepTool,
 	createLsTool,
@@ -40,6 +41,68 @@ interface ActiveError {
 const MAX_RECENT_TOOLS = 3;
 
 /**
+ * Commands allowed to be silenced (pure read-only queries with no side effects).
+ */
+const SAFE_READONLY_COMMANDS = new Set([
+	"cat", "head", "tail", "more", "less",
+	"ls", "dir", "pwd", "cd",
+	"grep", "egrep", "fgrep", "find", "sort", "uniq", "wc", "cut",
+	"which", "where", "type", "whoami", "uname", "date",
+	"echo", "printf",
+	"git", "node", "npm", "dotnet", "python", "python3", "pnpm", "yarn",
+]);
+
+/**
+ * Safe read-only subcommands for git.
+ */
+const SAFE_GIT_SUBCOMMANDS = new Set([
+	"status", "diff", "log", "branch", "show", "tag", "remote", "rev-parse", "describe",
+]);
+
+/**
+ * Check if a bash command is strictly read-only and safe to silence.
+ * Any command with file redirection, file modification, build, execution, or unknown binary will return false.
+ */
+function isSafeReadOnlyBashCommand(command?: string): boolean {
+	if (!command) return false;
+	const cmd = command.trim();
+
+	// 1. Any file redirection (> or >> or | tee) is a write operation
+	if (/>{1,2}/.test(cmd) || /\btee\b/.test(cmd)) {
+		return false;
+	}
+
+	// 2. Split compound commands (&&, ||, ;, |)
+	const subCommands = cmd.split(/&&|\|\||;|\|/).map((c) => c.trim()).filter(Boolean);
+	if (subCommands.length === 0) return false;
+
+	for (const sub of subCommands) {
+		// Strip leading environment variable assignments (e.g. "VAR=val cmd")
+		const parts = sub.replace(/^[A-Za-z_][A-Za-z0-9_]*=\S*\s+/, "").split(/\s+/);
+		const mainBin = parts[0]?.toLowerCase();
+		if (!mainBin || !SAFE_READONLY_COMMANDS.has(mainBin)) {
+			return false;
+		}
+
+		if (mainBin === "git") {
+			const gitSub = parts[1]?.toLowerCase();
+			if (!gitSub || !SAFE_GIT_SUBCOMMANDS.has(gitSub)) {
+				return false;
+			}
+		}
+
+		if (["node", "npm", "dotnet", "python", "python3", "pnpm", "yarn"].includes(mainBin)) {
+			const isVersionOrHelp = parts.some((p) => /^-{1,2}(v|version|h|help|info)$/i.test(p));
+			if (!isVersionOrHelp) {
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
+/**
  * Copy text to system clipboard across platforms.
  */
 function copyToClipboard(text: string): void {
@@ -62,7 +125,6 @@ function copyToClipboard(text: string): void {
 
 /**
  * Wrap text in terminal standard OSC 8 hyperlink escape sequence.
- * Enables native terminal hover tooltip showing full path, and Ctrl+Click to open.
  */
 function formatOsc8Link(url: string, text: string): string {
 	return `\x1b]8;;${url}\x07${text}\x1b]8;;\x07`;
@@ -97,7 +159,6 @@ function extractSummaryAndPath(
 			const absPath = resolve(cwd, rawPath);
 			const fileUrl = `file:///${absPath.replace(/\\/g, "/")}`;
 			const display = truncate(rawPath, 50);
-			// Wrap in OSC 8 link for native terminal hover & tooltips
 			const linkedDisplay = formatOsc8Link(fileUrl, display);
 			return { summaryDisplay: linkedDisplay, fullPath: absPath };
 		}
@@ -125,10 +186,11 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	let enabled = true;
 
 	// Thinking state
-	let isThinking = false;
+	let thinkingStatus: "idle" | "thinking" | "completed" = "idle";
 	let thinkingStartTime = 0;
+	let thinkingDurationMs = 0;
 
-	// Dedicated error state
+	// Dedicated error alert state
 	let activeError: ActiveError | null = null;
 
 	// Latest resolved path for right-click clipboard copy
@@ -139,7 +201,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 		const hasContent =
 			enabled &&
-			(isThinking || recentTools.length > 0 || activeError !== null);
+			(thinkingStatus !== "idle" || recentTools.length > 0 || activeError !== null);
 
 		if (!hasContent) {
 			ctx.ui.setWidget("rolling-tools", undefined);
@@ -151,11 +213,15 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			(_tui: any, theme: any) => {
 				const container = new Container();
 
-				// 1. Thinking block (if currently thinking)
-				if (isThinking) {
+				// 1. Thinking block
+				if (thinkingStatus === "thinking") {
 					const elapsedSec = ((Date.now() - thinkingStartTime) / 1000).toFixed(1);
 					const thinkingLine = `${theme.fg("accent", "🧠")} ${theme.bold(theme.fg("toolTitle", "Thinking..."))} ${theme.fg("muted", `(${elapsedSec}s)`)}`;
 					container.addChild(new Text(thinkingLine, 1, 0));
+				} else if (thinkingStatus === "completed") {
+					const elapsedSec = (thinkingDurationMs / 1000).toFixed(1);
+					const completedLine = `${theme.fg("accent", "🧠")} ${theme.bold(theme.fg("toolTitle", "Thinking completed"))} ${theme.fg("muted", `(${elapsedSec}s)`)}`;
+					container.addChild(new Text(completedLine, 1, 0));
 				}
 
 				// 2. Rolling tools queue
@@ -196,11 +262,19 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		);
 	}
 
-	// 1. Reset on new user interaction
+	// Silence the permanent thinking label in transcript completely
+	pi.on("session_start", async (_event, ctx) => {
+		(ctx.ui as any)?.setHiddenThinkingLabel?.("");
+	});
+
+	// 1. Reset on new user prompt
 	pi.on("agent_start", async (_event, ctx) => {
+		(ctx.ui as any)?.setHiddenThinkingLabel?.("");
 		recentTools.length = 0;
 		totalToolCount = 0;
-		isThinking = false;
+		thinkingStatus = "idle";
+		thinkingStartTime = 0;
+		thinkingDurationMs = 0;
 		activeError = null;
 		updateWidget(ctx);
 	});
@@ -212,14 +286,18 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 		// Thinking lifecycle
 		if (ev.type === "thinking_start") {
-			isThinking = true;
+			thinkingStatus = "thinking";
 			thinkingStartTime = Date.now();
 			updateWidget(ctx);
 		} else if (ev.type === "thinking_delta") {
-			isThinking = true;
+			if (thinkingStatus !== "thinking") {
+				thinkingStatus = "thinking";
+				thinkingStartTime = thinkingStartTime || Date.now();
+			}
 			updateWidget(ctx);
 		} else if (ev.type === "thinking_end") {
-			isThinking = false;
+			thinkingStatus = "completed";
+			thinkingDurationMs = Date.now() - (thinkingStartTime || Date.now());
 			updateWidget(ctx);
 		}
 
@@ -229,7 +307,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			(ev.type === "text_delta" && typeof ev.delta === "string" && ev.delta.trim().length > 0);
 
 		if (isTextStreaming) {
-			isThinking = false;
+			thinkingStatus = "idle";
 			activeError = null;
 			if (recentTools.length > 0) {
 				recentTools.length = 0;
@@ -241,7 +319,6 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	// 3. Tool execution starts
 	pi.on("tool_call", async (event, ctx) => {
 		totalToolCount++;
-		isThinking = false; // Transition to tool phase
 
 		const cwd = ctx?.cwd || process.cwd();
 		const { summaryDisplay, fullPath } = extractSummaryAndPath(event.toolName, event.input, cwd);
@@ -285,7 +362,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				message: rawError.trim(),
 			};
 		} else {
-			// If subsequent tool succeeds, hide previous error alert
+			// Condition: "如果有下一个工具调用正常了，也隐藏掉"
 			activeError = null;
 		}
 
@@ -312,14 +389,15 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		},
 	});
 
-	// 6. Only silence pure read tools (read, grep, find, ls) in transcript.
-	// bash, edit, write are NOT registered here! They are rendered 100% by pi-tool-display in OpenCode style!
+	// 6. Silence pure read tools (read, grep, find, ls) and safe read-only bash commands in transcript.
+	// edit and write are NOT registered here (100% handled by pi-tool-display for rich diffs!).
 	const toolCache = new Map<string, any>();
 	function getTools(cwd: string) {
 		let tools = toolCache.get(cwd);
 		if (!tools) {
 			tools = {
 				read: createReadTool(cwd),
+				bash: createBashTool(cwd),
 				grep: createGrepTool(cwd),
 				find: createFindTool(cwd),
 				ls: createLsTool(cwd),
@@ -329,9 +407,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		return tools;
 	}
 
-	const silencedToolNames = ["read", "grep", "find", "ls"] as const;
+	const managedToolNames = ["read", "bash", "grep", "find", "ls"] as const;
 
-	for (const name of silencedToolNames) {
+	for (const name of managedToolNames) {
 		const initialTools = getTools(process.cwd());
 		const original = initialTools[name];
 
@@ -350,7 +428,18 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			renderShell: "self",
 
 			renderCall(args, theme, context) {
-				// Collapsed: 0 lines
+				// Bash: check allowlist
+				if (name === "bash") {
+					const isSafe = isSafeReadOnlyBashCommand(args?.command);
+					if (!context.expanded && isSafe) {
+						return new EmptyComponent();
+					}
+					// Non-safe mutating bash: OpenCode style call
+					const title = theme.fg("toolTitle", theme.bold("$"));
+					return new Text(`${title} ${theme.fg("accent", truncate(args?.command || "", 80))}`, 0, 0);
+				}
+
+				// Read-only tools (read, grep, find, ls)
 				if (!context.expanded) {
 					return new EmptyComponent();
 				}
@@ -359,15 +448,32 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				return new Text(`${title} ${theme.fg("accent", summaryDisplay)}`, 0, 0);
 			},
 
-			renderResult(result, { expanded }, theme) {
-				// Escape hatch: Never hide errors in transcript
-				if (result.isError) {
-					const textContent = result.content?.find((c: any) => c.type === "text");
-					const errText = textContent?.text || "Unknown error";
-					return new Text(theme.fg("error", `✗ ${name} failed:\n${errText}`), 0, 0);
+			renderResult(result, { expanded }, theme, context) {
+				// User requirement: Do NOT render errors to permanent transcript!
+				// Only display errors temporarily in the rolling block.
+				if (!expanded && result.isError) {
+					return new EmptyComponent();
 				}
 
-				// Collapsed: 0 lines
+				// Bash: check allowlist
+				if (name === "bash") {
+					const isSafe = isSafeReadOnlyBashCommand(context?.args?.command);
+					if (!expanded && isSafe) {
+						return new EmptyComponent();
+					}
+					// Mutating bash command: render output in transcript
+					const textContent = result.content?.find((c: any) => c.type === "text");
+					const raw = textContent?.text || "";
+					const maxLines = expanded ? 40 : 10;
+					const lines = raw.split("\n").slice(0, maxLines);
+					let text = lines.map((l: string) => theme.fg("toolOutput", l)).join("\n");
+					if (raw.split("\n").length > maxLines) {
+						text += `\n${theme.fg("muted", `... (${raw.split("\n").length - maxLines} more lines, Ctrl+O to expand)`)}`;
+					}
+					return new Text(`\n${text}`, 0, 0);
+				}
+
+				// Read-only tools (read, grep, find, ls)
 				if (!expanded) {
 					return new EmptyComponent();
 				}
