@@ -9,7 +9,7 @@ import {
 	createReadTool,
 } from "@earendil-works/pi-coding-agent";
 import type { Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { Box, Text } from "@earendil-works/pi-tui";
+import { Box, Text, visibleWidth } from "@earendil-works/pi-tui";
 
 /**
  * 空组件：在正文中占用 0 行
@@ -53,6 +53,11 @@ interface WidgetState {
 	hoveredItemId: string | null;
 	copyFeedbackMessage: string | null;
 	completedMessage: string | null;
+}
+
+interface RenderedLineInfo {
+	item: ToolItem | null;
+	width: number;
 }
 
 const MAX_RECENT_TOOLS = 3;
@@ -200,13 +205,13 @@ function extractSummaryAndMetadata(
 }
 
 /**
- * 原生动态组件：0ms 响应鼠标悬停与点击，纯净展示
+ * 原生动态组件：精准根据文字可见宽度（X轴边界）触发悬停，空白区域绝不触发！
  */
 class RollingToolsWidgetComponent implements Component {
 	private tui: any;
 	private theme: any;
 	private state: WidgetState;
-	private lineMap: (ToolItem | null)[] = [];
+	private lineMap: RenderedLineInfo[] = [];
 	private copyFeedbackTimer: any = null;
 
 	constructor(tui: any, theme: any, state: WidgetState) {
@@ -220,24 +225,30 @@ class RollingToolsWidgetComponent implements Component {
 		const lines: string[] = [];
 		const theme = this.theme;
 
+		const pushLine = (text: string, item: ToolItem | null = null) => {
+			lines.push(text);
+			this.lineMap.push({ item, width: visibleWidth(text) });
+		};
+
 		// 1. 顶层状态行（等待服务器响应 ➔ 思考中 ➔ 思考完成，共用一行平滑过渡）
 		if (this.state.headerStatus.type === "waiting_server") {
 			const elapsedSec = ((Date.now() - this.state.headerStatus.startTime) / 1000).toFixed(1);
 			const spinner = SPINNER_FRAMES[Math.floor(Date.now() / 150) % SPINNER_FRAMES.length];
-			lines.push(` ${theme.fg("accent", "🌐")} ${theme.bold(theme.fg("toolTitle", `${spinner} 等待服务器响应...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`);
-			this.lineMap.push(null);
+			pushLine(` ${theme.fg("accent", "🌐")} ${theme.bold(theme.fg("toolTitle", `${spinner} 等待服务器响应...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`);
 		} else if (this.state.headerStatus.type === "thinking") {
 			const elapsedSec = ((Date.now() - this.state.headerStatus.startTime) / 1000).toFixed(1);
 			const spinner = SPINNER_FRAMES[Math.floor(Date.now() / 150) % SPINNER_FRAMES.length];
-			lines.push(` ${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", `${spinner} 思考中...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`);
-			this.lineMap.push(null);
+			pushLine(` ${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", `${spinner} 思考中...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`);
 		} else if (this.state.headerStatus.type === "thinking_completed") {
 			const elapsedSec = (this.state.headerStatus.durationMs / 1000).toFixed(1);
-			lines.push(` ${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", "思考完成"))} ${theme.fg("muted", `(${elapsedSec}s)`)}`);
-			this.lineMap.push(null);
+			pushLine(` ${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", "思考完成"))} ${theme.fg("muted", `(${elapsedSec}s)`)}`);
 		}
 
 		// 2. 滚动工具列表（完全无高亮突变，纯净平稳）
+		const hoveredItem = this.state.hoveredItemId
+			? this.state.recentTools.find((t) => t.id === this.state.hoveredItemId)
+			: null;
+
 		for (const t of this.state.recentTools) {
 			let icon = theme.fg("accent", "⏳");
 			if (t.status === "done") icon = theme.fg("success", "✓");
@@ -248,54 +259,51 @@ class RollingToolsWidgetComponent implements Component {
 			const summary = theme.fg("dim", t.summaryDisplay);
 			const time = t.durationMs !== undefined ? theme.fg("muted", ` (${t.durationMs}ms)`) : "";
 
-			lines.push(` ${icon} ${badge} ${name} ${summary}${time}`);
-			this.lineMap.push(t);
+			pushLine(` ${icon} ${badge} ${name} ${summary}${time}`, t);
 
-			// 鼠标悬停展开：直接展示完整路径或完整命令，绝无“提示：[左右键...”教学行
-			if (this.state.hoveredItemId === t.id) {
+			// 鼠标悬停展开：仅当鼠标精准悬停在该文字上方时才展开
+			if (hoveredItem && hoveredItem.id === t.id) {
 				if (t.fullPath) {
-					lines.push(`   ${theme.fg("accent", `↳ ${t.fullPath}`)}`);
-					this.lineMap.push(t);
+					pushLine(`   ${theme.fg("accent", `↳ ${t.fullPath}`)}`, t);
 				} else if (t.fullCommand) {
 					const cmdLines = t.fullCommand.split("\n").slice(0, 8);
 					for (const cmdLine of cmdLines) {
-						lines.push(`   ${theme.fg("accent", `↳ ${cmdLine}`)}`);
-						this.lineMap.push(t);
+						pushLine(`   ${theme.fg("accent", `↳ ${cmdLine}`)}`, t);
 					}
 				}
 			}
 		}
 
-		// 3. 复制成功反馈（仅在 Widget 内部优雅提示，绝对不向下方状态栏或正文打多余字）
+		// 3. 复制成功反馈（仅在 Widget 内部就地显示，绝对 0 污染）
 		if (this.state.copyFeedbackMessage) {
-			lines.push(`   ${theme.fg("success", `↳ ${this.state.copyFeedbackMessage}`)}`);
-			this.lineMap.push(null);
+			pushLine(`   ${theme.fg("success", `↳ ${this.state.copyFeedbackMessage}`)}`);
 		}
 
 		// 4. 独立临时报错 Alert 块
 		if (this.state.activeError) {
 			const errHeader = ` ${theme.fg("error", "🔴")} ${theme.bold(theme.fg("error", `[Error in #${this.state.activeError.index} ${this.state.activeError.toolName}]`))} ${theme.fg("dim", this.state.activeError.summary)}`;
 			const errBody = `    ${theme.fg("error", truncate(this.state.activeError.message.replace(/\r?\n/g, " "), 100))}`;
-			lines.push(errHeader);
-			this.lineMap.push(null);
-			lines.push(errBody);
-			this.lineMap.push(null);
+			pushLine(errHeader);
+			pushLine(errBody);
 		}
 
 		// 5. 主回复完成标识（仅在整个 Agent 回复完全生成完毕后才附带显示）
 		if (this.state.completedMessage) {
-			lines.push(` ${theme.fg("success", `✓ ${this.state.completedMessage}`)}`);
-			this.lineMap.push(null);
+			pushLine(` ${theme.fg("success", `✓ ${this.state.completedMessage}`)}`);
 		}
 
 		return lines;
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-		// 鼠标移动：0ms 瞬间根据坐标匹配并展开
+		// 精准判定：必须命中当前行，且 X 坐标必须落在实际文字渲染宽度之内！空白区域绝不触发！
+		const lineEntry = event.y >= 0 && event.y < this.lineMap.length ? this.lineMap[event.y] : null;
+		const isWithinText = Boolean(lineEntry && event.x >= 0 && event.x <= lineEntry.width);
+		const targetItem = isWithinText ? lineEntry?.item : null;
+		const targetId = targetItem ? targetItem.id : null;
+
+		// 鼠标移动
 		if (event.type === "move") {
-			const target = event.y >= 0 && event.y < this.lineMap.length ? this.lineMap[event.y] : null;
-			const targetId = target ? target.id : null;
 			if (this.state.hoveredItemId !== targetId) {
 				this.state.hoveredItemId = targetId;
 				this.tui?.requestRender?.();
@@ -304,22 +312,19 @@ class RollingToolsWidgetComponent implements Component {
 			return undefined;
 		}
 
-		// 鼠标点击（左键或右键）：复制到剪贴板，仅在 Widget 内部给反馈，不碰状态栏！
-		if (event.type === "click") {
-			const target = event.y >= 0 && event.y < this.lineMap.length ? this.lineMap[event.y] : null;
-			if (!target) return undefined;
-
+		// 鼠标点击（左键或右键）：仅在点击到文字范围内时触发
+		if (event.type === "click" && isWithinText && targetItem) {
 			// Ctrl + 左键：打开文件
-			if (event.ctrl && target.fullPath) {
-				openFile(target.fullPath);
+			if (event.ctrl && targetItem.fullPath) {
+				openFile(targetItem.fullPath);
 				return { handled: true };
 			}
 
-			// 左右键点击：复制文件完整路径或完整命令
-			const textToCopy = target.fullPath || target.fullCommand;
+			// 左右键点击：复制完整路径或完整命令
+			const textToCopy = targetItem.fullPath || targetItem.fullCommand;
 			if (textToCopy) {
 				copyToClipboard(textToCopy);
-				const label = target.fullPath ? "完整路径" : "完整命令";
+				const label = targetItem.fullPath ? "完整路径" : "完整命令";
 				this.state.copyFeedbackMessage = `✓ 已复制${label}至剪贴板: ${truncate(textToCopy, 45)}`;
 
 				if (this.copyFeedbackTimer) clearTimeout(this.copyFeedbackTimer);
@@ -391,6 +396,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 	// 1. 用户提问开始（新一轮 Agent 运行）时重置
 	pi.on("agent_start", async (_event, ctx) => {
+		// 确保工具默认处于折叠状态，避免误进入全展开模式导致 5 行限制失效
+		(ctx.ui as any)?.setToolsExpanded?.(false);
+
 		stopStatusTimer();
 		state.recentTools = [];
 		totalToolCount = 0;
@@ -574,78 +582,59 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 			renderShell: "self",
 
-			renderCall(args, theme, context) {
-				if (name === "bash") {
-					// renderCall 总是返回 EmptyComponent，由 renderResult 统一输出单个完整的 OpenCode Box，彻底杜绝两个框！
-					return new EmptyComponent();
-				}
-
-				if (!context.expanded) {
-					return new EmptyComponent();
-				}
-				const title = theme.fg("toolTitle", theme.bold(name));
-				const { summaryDisplay } = extractSummaryAndMetadata(name, args, process.cwd());
-				return new Text(`${title} ${theme.fg("accent", summaryDisplay)}`, 0, 0);
+			renderCall(_args, _theme, _context) {
+				// 正文中无论是 read 还是 bash 的调用头，一律返回 0 行！由 renderResult 统一输出单一完整的 Box，杜绝两个框！
+				return new EmptyComponent();
 			},
 
 			renderResult(result, { expanded }, theme, context) {
-				if (name === "bash") {
-					// 1. 如果是折叠状态且属于只读白名单：0行静音
-					const isSafe = isSafeReadOnlyBashCommand(context?.args?.command);
-					if (!expanded && isSafe) {
-						return new EmptyComponent();
-					}
-
-					// 2. 如果是折叠状态且出错了：0行静音（报错由 Widget Alert 负责）
-					if (!expanded && result.isError) {
-						return new EmptyComponent();
-					}
-
-					// 3. 变更型命令或展开状态：以正宗 OpenCode 风格单个 Box 完整呈现
-					const bgFn = (text: string) =>
-						result.isError ? theme.bg("toolErrorBg", text) : theme.bg("toolSuccessBg", text);
-					const box = new Box(1, 1, bgFn);
-
-					// 命令行头
-					const title = theme.fg("toolTitle", theme.bold("$"));
-					const rawCmd = typeof context?.args?.command === "string" ? context.args.command.trim() : "";
-					box.addChild(new Text(`${title} ${theme.fg("accent", truncate(rawCmd, 80))}`, 0, 0));
-
-					// 命令输出
-					const textContent = result.content?.find((c: any) => c.type === "text");
-					const raw = textContent?.text || "";
-					const lines = raw.split("\n").filter((l: string, idx: number, arr: string[]) => idx < arr.length - 1 || l.trim().length > 0);
-
-					if (lines.length === 0) {
-						box.addChild(new Text(theme.fg("muted", "↳ (no output)"), 0, 0));
-					} else {
-						// 严格遵从最多 5 行折叠配置
-						const maxLines = expanded ? lines.length : 5;
-						const shown = lines.slice(0, maxLines);
-						const remaining = lines.length - shown.length;
-
-						let text = shown.map((l: string) => theme.fg("toolOutput", l)).join("\n");
-						if (remaining > 0) {
-							text += `\n${theme.fg("muted", `... (${remaining} more lines • Ctrl+O to expand)`)}`;
-						}
-						box.addChild(new Text(text, 0, 0));
-					}
-
-					return box;
-				}
-
-				if (!expanded) {
+				// 【核心规则 1】：纯只读工具（read, grep, find, ls）在正文中永远 100% 占用 0 行！绝对不输出任何“自定义样式”！
+				if (name !== "bash") {
 					return new EmptyComponent();
 				}
 
+				// 【核心规则 2】：Bash 命中纯只读白名单（如 echo, pwd, node -v）➔ 正文永远 100% 占用 0 行！
+				const isSafe = isSafeReadOnlyBashCommand(context?.args?.command);
+				if (isSafe) {
+					return new EmptyComponent();
+				}
+
+				// 【核心规则 3】：Bash 执行报错 ➔ 折叠时正文 0 行（错误全由 Widget Alert 负责，绝不留永久垃圾）
+				if (!expanded && result.isError) {
+					return new EmptyComponent();
+				}
+
+				// 【核心规则 4】：真实变更型 Bash 命令 ➔ 严格以正统 OpenCode 风格单个 Box 输出，最多显示 5 行！
+				const bgFn = (text: string) =>
+					result.isError ? theme.bg("toolErrorBg", text) : theme.bg("toolSuccessBg", text);
+				const box = new Box(1, 1, bgFn);
+
+				// 命令行头：$ command
+				const title = theme.fg("toolTitle", theme.bold("$"));
+				const rawCmd = typeof context?.args?.command === "string" ? context.args.command.trim() : "";
+				box.addChild(new Text(`${title} ${theme.fg("accent", truncate(rawCmd, 80))}`, 0, 0));
+
+				// 命令输出：严格最多显示 5 行折叠
 				const textContent = result.content?.find((c: any) => c.type === "text");
 				const raw = textContent?.text || "";
-				const lines = raw.split("\n").slice(0, 20);
-				let text = lines.map((l: string) => theme.fg("toolOutput", l)).join("\n");
-				if (raw.split("\n").length > 20) {
-					text += `\n${theme.fg("muted", "... (truncated in expanded view)")}`;
+				const lines = raw.split("\n").filter((l: string, idx: number, arr: string[]) => idx < arr.length - 1 || l.trim().length > 0);
+
+				if (lines.length === 0) {
+					box.addChild(new Text(theme.fg("muted", "↳ (no output)"), 0, 0));
+				} else {
+					// 严格遵从折叠时最多 5 行的限制
+					const maxLines = expanded ? lines.length : 5;
+					const shown = lines.slice(0, maxLines);
+					const remaining = lines.length - shown.length;
+
+					let text = shown.map((l: string) => theme.fg("toolOutput", l)).join("\n");
+					if (remaining > 0) {
+						text += `\n${theme.fg("muted", `... (${remaining} more lines • Ctrl+O to expand)`)}`;
+					}
+					box.addChild(new Text(text, 0, 0));
 				}
-				return new Text(`\n${text}`, 0, 0);
+
+				return box;
 			},
 		});
 	}
