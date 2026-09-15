@@ -39,10 +39,14 @@ interface ActiveError {
 	message: string;
 }
 
+type HeaderStatus =
+	| { type: "idle" }
+	| { type: "waiting_server"; startTime: number }
+	| { type: "thinking"; startTime: number }
+	| { type: "thinking_completed"; durationMs: number };
+
 interface WidgetState {
-	thinkingStatus: "idle" | "thinking" | "completed";
-	thinkingStartTime: number;
-	thinkingDurationMs: number;
+	headerStatus: HeaderStatus;
 	recentTools: ToolItem[];
 	activeError: ActiveError | null;
 	hoveredItemId: string | null;
@@ -52,7 +56,6 @@ interface WidgetState {
 
 const MAX_RECENT_TOOLS = 3;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const MIN_THINKING_DISPLAY_MS = 1500; // 保证思考动画至少展示 1.5 秒
 
 /**
  * 跨平台剪贴板复制
@@ -145,15 +148,13 @@ class RollingToolsWidgetComponent implements Component {
 	private tui: any;
 	private theme: any;
 	private state: WidgetState;
-	private ctx: any;
 	private lineMap: (ToolItem | null)[] = [];
 	private copyFeedbackTimer: any = null;
 
-	constructor(tui: any, theme: any, state: WidgetState, ctx: any) {
+	constructor(tui: any, theme: any, state: WidgetState) {
 		this.tui = tui;
 		this.theme = theme;
 		this.state = state;
-		this.ctx = ctx;
 	}
 
 	render(_width: number): string[] {
@@ -161,17 +162,19 @@ class RollingToolsWidgetComponent implements Component {
 		const lines: string[] = [];
 		const theme = this.theme;
 
-		// 1. Thinking 状态块（仅在思考中展示动画与秒表；思考完成保持常驻，直到正文流式输出才退场）
-		if (this.state.thinkingStatus === "thinking") {
-			const elapsedMs = this.state.thinkingDurationMs > 0
-				? this.state.thinkingDurationMs
-				: Math.max(0, Date.now() - this.state.thinkingStartTime);
-			const elapsedSec = (elapsedMs / 1000).toFixed(1);
+		// 1. 顶层状态行（等待服务器响应 ➔ 思考中 ➔ 思考完成，共用一行平滑过渡）
+		if (this.state.headerStatus.type === "waiting_server") {
+			const elapsedSec = ((Date.now() - this.state.headerStatus.startTime) / 1000).toFixed(1);
+			const spinner = SPINNER_FRAMES[Math.floor(Date.now() / 150) % SPINNER_FRAMES.length];
+			lines.push(` ${theme.fg("accent", "🌐")} ${theme.bold(theme.fg("toolTitle", `${spinner} 等待服务器响应...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`);
+			this.lineMap.push(null);
+		} else if (this.state.headerStatus.type === "thinking") {
+			const elapsedSec = ((Date.now() - this.state.headerStatus.startTime) / 1000).toFixed(1);
 			const spinner = SPINNER_FRAMES[Math.floor(Date.now() / 150) % SPINNER_FRAMES.length];
 			lines.push(` ${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", `${spinner} 思考中...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`);
 			this.lineMap.push(null);
-		} else if (this.state.thinkingStatus === "completed") {
-			const elapsedSec = (this.state.thinkingDurationMs / 1000).toFixed(1);
+		} else if (this.state.headerStatus.type === "thinking_completed") {
+			const elapsedSec = (this.state.headerStatus.durationMs / 1000).toFixed(1);
 			lines.push(` ${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", "思考完成"))} ${theme.fg("muted", `(${elapsedSec}s)`)}`);
 			this.lineMap.push(null);
 		}
@@ -190,7 +193,7 @@ class RollingToolsWidgetComponent implements Component {
 			lines.push(` ${icon} ${badge} ${name} ${summary}${time}`);
 			this.lineMap.push(t);
 
-			// 鼠标悬停展开：直接展示完整路径或完整命令，无任何多余教学字样
+			// 鼠标悬停展开：直接展示完整路径或完整命令，绝无“提示：[左右键...”教学行
 			if (this.state.hoveredItemId === t.id) {
 				if (t.fullPath) {
 					lines.push(`   ${theme.fg("accent", `↳ ${t.fullPath}`)}`);
@@ -281,12 +284,10 @@ class RollingToolsWidgetComponent implements Component {
 export default function rollingTools(pi: ExtensionAPI): void {
 	let totalToolCount = 0;
 	let enabled = true;
-	let thinkingTimer: any = null;
+	let statusTimer: any = null;
 
 	const state: WidgetState = {
-		thinkingStatus: "idle",
-		thinkingStartTime: 0,
-		thinkingDurationMs: 0,
+		headerStatus: { type: "idle" },
 		recentTools: [],
 		activeError: null,
 		hoveredItemId: null,
@@ -294,11 +295,18 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		completedMessage: null,
 	};
 
-	function stopThinkingTimer(): void {
-		if (thinkingTimer) {
-			clearInterval(thinkingTimer);
-			thinkingTimer = null;
+	function stopStatusTimer(): void {
+		if (statusTimer) {
+			clearInterval(statusTimer);
+			statusTimer = null;
 		}
+	}
+
+	function startStatusTimer(ctx: any): void {
+		stopStatusTimer();
+		statusTimer = setInterval(() => {
+			syncWidget(ctx);
+		}, 100);
 	}
 
 	function syncWidget(ctx: any): void {
@@ -306,7 +314,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 		const hasContent =
 			enabled &&
-			(state.thinkingStatus !== "idle" ||
+			(state.headerStatus.type !== "idle" ||
 				state.recentTools.length > 0 ||
 				state.activeError !== null ||
 				state.completedMessage !== null);
@@ -318,19 +326,17 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 		ctx.ui.setWidget(
 			"rolling-tools",
-			(tui: any, theme: any) => new RollingToolsWidgetComponent(tui, theme, state, ctx),
+			(tui: any, theme: any) => new RollingToolsWidgetComponent(tui, theme, state),
 			{ placement: "aboveEditor" },
 		);
 	}
 
 	// 1. 用户提问开始（新一轮 Agent 运行）时重置
 	pi.on("agent_start", async (_event, ctx) => {
-		stopThinkingTimer();
+		stopStatusTimer();
 		state.recentTools = [];
 		totalToolCount = 0;
-		state.thinkingStatus = "idle";
-		state.thinkingStartTime = 0;
-		state.thinkingDurationMs = 0;
+		state.headerStatus = { type: "idle" };
 		state.activeError = null;
 		state.hoveredItemId = null;
 		state.copyFeedbackMessage = null;
@@ -338,10 +344,16 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		syncWidget(ctx);
 	});
 
-	// 2. 消息流式事件：
-	// - 保证思考动画最少可见 1.5 秒
-	// - 思考完成就更新为“思考完成”并常驻，直到正文流式输出才退场
-	// - 绝不在 turn_end 或工具之间把思考状态删掉！
+	// 2. 发起网络请求前：顶层状态行切换为“等待服务器响应”，开启动态计时
+	pi.on("before_provider_request", (_event, ctx) => {
+		state.headerStatus = { type: "waiting_server", startTime: Date.now() };
+		startStatusTimer(ctx);
+		syncWidget(ctx);
+	});
+
+	// 3. 消息流式事件：
+	// - 驱动 Thinking 状态（与等待服务器响应共用同一行，无缝过渡）
+	// - 彻底过滤正文中的 thinking 块，消除占位符与空行！
 	pi.on("message_update", async (event, ctx) => {
 		if (event.message?.role === "assistant" && Array.isArray(event.message.content)) {
 			event.message.content = event.message.content.filter((c: any) => c.type !== "thinking");
@@ -351,44 +363,28 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		if (!ev) return;
 
 		if (ev.type === "thinking_start" || ev.type === "thinking_delta") {
-			if (state.thinkingStatus !== "thinking") {
-				state.thinkingStatus = "thinking";
-				state.thinkingStartTime = Date.now();
-				stopThinkingTimer();
-				thinkingTimer = setInterval(() => {
-					syncWidget(ctx);
-				}, 100);
+			if (state.headerStatus.type !== "thinking") {
+				state.headerStatus = { type: "thinking", startTime: Date.now() };
+				startStatusTimer(ctx);
 				syncWidget(ctx);
 			}
 		} else if (ev.type === "thinking_end") {
-			// 立即捕获模型真实的思考耗时，秒表严格定格在真实耗时，绝不把动画延迟算入思考时间！
-			const actualDuration = Math.max(100, Date.now() - (state.thinkingStartTime || Date.now()));
-			state.thinkingDurationMs = actualDuration;
-			stopThinkingTimer();
-
-			// 检查是否需要补足最小可见动画时间（仅为了人眼能看见动画帧，时间数值严格不变）
-			const elapsedSoFar = Date.now() - state.thinkingStartTime;
-			const remainingAnimDelay = Math.max(0, MIN_THINKING_DISPLAY_MS - elapsedSoFar);
-
-			if (remainingAnimDelay > 0) {
-				setTimeout(() => {
-					state.thinkingStatus = "completed";
-					syncWidget(ctx);
-				}, remainingAnimDelay);
-			} else {
-				state.thinkingStatus = "completed";
-				syncWidget(ctx);
-			}
+			const thinkingStartTime = state.headerStatus.type === "thinking" ? state.headerStatus.startTime : Date.now();
+			const actualDuration = Math.max(100, Date.now() - thinkingStartTime);
+			stopStatusTimer();
+			// 思考结束更新为“思考完成”，绝不提前退场，继续在顶层同一行常驻！
+			state.headerStatus = { type: "thinking_completed", durationMs: actualDuration };
+			syncWidget(ctx);
 		}
 
-		// 正文流式输出时：思考状态才正式退场让位给正文！
+		// 正文流式输出时：顶层状态行（等待/思考）正式退场让位给正文！
 		const isTextStreaming =
 			ev.type === "text_start" ||
 			(ev.type === "text_delta" && typeof ev.delta === "string" && ev.delta.trim().length > 0);
 
 		if (isTextStreaming) {
-			state.thinkingStatus = "idle";
-			stopThinkingTimer();
+			state.headerStatus = { type: "idle" };
+			stopStatusTimer();
 			state.activeError = null;
 			syncWidget(ctx);
 		}
@@ -405,18 +401,21 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		}
 	});
 
-	// 3. 只有当整个 Agent 任务全部结束（正文生成完毕）后，才在底部展示 Completed！
-	// 绝不在 turn_end 中过早展示 Completed！
+	// 4. 只有当整个 Agent 任务全部结束（正文生成完毕）后，才在底部展示 Completed！
 	pi.on("agent_end", async (_event, ctx) => {
-		stopThinkingTimer();
-		state.thinkingStatus = "idle";
+		stopStatusTimer();
+		state.headerStatus = { type: "idle" };
 		state.completedMessage = "Completed";
 		syncWidget(ctx);
 	});
 
-	// 4. 工具调用开始
+	// 5. 工具调用开始：若仍处于等待响应状态，清空顶层状态行，工具入队
 	pi.on("tool_call", async (event, ctx) => {
 		totalToolCount++;
+		if (state.headerStatus.type === "waiting_server") {
+			state.headerStatus = { type: "idle" };
+			stopStatusTimer();
+		}
 
 		const cwd = ctx?.cwd || process.cwd();
 		const { summaryDisplay, fullPath, fullCommand } = extractSummaryAndMetadata(event.toolName, event.input, cwd);
@@ -439,7 +438,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		syncWidget(ctx);
 	});
 
-	// 5. 工具调用完成
+	// 6. 工具调用完成
 	pi.on("tool_result", async (event, ctx) => {
 		const item = state.recentTools.find((t) => t.id === event.toolCallId);
 		if (item) {
@@ -463,7 +462,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		syncWidget(ctx);
 	});
 
-	// 6. 开关控制命令
+	// 7. 开关控制命令
 	pi.registerCommand("rolling-tools", {
 		description: "Toggle or check rolling tools widget mode",
 		handler: async (args, ctx) => {
@@ -480,8 +479,8 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		},
 	});
 
-	// 7. 纯只读工具（read, grep, find, ls）在正文中做 0 行静音
-	// 【核心设计】：bash, edit, write 绝不覆写！100% 交由 pi-tool-display 独占进行正统 OpenCode 渲染！
+	// 8. 纯只读工具（read, grep, find, ls）在正文中做 0 行静音
+	// 【核心设计】：bash, edit, write 绝不在此覆写！100% 交由 pi-tool-display 独占进行正统 OpenCode 渲染！
 	const toolCache = new Map<string, any>();
 	function getTools(cwd: string) {
 		let tools = toolCache.get(cwd);
