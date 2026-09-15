@@ -8,12 +8,13 @@ import {
 	createLsTool,
 	createReadTool,
 } from "@earendil-works/pi-coding-agent";
-import { Container, MouseRegion, Text } from "@earendil-works/pi-tui";
+import type { Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
 
 /**
  * 空组件：在正文中占用 0 行
  */
-class EmptyComponent {
+class EmptyComponent implements Component {
 	render(_width: number): string[] {
 		return [];
 	}
@@ -37,6 +38,17 @@ interface ActiveError {
 	index: number;
 	summary: string;
 	message: string;
+}
+
+interface WidgetState {
+	thinkingStatus: "idle" | "thinking" | "completed";
+	thinkingStartTime: number;
+	thinkingDurationMs: number;
+	recentTools: ToolItem[];
+	activeError: ActiveError | null;
+	hoveredItemId: string | null;
+	copyFeedbackMessage: string | null;
+	completedMessage: string | null;
 }
 
 const MAX_RECENT_TOOLS = 3;
@@ -184,26 +196,163 @@ function extractSummaryAndMetadata(
 	}
 }
 
+/**
+ * 原生动态组件：每一帧实时感知状态与鼠标位置，0ms 响应悬停展开与左右键复制
+ */
+class RollingToolsWidgetComponent implements Component {
+	private tui: any;
+	private theme: any;
+	private state: WidgetState;
+	private ctx: any;
+	private lineMap: (ToolItem | null)[] = [];
+	private copyFeedbackTimer: any = null;
+
+	constructor(tui: any, theme: any, state: WidgetState, ctx: any) {
+		this.tui = tui;
+		this.theme = theme;
+		this.state = state;
+		this.ctx = ctx;
+	}
+
+	render(_width: number): string[] {
+		this.lineMap = [];
+		const lines: string[] = [];
+		const theme = this.theme;
+
+		// 1. Thinking 状态（思考中动态转轮；思考完成保持常驻，直到正文流式输出）
+		if (this.state.thinkingStatus === "thinking") {
+			const elapsedSec = ((Date.now() - this.state.thinkingStartTime) / 1000).toFixed(1);
+			const spinner = SPINNER_FRAMES[Math.floor(Date.now() / 150) % SPINNER_FRAMES.length];
+			lines.push(` ${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", `${spinner} 思考中...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`);
+			this.lineMap.push(null);
+		} else if (this.state.thinkingStatus === "completed") {
+			const elapsedSec = (this.state.thinkingDurationMs / 1000).toFixed(1);
+			lines.push(` ${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", "思考完成"))} ${theme.fg("muted", `(${elapsedSec}s)`)}`);
+			this.lineMap.push(null);
+		}
+
+		// 2. 滚动工具列表（完全无高亮突变，纯净平稳）
+		for (const t of this.state.recentTools) {
+			let icon = theme.fg("accent", "⏳");
+			if (t.status === "done") icon = theme.fg("success", "✓");
+			if (t.status === "error") icon = theme.fg("error", "✗");
+
+			const badge = theme.fg("dim", `[${t.index}]`);
+			const name = theme.bold(theme.fg("toolTitle", t.name));
+			const summary = theme.fg("dim", t.summaryDisplay);
+			const time = t.durationMs !== undefined ? theme.fg("muted", ` (${t.durationMs}ms)`) : "";
+
+			lines.push(` ${icon} ${badge} ${name} ${summary}${time}`);
+			this.lineMap.push(t);
+
+			// 鼠标悬停展开：直接展示完整路径或完整命令，绝无“提示：[左右键...”教学行
+			if (this.state.hoveredItemId === t.id) {
+				if (t.fullPath) {
+					lines.push(`   ${theme.fg("accent", `↳ ${t.fullPath}`)}`);
+					this.lineMap.push(t);
+				} else if (t.fullCommand) {
+					const cmdLines = t.fullCommand.split("\n").slice(0, 8);
+					for (const cmdLine of cmdLines) {
+						lines.push(`   ${theme.fg("accent", `↳ ${cmdLine}`)}`);
+						this.lineMap.push(t);
+					}
+				}
+			}
+		}
+
+		// 3. 复制成功反馈（在组件内部优雅淡入淡出，0 污染正文）
+		if (this.state.copyFeedbackMessage) {
+			lines.push(`   ${theme.fg("success", `↳ ${this.state.copyFeedbackMessage}`)}`);
+			this.lineMap.push(null);
+		}
+
+		// 4. 独立临时报错 Alert 块
+		if (this.state.activeError) {
+			const errHeader = ` ${theme.fg("error", "🔴")} ${theme.bold(theme.fg("error", `[Error in #${this.state.activeError.index} ${this.state.activeError.toolName}]`))} ${theme.fg("dim", this.state.activeError.summary)}`;
+			const errBody = `    ${theme.fg("error", truncate(this.state.activeError.message.replace(/\r?\n/g, " "), 100))}`;
+			lines.push(errHeader);
+			this.lineMap.push(null);
+			lines.push(errBody);
+			this.lineMap.push(null);
+		}
+
+		// 5. 主要回复完成标识（仅在整个回合结束时附加展示）
+		if (this.state.completedMessage) {
+			lines.push(` ${theme.fg("success", `✓ ${this.state.completedMessage}`)}`);
+			this.lineMap.push(null);
+		}
+
+		return lines;
+	}
+
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		// 鼠标移动：根据 y 坐标精准匹配工具项，0ms 立即更新悬停项并重绘
+		if (event.type === "move") {
+			const target = event.y >= 0 && event.y < this.lineMap.length ? this.lineMap[event.y] : null;
+			const targetId = target ? target.id : null;
+			if (this.state.hoveredItemId !== targetId) {
+				this.state.hoveredItemId = targetId;
+				this.tui?.requestRender?.();
+				return { handled: true };
+			}
+			return undefined;
+		}
+
+		// 鼠标点击（左键或右键）
+		if (event.type === "click") {
+			const target = event.y >= 0 && event.y < this.lineMap.length ? this.lineMap[event.y] : null;
+			if (!target) return undefined;
+
+			// Ctrl + 左键：打开文件
+			if (event.ctrl && target.fullPath) {
+				openFile(target.fullPath);
+				this.ctx.ui.setStatus("clipboard", this.theme.fg("accent", `正在打开文件: ${truncate(target.fullPath, 40)}`));
+				setTimeout(() => this.ctx.ui.setStatus("clipboard", undefined), 2500);
+				return { handled: true };
+			}
+
+			// 左右键点击：复制文件完整路径或完整命令（绝不向正文输出任何提示文字！）
+			const textToCopy = target.fullPath || target.fullCommand;
+			if (textToCopy) {
+				copyToClipboard(textToCopy);
+				const label = target.fullPath ? "完整路径" : "完整命令";
+				this.state.copyFeedbackMessage = `✓ 已复制${label}至剪贴板: ${truncate(textToCopy, 45)}`;
+
+				this.ctx.ui.setStatus("clipboard", this.theme.fg("success", `✓ 已复制${label}到剪贴板`));
+
+				if (this.copyFeedbackTimer) clearTimeout(this.copyFeedbackTimer);
+				this.copyFeedbackTimer = setTimeout(() => {
+					this.state.copyFeedbackMessage = null;
+					this.ctx.ui.setStatus("clipboard", undefined);
+					this.tui?.requestRender?.();
+				}, 2500);
+
+				this.tui?.requestRender?.();
+				return { handled: true };
+			}
+		}
+
+		return undefined;
+	}
+
+	invalidate(): void {}
+}
+
 export default function rollingTools(pi: ExtensionAPI): void {
-	const recentTools: ToolItem[] = [];
 	let totalToolCount = 0;
 	let enabled = true;
-
-	// Thinking 状态
-	let isThinking = false;
-	let thinkingStartTime = 0;
 	let thinkingTimer: any = null;
 
-	// 临时报错状态
-	let activeError: ActiveError | null = null;
-
-	// 悬停交互与复制提示状态
-	let hoveredItemId: string | null = null;
-	let copyFeedbackMessage: string | null = null;
-	let copyFeedbackTimer: any = null;
-
-	// 主回复完成状态
-	let completedMessage: string | null = null;
+	const state: WidgetState = {
+		thinkingStatus: "idle",
+		thinkingStartTime: 0,
+		thinkingDurationMs: 0,
+		recentTools: [],
+		activeError: null,
+		hoveredItemId: null,
+		copyFeedbackMessage: null,
+		completedMessage: null,
+	};
 
 	function stopThinkingTimer(): void {
 		if (thinkingTimer) {
@@ -212,12 +361,15 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		}
 	}
 
-	function updateWidget(ctx: any): void {
+	function syncWidget(ctx: any): void {
 		if (!ctx?.hasUI) return;
 
 		const hasContent =
 			enabled &&
-			(isThinking || recentTools.length > 0 || activeError !== null || completedMessage !== null);
+			(state.thinkingStatus !== "idle" ||
+				state.recentTools.length > 0 ||
+				state.activeError !== null ||
+				state.completedMessage !== null);
 
 		if (!hasContent) {
 			ctx.ui.setWidget("rolling-tools", undefined);
@@ -226,133 +378,30 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 		ctx.ui.setWidget(
 			"rolling-tools",
-			(tui: any, theme: any) => {
-				const container = new Container();
-
-				// 1. Thinking 状态块：仅在进行中展示动画与秒表，思考结束直接隐去，绝不显示“思考完成”
-				if (isThinking) {
-					const elapsedSec = ((Date.now() - thinkingStartTime) / 1000).toFixed(1);
-					const spinner = SPINNER_FRAMES[Math.floor(Date.now() / 150) % SPINNER_FRAMES.length];
-					const thinkingLine = `${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", `${spinner} 思考中...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`;
-					container.addChild(new Text(thinkingLine, 1, 0));
-				}
-
-				// 2. 滚动工具列表（完全无高亮突变，视觉保持平静稳定）
-				const hoveredItem = hoveredItemId ? recentTools.find((t) => t.id === hoveredItemId) : null;
-
-				for (const t of recentTools) {
-					let icon = theme.fg("accent", "⏳");
-					if (t.status === "done") icon = theme.fg("success", "✓");
-					if (t.status === "error") icon = theme.fg("error", "✗");
-
-					const badge = theme.fg("dim", `[${t.index}]`);
-					const name = theme.bold(theme.fg("toolTitle", t.name));
-					const summary = theme.fg("dim", t.summaryDisplay);
-					const time = t.durationMs !== undefined ? theme.fg("muted", ` (${t.durationMs}ms)`) : "";
-
-					const lineText = `${icon} ${badge} ${name} ${summary}${time}`;
-					const textComponent = new Text(lineText, 1, 0);
-
-					const mouseRegion = new MouseRegion(textComponent, (event) => {
-						// 鼠标移入：仅触发展开 Tips，不改变行内高亮
-						if (event.type === "move") {
-							if (hoveredItemId !== t.id) {
-								hoveredItemId = t.id;
-								tui.requestRender();
-							}
-							return { handled: true };
-						}
-
-						// 鼠标点击
-						if (event.type === "click") {
-							// Ctrl + 左键：打开文件
-							if (event.ctrl && t.fullPath) {
-								openFile(t.fullPath);
-								ctx.ui.setStatus("clipboard", theme.fg("accent", `正在打开文件: ${truncate(t.fullPath, 40)}`));
-								setTimeout(() => ctx.ui.setStatus("clipboard", undefined), 2500);
-								return { handled: true };
-							}
-
-							// 左右键点击：复制完整路径或完整命令（绝不向正文输出任何提示文字！）
-							const textToCopy = t.fullPath || t.fullCommand;
-							if (textToCopy) {
-								copyToClipboard(textToCopy);
-								const label = t.fullPath ? "完整路径" : "完整命令";
-								copyFeedbackMessage = `✓ 已复制${label}至剪贴板: ${truncate(textToCopy, 45)}`;
-
-								ctx.ui.setStatus("clipboard", theme.fg("success", `✓ 已复制${label}到剪贴板`));
-
-								if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer);
-								copyFeedbackTimer = setTimeout(() => {
-									copyFeedbackMessage = null;
-									ctx.ui.setStatus("clipboard", undefined);
-									tui.requestRender();
-								}, 2500);
-
-								tui.requestRender();
-								return { handled: true };
-							}
-						}
-
-						return undefined;
-					});
-
-					container.addChild(mouseRegion);
-				}
-
-				// 3. 悬停展开面板（直接展示完整路径或完整命令，无多余教学字样）
-				if (hoveredItem) {
-					if (hoveredItem.fullPath) {
-						container.addChild(new Text(theme.fg("accent", `  ↳ ${hoveredItem.fullPath}`), 1, 0));
-					} else if (hoveredItem.fullCommand) {
-						const cmdLines = hoveredItem.fullCommand.split("\n").slice(0, 8);
-						for (const cmdLine of cmdLines) {
-							container.addChild(new Text(theme.fg("accent", `  ↳ ${cmdLine}`), 1, 0));
-						}
-					}
-				}
-
-				// 4. 复制成功反馈（在 Widget 内部优雅显示，正文零污染）
-				if (copyFeedbackMessage) {
-					container.addChild(new Text(theme.fg("success", `  ↳ ${copyFeedbackMessage}`), 1, 0));
-				}
-
-				// 5. 独立临时报错 Alert 块
-				if (activeError) {
-					const errHeader = `${theme.fg("error", "🔴")} ${theme.bold(theme.fg("error", `[Error in #${activeError.index} ${activeError.toolName}]`))} ${theme.fg("dim", activeError.summary)}`;
-					const errBody = `   ${theme.fg("error", truncate(activeError.message.replace(/\r?\n/g, " "), 100))}`;
-					container.addChild(new Text(errHeader, 1, 0));
-					container.addChild(new Text(errBody, 1, 0));
-				}
-
-				// 6. 主回复完成标识：正文输出完毕后展示 Completed
-				if (completedMessage) {
-					container.addChild(new Text(theme.fg("success", `✓ ${completedMessage}`), 1, 0));
-				}
-
-				return container;
-			},
+			(tui: any, theme: any) => new RollingToolsWidgetComponent(tui, theme, state, ctx),
 			{ placement: "aboveEditor" },
 		);
 	}
 
-	// 1. 用户提问（新一轮交互）重置
+	// 1. 用户提问（新一轮交互开始）时重置所有状态
 	pi.on("agent_start", async (_event, ctx) => {
 		stopThinkingTimer();
-		recentTools.length = 0;
+		state.recentTools = [];
 		totalToolCount = 0;
-		isThinking = false;
-		thinkingStartTime = 0;
-		activeError = null;
-		hoveredItemId = null;
-		copyFeedbackMessage = null;
-		completedMessage = null;
-		updateWidget(ctx);
+		state.thinkingStatus = "idle";
+		state.thinkingStartTime = 0;
+		state.thinkingDurationMs = 0;
+		state.activeError = null;
+		state.hoveredItemId = null;
+		state.copyFeedbackMessage = null;
+		state.completedMessage = null;
+		syncWidget(ctx);
 	});
 
 	// 2. 消息流式事件：
 	// - 保证思考动画最少可见 1.5 秒
-	// - 彻底过滤正文中的 thinking 块，消除占位符与空行
+	// - 思考完成更新为“思考完成”并常驻，直到正文流式输出才退场
+	// - 彻底过滤正文中的 thinking 块，消除占位符与空行！
 	pi.on("message_update", async (event, ctx) => {
 		if (event.message?.role === "assistant" && Array.isArray(event.message.content)) {
 			event.message.content = event.message.content.filter((c: any) => c.type !== "thinking");
@@ -362,35 +411,38 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		if (!ev) return;
 
 		if (ev.type === "thinking_start" || ev.type === "thinking_delta") {
-			if (!isThinking) {
-				isThinking = true;
-				thinkingStartTime = Date.now();
+			if (state.thinkingStatus !== "thinking") {
+				state.thinkingStatus = "thinking";
+				state.thinkingStartTime = Date.now();
 				stopThinkingTimer();
 				thinkingTimer = setInterval(() => {
-					updateWidget(ctx);
+					syncWidget(ctx);
 				}, 100);
-				updateWidget(ctx);
+				syncWidget(ctx);
 			}
 		} else if (ev.type === "thinking_end") {
-			const elapsed = Date.now() - thinkingStartTime;
+			// 保证思考动画至少展示 MIN_THINKING_DISPLAY_MS，避免一闪而过
+			const elapsed = Date.now() - state.thinkingStartTime;
 			const remaining = Math.max(0, MIN_THINKING_DISPLAY_MS - elapsed);
 			setTimeout(() => {
-				isThinking = false;
 				stopThinkingTimer();
-				updateWidget(ctx);
+				// 思考结束更新为“思考完成”，绝不提前退场，继续在 Widget 顶部常驻
+				state.thinkingStatus = "completed";
+				state.thinkingDurationMs = Date.now() - (state.thinkingStartTime || Date.now());
+				syncWidget(ctx);
 			}, remaining);
 		}
 
-		// 正文流式输出：停止思考，不显示思考完成，错误若有已自愈则收起
+		// 正文流式输出时：思考状态才正式退场让位！
 		const isTextStreaming =
 			ev.type === "text_start" ||
 			(ev.type === "text_delta" && typeof ev.delta === "string" && ev.delta.trim().length > 0);
 
 		if (isTextStreaming) {
-			isThinking = false;
+			state.thinkingStatus = "idle";
 			stopThinkingTimer();
-			activeError = null;
-			updateWidget(ctx);
+			state.activeError = null;
+			syncWidget(ctx);
 		}
 	});
 
@@ -405,24 +457,22 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		}
 	});
 
-	// 3. 回合执行结束：主回复生成完毕，展示 Completed 标识
+	// 3. 回合执行结束：主要回复已全部生成完成，展示 Completed
 	pi.on("turn_end", async (_event, ctx) => {
 		stopThinkingTimer();
-		isThinking = false;
-		completedMessage = "Completed";
-		updateWidget(ctx);
+		state.thinkingStatus = "idle";
+		state.completedMessage = "Completed";
+		syncWidget(ctx);
 	});
 
-	// 4. 工具调用开始
+	// 4. 工具调用开始：工具常驻加入队列，如果有下一次思考，后续事件会再次激活思考中
 	pi.on("tool_call", async (event, ctx) => {
 		totalToolCount++;
-		isThinking = false;
-		stopThinkingTimer();
 
 		const cwd = ctx?.cwd || process.cwd();
 		const { summaryDisplay, fullPath, fullCommand } = extractSummaryAndMetadata(event.toolName, event.input, cwd);
 
-		recentTools.push({
+		state.recentTools.push({
 			id: event.toolCallId,
 			index: totalToolCount,
 			name: event.toolName,
@@ -433,16 +483,16 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			startTime: Date.now(),
 		});
 
-		if (recentTools.length > MAX_RECENT_TOOLS) {
-			recentTools.shift();
+		if (state.recentTools.length > MAX_RECENT_TOOLS) {
+			state.recentTools.shift();
 		}
 
-		updateWidget(ctx);
+		syncWidget(ctx);
 	});
 
 	// 5. 工具调用完成
 	pi.on("tool_result", async (event, ctx) => {
-		const item = recentTools.find((t) => t.id === event.toolCallId);
+		const item = state.recentTools.find((t) => t.id === event.toolCallId);
 		if (item) {
 			item.status = event.isError ? "error" : "done";
 			item.durationMs = Date.now() - item.startTime;
@@ -451,17 +501,17 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		if (event.isError) {
 			const textContent = (event.content as any[])?.find((c) => c.type === "text");
 			const rawError = textContent?.text || "Tool execution failed";
-			activeError = {
+			state.activeError = {
 				toolName: event.toolName,
 				index: item?.index ?? totalToolCount,
 				summary: item?.summaryDisplay || "",
 				message: rawError.trim(),
 			};
 		} else {
-			activeError = null;
+			state.activeError = null;
 		}
 
-		updateWidget(ctx);
+		syncWidget(ctx);
 	});
 
 	// 6. 开关控制命令
@@ -470,17 +520,17 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			if (args === "off") {
 				enabled = false;
-				updateWidget(ctx);
+				syncWidget(ctx);
 				ctx.ui.setStatus("rolling-tools", "Rolling tools disabled");
 				setTimeout(() => ctx.ui.setStatus("rolling-tools", undefined), 2000);
 			} else if (args === "on") {
 				enabled = true;
-				updateWidget(ctx);
+				syncWidget(ctx);
 				ctx.ui.setStatus("rolling-tools", "Rolling tools enabled");
 				setTimeout(() => ctx.ui.setStatus("rolling-tools", undefined), 2000);
 			} else {
 				enabled = !enabled;
-				updateWidget(ctx);
+				syncWidget(ctx);
 				ctx.ui.setStatus("rolling-tools", `Rolling tools: ${enabled ? "enabled" : "disabled"}`);
 				setTimeout(() => ctx.ui.setStatus("rolling-tools", undefined), 2000);
 			}
@@ -531,7 +581,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 					if (!context.expanded && isSafe) {
 						return new EmptyComponent();
 					}
-					// 仅渲染单行调用头，绝不二次包装独立 Box
+					// 仅渲染单行调用头，绝不包装冗余独立 Box
 					const title = theme.fg("toolTitle", theme.bold("$"));
 					const cmdDisplay = args?.command?.trim() || "";
 					return new Text(`${title} ${theme.fg("accent", truncate(cmdDisplay, 80))}`, 1, 0);
@@ -557,7 +607,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 						return new EmptyComponent();
 					}
 
-					// 仅渲染单次输出内容，与 renderCall 无缝衔接在同一区域，杜绝二次渲染与双重 Box！
+					// 仅渲染单次输出内容，与 renderCall 顺畅衔接在同一块区域，彻底杜绝重复打两次框！
 					const textContent = result.content?.find((c: any) => c.type === "text");
 					const raw = textContent?.text || "";
 					const maxLines = expanded ? 40 : 5;

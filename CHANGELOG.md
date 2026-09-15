@@ -4,6 +4,7 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- feat(extensions): dynamic RollingToolsWidgetComponent for instant 0ms hover tips, thinking completed stays until text streams, and fix duplicate bash box.
 - feat(extensions): clean hover tips without instructional prefix, show Completed on turn end, fix duplicate bash rendering, and eliminate thinking completed label.
 - feat(extensions): minimum 1.5s thinking animation, remove hover text highlight, fix multiline bash allowlist splitting, and eliminate completed message labels.
 - feat(extensions): complete thinking elimination from transcript, gentle bulb icon, native TUI hover/click interactions for paths and multiline commands, and full pi-tool-display ownership for bash/edit/write.
