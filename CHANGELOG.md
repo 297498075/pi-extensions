@@ -4,6 +4,7 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- feat(extensions): switch detail expansion from hover to click toggle with visual indicator, include bash unconditionally in rolling widget, silence collapsed bash in transcript, and support in-detail copy and execution output view.
 - fix(extensions): precise text-width X-axis hover boundary, unconditional 0-line silence for read/grep/find/ls, and enforce default collapsed tools on agent start.
 - feat(extensions): unified single OpenCode box for bash with strict 5-line limit, full silence for read-only tools and allowlisted bash, and completed on agent end.
 - feat(extensions): add waiting server response state sharing top line with thinking, with globe icon and dynamic request timer.
