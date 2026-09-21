@@ -154,6 +154,15 @@ Load directly:
 pi --extension ./extensions/rolling-tools.ts
 ```
 
+## IDM Download (Skill)
+
+`skills/idm-download` 提供将大文件、模型权重（`.safetensors`, `.pth` 等）和数据集自动化推送到 Windows 本地 **Internet Download Manager (IDM / `IDMan.exe`)** 进行多线程后台下载的能力：
+
+- **零外部依赖**: 内置纯标准库 Python 脚本 `scripts/idm_push.py`，支持单任务直推、仅入队（`/a`）、批量文件/JSON 解析与启动队列（`/s`）。
+- **可执行文件自动发现**: 自动扫描默认安装路径、`PATH`、Windows Registry 及环境变量 `IDM_PATH`，同时支持通过 `--idm-path` 显式指定。
+- **ComfyUI 目录映射**: 内置 Diffusion Models, Checkpoints, Text Encoders, VAE, LoRA, ControlNet 等分类的推荐存放子目录。
+- **镜像源解析指引**: 针对 ModelScope CDN、Hugging Face (含国内镜像) 及 Civitai 提供直接下载链接格式规范。
+
 ## Pi package
 
 ```bash
