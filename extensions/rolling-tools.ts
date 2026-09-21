@@ -1088,15 +1088,6 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				currentConfig.enabled = true;
 				syncWidget(ctx);
 				ctx.ui?.notify?.("rolling-tools: 已启用正文静音与滚动条", "info");
-			} else if (action === "test-solpi") {
-				const mockMsg = "⚡ SoL-Pi · Observation Pack\nMoney saved · 18.5k context tokens avoided ($0.05)";
-				state.solPiSavings = parseSolPiSavings(mockMsg);
-				syncWidget(ctx);
-				ctx.ui?.notify?.("✓ rolling-tools: 已模拟注入 SoL-Pi 节省信息徽标至滚动条", "info");
-			} else if (action === "clear-solpi") {
-				state.solPiSavings = null;
-				syncWidget(ctx);
-				ctx.ui?.notify?.("✓ rolling-tools: 已清除 SoL-Pi 节省徽标", "info");
 			} else if (action === "status") {
 				const info = [
 					`rolling-tools 状态:`,
