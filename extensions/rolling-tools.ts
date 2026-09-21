@@ -643,23 +643,12 @@ class RollingToolsWidgetComponent implements Component {
 			}
 		}
 
-		// 3. SoL-Pi 节省信息徽标行（静音通知后在此就地呈现，可点击复制）
-		if (this.state.solPiSavings) {
-			const full = this.state.solPiSavings.fullMessage;
-			pushLine(
-				` ${theme.fg("warning", "⚡")} ${theme.bold(theme.fg("accent", "SoL-Pi"))} ${theme.fg("success", `Money saved · ${this.state.solPiSavings.summary}`)}`,
-				null,
-				"detail_copyable",
-				full,
-			);
-		}
-
-		// 4. 复制成功反馈（仅在 Widget 内部就地显示，绝对 0 污染）
+		// 3. 复制成功反馈（仅在 Widget 内部就地显示，绝对 0 污染）
 		if (this.state.copyFeedbackMessage) {
 			pushLine(`   ${theme.fg("success", `↳ ${this.state.copyFeedbackMessage}`)}`);
 		}
 
-		// 5. 独立临时报错 Alert 块
+		// 4. 独立临时报错 Alert 块
 		if (this.state.activeError) {
 			const errHeader = ` ${theme.fg("error", "🔴")} ${theme.bold(theme.fg("error", `[Error in #${this.state.activeError.index} ${this.state.activeError.toolName}]`))} ${theme.fg("dim", this.state.activeError.summary)}`;
 			const errBody = `    ${theme.fg("error", truncate(this.state.activeError.message.replace(/\r?\n/g, " "), 100))}`;
@@ -667,7 +656,7 @@ class RollingToolsWidgetComponent implements Component {
 			pushLine(errBody);
 		}
 
-		// 6. 主回复完成标识（仅在整个 Agent 回复完全生成完毕后才附带显示）
+		// 5. 主回复完成标识（仅在整个 Agent 回复完全生成完毕后才附带显示）
 		if (this.state.completedMessage) {
 			pushLine(` ${theme.fg("success", `✓ ${this.state.completedMessage}`)}`);
 		}
@@ -766,6 +755,29 @@ function installToolExecutionRenderHook(getConfig: () => RollingToolsConfig): vo
 }
 
 /**
+ * 格式化底部状态栏的 SoL-Pi 提示信息，赋予与主题一致的原生配色
+ */
+function formatColoredSolPiStatus(rawText: string, theme?: any): string {
+	const match = rawText.match(/^⚡\s*(?:SoL-Pi\s*·\s*)?(.*?)\s*·\s*(.*)$/);
+	if (match) {
+		const mechanism = match[1] || "Observation Pack";
+		const saving = match[2] || "";
+		if (theme?.fg) {
+			const yellowLightning = theme.fg("warning", "⚡");
+			const cyanMechanism = theme.fg("accent", theme.bold(mechanism));
+			const greenSaving = theme.fg("success", saving);
+			const dimDot = theme.fg("dim", "·");
+			return `${yellowLightning} ${cyanMechanism} ${dimDot} ${greenSaving}`;
+		}
+		return `\x1b[33m⚡\x1b[39m \x1b[1;36m${mechanism}\x1b[22;39m \x1b[90m·\x1b[39m \x1b[32m${saving}\x1b[39m`;
+	}
+	return rawText;
+}
+
+let solPiStatusTimer: any = null;
+let solPiStatusExpireTime = 0;
+
+/**
  * 劫持 InteractiveMode.prototype.showExtensionNotify 与 setExtensionStatus
  * 从全局 UI 根层级拦截通知与状态更新，实现 100% 可靠的静音与数据注入
  */
@@ -794,8 +806,29 @@ function installInteractiveModeNotificationHook(
 
 	const originalSetExtensionStatus = proto.setExtensionStatus;
 	proto.setExtensionStatus = function (this: any, key: string, text: string | undefined) {
-		if (key === "sol-pi" && text) {
-			onIntercept(text);
+		if (key === "sol-pi") {
+			if (text) {
+				// 新提示到达：清除旧定时器，重置为 3 秒
+				if (solPiStatusTimer) {
+					clearTimeout(solPiStatusTimer);
+					solPiStatusTimer = null;
+				}
+				solPiStatusExpireTime = Date.now() + 3000;
+				const coloredText = formatColoredSolPiStatus(text, this.themeController?.currentTheme);
+				originalSetExtensionStatus.call(this, key, coloredText);
+
+				solPiStatusTimer = setTimeout(() => {
+					solPiStatusTimer = null;
+					originalSetExtensionStatus.call(this, key, undefined);
+				}, 3000);
+				return;
+			} else {
+				// SoL-Pi 内部定时器尝试提前清空：若 3 秒尚未到期，阻止提前擦除
+				const remaining = solPiStatusExpireTime - Date.now();
+				if (remaining > 0) {
+					return;
+				}
+			}
 		}
 		return originalSetExtensionStatus.call(this, key, text);
 	};
@@ -849,8 +882,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			(state.headerStatus.type !== "idle" ||
 				state.recentTools.length > 0 ||
 				state.activeError !== null ||
-				state.completedMessage !== null ||
-				state.solPiSavings !== null);
+				state.completedMessage !== null);
 
 		if (!hasContent) {
 			ctx.ui.setWidget("rolling-tools", undefined);

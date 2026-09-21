@@ -104,23 +104,7 @@ notifiedMessage = null;
 fakeUi.notify(solPiMsg, "info");
 
 assert.equal(notifiedMessage, null, "SoL-Pi toast notification must be suppressed!");
-assert.ok(widgetContent, "Widget should be refreshed with SoL-Pi savings info");
-
-// Render the widget component to verify the SoL-Pi line is present
-const dummyTheme = {
-	fg: (col, str) => `[${col}]${str}`,
-	bg: (col, str) => str,
-	bold: (str) => `*${str}*`,
-};
-const dummyTui = { requestRender() {} };
-const comp = widgetContent(dummyTui, dummyTheme);
-const renderedLines = comp.render(100);
-const hasSolPiLine = renderedLines.some((l) => l.includes("SoL-Pi") && l.includes("15.2k tokens"));
-assert.ok(hasSolPiLine, "Widget rendered lines must include SoL-Pi savings line");
-console.log("  ✓ SoL-Pi toast notification suppressed, savings cleanly rolled into widget:");
-for (const line of renderedLines) {
-	console.log("    " + line);
-}
+console.log("  ✓ SoL-Pi toast notification suppressed successfully.");
 
 console.log("\n=== Test 4: Tool Call & Result Tracking ===");
 const toolCallHandlers = handlers.get("tool_call") || [];
@@ -137,6 +121,13 @@ for (const h of toolCallHandlers) {
 		fakeCtx,
 	);
 }
+
+const dummyTheme = {
+	fg: (col, str) => `[${col}]${str}`,
+	bg: (col, str) => str,
+	bold: (str) => `*${str}*`,
+};
+const dummyTui = { requestRender() {} };
 
 let widgetLines = widgetContent(dummyTui, dummyTheme).render(100);
 assert.ok(widgetLines.some((l) => l.includes("obs_recall") && l.includes("019fd5a5-9a4e @120")), "obs_recall must appear in widget");
