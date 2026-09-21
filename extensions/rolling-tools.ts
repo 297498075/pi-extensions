@@ -755,10 +755,11 @@ function installToolExecutionRenderHook(getConfig: () => RollingToolsConfig): vo
 }
 
 /**
- * 格式化底部状态栏的 SoL-Pi 提示信息，赋予与主题一致的原生配色
+ * 格式化底部状态栏的 SoL-Pi 提示信息，赋予与主题一致的原生配色并附带相对时间
  */
-function formatColoredSolPiStatus(rawText: string, theme?: any): string {
+function formatColoredSolPiStatus(rawText: string, theme?: any, elapsedSec?: number): string {
 	const match = rawText.match(/^⚡\s*(?:SoL-Pi\s*·\s*)?(.*?)\s*·\s*(.*)$/);
+	const timeSuffix = elapsedSec !== undefined ? ` (${elapsedSec}s ago)` : "";
 	if (match) {
 		const mechanism = match[1] || "Observation Pack";
 		const saving = match[2] || "";
@@ -767,15 +768,18 @@ function formatColoredSolPiStatus(rawText: string, theme?: any): string {
 			const cyanMechanism = theme.fg("accent", theme.bold(mechanism));
 			const greenSaving = theme.fg("success", saving);
 			const dimDot = theme.fg("dim", "·");
-			return `${yellowLightning} ${cyanMechanism} ${dimDot} ${greenSaving}`;
+			const mutedTime = theme.fg("muted", timeSuffix);
+			return `${yellowLightning} ${cyanMechanism} ${dimDot} ${greenSaving}${mutedTime}`;
 		}
-		return `\x1b[33m⚡\x1b[39m \x1b[1;36m${mechanism}\x1b[22;39m \x1b[90m·\x1b[39m \x1b[32m${saving}\x1b[39m`;
+		return `\x1b[33m⚡\x1b[39m \x1b[1;36m${mechanism}\x1b[22;39m \x1b[90m·\x1b[39m \x1b[32m${saving}\x1b[39m \x1b[90m${timeSuffix}\x1b[39m`;
 	}
-	return rawText;
+	return rawText + (timeSuffix ? ` \x1b[90m${timeSuffix}\x1b[39m` : "");
 }
 
-let solPiStatusTimer: any = null;
-let solPiStatusExpireTime = 0;
+const SOL_PI_STATUS_MAX_DURATION_MS = 30_000;
+let solPiStatusInterval: any = null;
+let solPiStartTime = 0;
+let lastSolPiRawText = "";
 
 /**
  * 劫持 InteractiveMode.prototype.showExtensionNotify 与 setExtensionStatus
@@ -808,24 +812,43 @@ function installInteractiveModeNotificationHook(
 	proto.setExtensionStatus = function (this: any, key: string, text: string | undefined) {
 		if (key === "sol-pi") {
 			if (text) {
-				// 新提示到达：清除旧定时器，重置为 3 秒
-				if (solPiStatusTimer) {
-					clearTimeout(solPiStatusTimer);
-					solPiStatusTimer = null;
+				// 新提示到达：清除旧定时器，重置起始时间
+				if (solPiStatusInterval) {
+					clearInterval(solPiStatusInterval);
+					solPiStatusInterval = null;
 				}
-				solPiStatusExpireTime = Date.now() + 3000;
-				const coloredText = formatColoredSolPiStatus(text, this.themeController?.currentTheme);
-				originalSetExtensionStatus.call(this, key, coloredText);
+				lastSolPiRawText = text;
+				solPiStartTime = Date.now();
 
-				solPiStatusTimer = setTimeout(() => {
-					solPiStatusTimer = null;
-					originalSetExtensionStatus.call(this, key, undefined);
-				}, 3000);
+				const updateStatus = () => {
+					const elapsedSec = Math.floor((Date.now() - solPiStartTime) / 1000);
+					if (elapsedSec >= Math.floor(SOL_PI_STATUS_MAX_DURATION_MS / 1000)) {
+						if (solPiStatusInterval) {
+							clearInterval(solPiStatusInterval);
+							solPiStatusInterval = null;
+						}
+						lastSolPiRawText = "";
+						originalSetExtensionStatus.call(this, key, undefined);
+						return;
+					}
+					const coloredText = formatColoredSolPiStatus(
+						lastSolPiRawText,
+						this.themeController?.currentTheme,
+						elapsedSec,
+					);
+					originalSetExtensionStatus.call(this, key, coloredText);
+				};
+
+				updateStatus();
+				solPiStatusInterval = setInterval(updateStatus, 1000);
+				if (typeof solPiStatusInterval === "object" && "unref" in solPiStatusInterval) {
+					solPiStatusInterval.unref();
+				}
 				return;
 			} else {
-				// SoL-Pi 内部定时器尝试提前清空：若 3 秒尚未到期，阻止提前擦除
-				const remaining = solPiStatusExpireTime - Date.now();
-				if (remaining > 0) {
+				// SoL-Pi 内部定时器尝试提前清空：若 30 秒尚未到期，阻止提前擦除
+				const remaining = solPiStartTime + SOL_PI_STATUS_MAX_DURATION_MS - Date.now();
+				if (remaining > 0 && lastSolPiRawText) {
 					return;
 				}
 			}
@@ -1098,6 +1121,10 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	// 9. 会话终止清理资源
 	pi.on("session_shutdown", async () => {
 		stopStatusTimer();
+		if (solPiStatusInterval) {
+			clearInterval(solPiStatusInterval);
+			solPiStatusInterval = null;
+		}
 	});
 
 	// 10. 管理控制命令
