@@ -669,10 +669,7 @@ class RollingToolsWidgetComponent implements Component {
 
 		// 6. 主回复完成标识（仅在整个 Agent 回复完全生成完毕后才附带显示）
 		if (this.state.completedMessage) {
-			const solPiBadge = this.state.solPiSavings
-				? ` · ${theme.fg("warning", "⚡")} ${theme.fg("success", this.state.solPiSavings.summary)}`
-				: "";
-			pushLine(` ${theme.fg("success", `✓ ${this.state.completedMessage}`)}${solPiBadge}`);
+			pushLine(` ${theme.fg("success", `✓ ${this.state.completedMessage}`)}`);
 		}
 
 		return lines;
@@ -927,7 +924,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		state.expandedItemId = null;
 		state.copyFeedbackMessage = null;
 		state.completedMessage = null;
-		// 注意：state.solPiSavings 在会话内保持展示，不随单轮提问清空，随时展示最新节省数据
+		state.solPiSavings = null;
 		syncWidget(ctx);
 	});
 
