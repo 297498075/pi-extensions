@@ -46,6 +46,7 @@ const DEFAULT_CONFIG: RollingToolsConfig = {
 	managedTools: [
 		"read",
 		"bash",
+		"powershell",
 		"grep",
 		"find",
 		"ls",
@@ -219,13 +220,23 @@ function getLocalConfigPath(cwd: string): string {
 }
 
 function mergeConfig(base: RollingToolsConfig, override: Partial<RollingToolsConfig>): RollingToolsConfig {
+	let mergedManagedTools = base.managedTools;
+	if (Array.isArray(override.managedTools)) {
+		mergedManagedTools = [...override.managedTools];
+		// 兼容性适配：Pi 0.86+ 引入了原生 powershell 工具，若旧配置托管了 bash 则自动无缝兼容 powershell
+		if (mergedManagedTools.includes("bash") && !mergedManagedTools.includes("powershell")) {
+			const bashIdx = mergedManagedTools.indexOf("bash");
+			mergedManagedTools.splice(bashIdx + 1, 0, "powershell");
+		}
+	}
+
 	return {
 		enabled: typeof override.enabled === "boolean" ? override.enabled : base.enabled,
 		maxRecentTools:
 			typeof override.maxRecentTools === "number" && override.maxRecentTools > 0
 				? override.maxRecentTools
 				: base.maxRecentTools,
-		managedTools: Array.isArray(override.managedTools) ? [...override.managedTools] : base.managedTools,
+		managedTools: mergedManagedTools,
 		silencedTools: Array.isArray(override.silencedTools) ? [...override.silencedTools] : base.silencedTools,
 		widgetTools: Array.isArray(override.widgetTools) ? [...override.widgetTools] : base.widgetTools,
 		genericPropertyFallbacks: Array.isArray(override.genericPropertyFallbacks)
@@ -371,8 +382,8 @@ function extractSummaryAndMetadata(
 		return { summaryDisplay: "" };
 	}
 
-	// 1. 内置命令：bash
-	if (name === "bash") {
+	// 1. 内置命令：bash 与 powershell
+	if (name === "bash" || name === "powershell") {
 		const rawCmd = typeof input.command === "string" ? input.command : "";
 		const firstLine = rawCmd.split("\n")[0] || "";
 		const isMultiline = rawCmd.includes("\n");
@@ -1099,8 +1110,14 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		}
 	});
 
-	// 6. 整个 Agent 任务全部结束（正文生成完毕）后展示 Completed
+	// 6. 任务结束处理与 settled 最终状态标记
 	pi.on("agent_end", async (_event, ctx) => {
+		stopStatusTimer();
+		state.headerStatus = { type: "idle" };
+		syncWidget(ctx);
+	});
+
+	pi.on("agent_settled", async (_event, ctx) => {
 		stopStatusTimer();
 		state.headerStatus = { type: "idle" };
 		state.completedMessage = "Completed";

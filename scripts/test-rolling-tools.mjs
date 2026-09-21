@@ -32,6 +32,7 @@ console.log("\n=== Test 2: ToolExecutionComponent Silencing & Ctrl+O Expansion =
 const testTools = [
 	{ name: "read", shouldSilence: true },
 	{ name: "bash", shouldSilence: true },
+	{ name: "powershell", shouldSilence: true },
 	{ name: "grep", shouldSilence: true },
 	{ name: "find", shouldSilence: true },
 	{ name: "ls", shouldSilence: true },
@@ -183,6 +184,22 @@ for (const h of toolCallHandlers) {
 widgetLines = widgetContent(dummyTui, dummyTheme).render(100);
 assert.ok(widgetLines.some((l) => l.includes("rider-debugger:list_threads")), "mcp namespaced tool must be formatted nicely");
 console.log("  ✓ mcp__rider-debugger__list_threads formatted as rider-debugger:list_threads.");
+
+// Call powershell tool (native Windows tool in Pi 0.86+)
+for (const h of toolCallHandlers) {
+	await h(
+		{
+			toolCallId: "call_ps_1",
+			toolName: "powershell",
+			input: { command: "Get-Process\nSelect-Object -First 5" },
+		},
+		fakeCtx,
+	);
+}
+
+widgetLines = widgetContent(dummyTui, dummyTheme).render(100);
+assert.ok(widgetLines.some((l) => l.includes("powershell") && l.includes("Get-Process ↵")), "powershell multiline command must format nicely with ↵");
+console.log("  ✓ powershell command tracked and formatted with ↵ indicator.");
 
 console.log("\n=== Test 5: Command Handling (/rolling-tools) ===");
 let lastCmdNotification = null;

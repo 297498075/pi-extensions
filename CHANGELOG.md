@@ -4,6 +4,10 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- feat(compatibility): upgrade dependencies to Pi 0.86.1 (`@earendil-works/pi-coding-agent` & `@earendil-works/pi-tui`), maintaining `>=0.84.1` peer compatibility.
+- feat(rolling-tools): support Pi 0.86+ native `powershell` tool on Windows as a first-class shell command with automatic transcript silencing, multiline formatting, and backward-compatible config migration.
+- fix(rolling-tools): refine completion state handling with `agent_settled` to avoid premature completion labels during auto-retry or mid-run compactions.
+
 - feat(skills): add idm-download skill with sanitized configuration and automated background download support for IDM.
 - feat(extensions): switch detail expansion from hover to click toggle with visual indicator, include bash unconditionally in rolling widget, silence collapsed bash in transcript, and support in-detail copy and execution output view.
 - fix(extensions): precise text-width X-axis hover boundary, unconditional 0-line silence for read/grep/find/ls, and enforce default collapsed tools on agent start.
