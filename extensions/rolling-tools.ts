@@ -122,8 +122,19 @@ interface RenderedLineInfo {
 }
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const TOOL_SILENCE_HOOK_INSTALLED = Symbol.for("pi-rolling-tools.toolExecutionRenderHook.v1");
-const UI_HOOKS_INSTALLED = Symbol.for("pi-rolling-tools.uiHooksInstalled.v1");
+const DYNAMIC_HOOKS_KEY = Symbol.for("pi-rolling-tools.dynamicHooks.v3");
+
+interface DynamicHooksState {
+	installed: boolean;
+	handleToolRender?: (target: any, width: number, origRender: Function) => string[];
+	handleShowExtensionNotify?: (target: any, message: string, type: string | undefined, origFn: Function) => void;
+	handleSetExtensionStatus?: (target: any, key: string, text: string | undefined, origFn: Function) => void;
+}
+
+const dynamicHooks: DynamicHooksState = (globalThis as any)[DYNAMIC_HOOKS_KEY] ?? {
+	installed: false,
+};
+(globalThis as any)[DYNAMIC_HOOKS_KEY] = dynamicHooks;
 
 /**
  * 跨平台剪贴板复制
@@ -736,41 +747,14 @@ class RollingToolsWidgetComponent implements Component {
 }
 
 /**
- * 劫持 ToolExecutionComponent.prototype.render 实现正文工具静音
- * 当工具处于折叠状态且命中配置白名单时返回 0 行；Ctrl+O 展开时调用原生渲染器
- */
-function installToolExecutionRenderHook(getConfig: () => RollingToolsConfig): void {
-	const proto = ToolExecutionComponent.prototype as any;
-	if (proto[TOOL_SILENCE_HOOK_INSTALLED]) return;
-	proto[TOOL_SILENCE_HOOK_INSTALLED] = true;
-
-	const originalRender = proto.render;
-	proto.render = function (this: any, width: number): string[] {
-		const config = getConfig();
-		if (config.enabled && !this.expanded && shouldSilenceInTranscript(this.toolName, config)) {
-			return [];
-		}
-		return originalRender.call(this, width);
-	};
-}
-
-/**
  * 格式化底部状态栏的 SoL-Pi 提示信息，赋予与主题一致的原生配色并附带相对时间
  */
-function formatColoredSolPiStatus(rawText: string, theme?: any, elapsedSec?: number): string {
+function formatColoredSolPiStatus(rawText: string, elapsedSec?: number): string {
 	const match = rawText.match(/^⚡\s*(?:SoL-Pi\s*·\s*)?(.*?)\s*·\s*(.*)$/);
 	const timeSuffix = elapsedSec !== undefined ? ` (${elapsedSec}s ago)` : "";
 	if (match) {
 		const mechanism = match[1] || "Observation Pack";
 		const saving = match[2] || "";
-		if (theme?.fg) {
-			const yellowLightning = theme.fg("warning", "⚡");
-			const cyanMechanism = theme.fg("accent", theme.bold(mechanism));
-			const greenSaving = theme.fg("success", saving);
-			const dimDot = theme.fg("dim", "·");
-			const mutedTime = theme.fg("muted", timeSuffix);
-			return `${yellowLightning} ${cyanMechanism} ${dimDot} ${greenSaving}${mutedTime}`;
-		}
 		return `\x1b[33m⚡\x1b[39m \x1b[1;36m${mechanism}\x1b[22;39m \x1b[90m·\x1b[39m \x1b[32m${saving}\x1b[39m \x1b[90m${timeSuffix}\x1b[39m`;
 	}
 	return rawText + (timeSuffix ? ` \x1b[90m${timeSuffix}\x1b[39m` : "");
@@ -782,78 +766,35 @@ let solPiStartTime = 0;
 let lastSolPiRawText = "";
 
 /**
- * 劫持 InteractiveMode.prototype.showExtensionNotify 与 setExtensionStatus
- * 从全局 UI 根层级拦截通知与状态更新，实现 100% 可靠的静音与数据注入
+ * 安装原型劫持骨架（仅在进程初次加载时拦截一次，后续所有 reload 均由 dynamicHooks 委托热刷新）
  */
-function installInteractiveModeNotificationHook(
-	getConfig: () => RollingToolsConfig,
-	onIntercept: (message: string) => void,
-): void {
-	const proto = InteractiveMode.prototype as any;
-	if (proto[UI_HOOKS_INSTALLED]) return;
-	proto[UI_HOOKS_INSTALLED] = true;
+function ensureGlobalPrototypeHooksInstalled(): void {
+	if (dynamicHooks.installed) return;
+	dynamicHooks.installed = true;
 
-	const originalShowExtensionNotify = proto.showExtensionNotify;
-	proto.showExtensionNotify = function (this: any, message: string, type?: string) {
-		const config = getConfig();
-		const matchedRule = matchNotificationRule(message, config.interceptNotifications);
-		if (matchedRule) {
-			if (matchedRule.rollIntoWidget) {
-				onIntercept(message);
-			}
-			if (matchedRule.suppressToast) {
-				return;
-			}
+	const origToolRender = ToolExecutionComponent.prototype.render;
+	ToolExecutionComponent.prototype.render = function (this: any, width: number): string[] {
+		if (dynamicHooks.handleToolRender) {
+			return dynamicHooks.handleToolRender(this, width, origToolRender);
 		}
-		return originalShowExtensionNotify.call(this, message, type);
+		return origToolRender.call(this, width);
 	};
 
-	const originalSetExtensionStatus = proto.setExtensionStatus;
-	proto.setExtensionStatus = function (this: any, key: string, text: string | undefined) {
-		if (key === "sol-pi") {
-			if (text) {
-				// 新提示到达：清除旧定时器，重置起始时间
-				if (solPiStatusInterval) {
-					clearInterval(solPiStatusInterval);
-					solPiStatusInterval = null;
-				}
-				lastSolPiRawText = text;
-				solPiStartTime = Date.now();
-
-				const updateStatus = () => {
-					const elapsedSec = Math.floor((Date.now() - solPiStartTime) / 1000);
-					if (elapsedSec >= Math.floor(SOL_PI_STATUS_MAX_DURATION_MS / 1000)) {
-						if (solPiStatusInterval) {
-							clearInterval(solPiStatusInterval);
-							solPiStatusInterval = null;
-						}
-						lastSolPiRawText = "";
-						originalSetExtensionStatus.call(this, key, undefined);
-						return;
-					}
-					const coloredText = formatColoredSolPiStatus(
-						lastSolPiRawText,
-						this.themeController?.currentTheme,
-						elapsedSec,
-					);
-					originalSetExtensionStatus.call(this, key, coloredText);
-				};
-
-				updateStatus();
-				solPiStatusInterval = setInterval(updateStatus, 1000);
-				if (typeof solPiStatusInterval === "object" && "unref" in solPiStatusInterval) {
-					solPiStatusInterval.unref();
-				}
-				return;
-			} else {
-				// SoL-Pi 内部定时器尝试提前清空：若 30 秒尚未到期，阻止提前擦除
-				const remaining = solPiStartTime + SOL_PI_STATUS_MAX_DURATION_MS - Date.now();
-				if (remaining > 0 && lastSolPiRawText) {
-					return;
-				}
-			}
+	const interactiveProto = InteractiveMode.prototype as any;
+	const origShowNotify = interactiveProto.showExtensionNotify;
+	interactiveProto.showExtensionNotify = function (this: any, message: string, type?: string) {
+		if (dynamicHooks.handleShowExtensionNotify) {
+			return dynamicHooks.handleShowExtensionNotify(this, message, type, origShowNotify);
 		}
-		return originalSetExtensionStatus.call(this, key, text);
+		return origShowNotify.call(this, message, type);
+	};
+
+	const origSetStatus = interactiveProto.setExtensionStatus;
+	interactiveProto.setExtensionStatus = function (this: any, key: string, text: string | undefined) {
+		if (dynamicHooks.handleSetExtensionStatus) {
+			return dynamicHooks.handleSetExtensionStatus(this, key, text, origSetStatus);
+		}
+		return origSetStatus.call(this, key, text);
 	};
 }
 
@@ -873,15 +814,81 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		solPiSavings: null,
 	};
 
-	// 1. 安装正文静音 Hook 与全局通知拦截 Hook
-	installToolExecutionRenderHook(() => currentConfig);
-	installInteractiveModeNotificationHook(
-		() => currentConfig,
-		(message) => {
-			state.solPiSavings = parseSolPiSavings(message);
-			if (lastCtx) syncWidget(lastCtx);
-		},
-	);
+	// 1. 安装底层全局原型钩子骨架（单例）
+	ensureGlobalPrototypeHooksInstalled();
+
+	// 2. 动态更新委派处理函数（支持任意次数的 /reload 即刻生效！）
+	dynamicHooks.handleToolRender = (target: any, width: number, origRender: Function) => {
+		if (currentConfig.enabled && !target.expanded && shouldSilenceInTranscript(target.toolName, currentConfig)) {
+			return [];
+		}
+		return origRender.call(target, width);
+	};
+
+	dynamicHooks.handleShowExtensionNotify = (
+		target: any,
+		message: string,
+		type: string | undefined,
+		origFn: Function,
+	) => {
+		const matchedRule = matchNotificationRule(message, currentConfig.interceptNotifications);
+		if (matchedRule) {
+			if (matchedRule.rollIntoWidget) {
+				state.solPiSavings = parseSolPiSavings(message);
+				if (lastCtx) syncWidget(lastCtx);
+			}
+			if (matchedRule.suppressToast) {
+				return;
+			}
+		}
+		return origFn.call(target, message, type);
+	};
+
+	dynamicHooks.handleSetExtensionStatus = (
+		target: any,
+		key: string,
+		text: string | undefined,
+		origFn: Function,
+	) => {
+		if (key === "sol-pi") {
+			if (text) {
+				if (solPiStatusInterval) {
+					clearInterval(solPiStatusInterval);
+					solPiStatusInterval = null;
+				}
+				lastSolPiRawText = text;
+				solPiStartTime = Date.now();
+
+				const updateStatus = () => {
+					const elapsedSec = Math.floor((Date.now() - solPiStartTime) / 1000);
+					if (elapsedSec >= Math.floor(SOL_PI_STATUS_MAX_DURATION_MS / 1000)) {
+						if (solPiStatusInterval) {
+							clearInterval(solPiStatusInterval);
+							solPiStatusInterval = null;
+						}
+						lastSolPiRawText = "";
+						origFn.call(target, key, undefined);
+						return;
+					}
+					const coloredText = formatColoredSolPiStatus(lastSolPiRawText, elapsedSec);
+					origFn.call(target, key, coloredText);
+				};
+
+				updateStatus();
+				solPiStatusInterval = setInterval(updateStatus, 1000);
+				if (typeof solPiStatusInterval === "object" && "unref" in solPiStatusInterval) {
+					solPiStatusInterval.unref();
+				}
+				return;
+			} else {
+				const remaining = solPiStartTime + SOL_PI_STATUS_MAX_DURATION_MS - Date.now();
+				if (remaining > 0 && lastSolPiRawText) {
+					return;
+				}
+			}
+		}
+		return origFn.call(target, key, text);
+	};
 
 	function stopStatusTimer(): void {
 		if (statusTimer) {
@@ -920,13 +927,14 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * 安装 UI 通知 Hook（用于拦截并静音 SoL-Pi 弹窗，将节省信息融入滚动条）
+	 * 安装 UI 通知 Hook（用于拦截并静音 SoL-Pi 弹窗）
 	 */
 	function installUiHooks(ctx: ExtensionContext): void {
 		if (!ctx?.hasUI || !ctx.ui) return;
 		const ui = ctx.ui as any;
-		if (ui[UI_HOOKS_INSTALLED]) return;
-		ui[UI_HOOKS_INSTALLED] = true;
+		const hookKey = Symbol.for("pi-rolling-tools.contextUiHook.v1");
+		if (ui[hookKey]) return;
+		ui[hookKey] = true;
 
 		const originalNotify = ui.notify?.bind(ui);
 		if (originalNotify) {
