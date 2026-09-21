@@ -136,6 +136,14 @@ Example configuration (`~/.pi/agent/extensions/rolling-tools/config.json`):
       "suppressToast": true,
       "rollIntoWidget": true
     }
+  ],
+  "statusEnhancements": [
+    {
+      "keyPattern": "sol-pi*",
+      "durationMs": 30000,
+      "showRelativeTime": true,
+      "colorize": true
+    }
   ]
 }
 ```

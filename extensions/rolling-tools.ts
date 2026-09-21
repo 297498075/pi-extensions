@@ -17,6 +17,16 @@ interface InterceptNotificationRule {
 }
 
 /**
+ * 状态栏增强规则（支持通配符、可配置时长、相对时间戳与自适应语法着色）
+ */
+interface StatusEnhancementRule {
+	keyPattern: string;
+	durationMs?: number;
+	showRelativeTime?: boolean;
+	colorize?: boolean;
+}
+
+/**
  * 滚动条与工具静音配置结构
  */
 interface RollingToolsConfig {
@@ -27,6 +37,7 @@ interface RollingToolsConfig {
 	widgetTools?: string[];
 	genericPropertyFallbacks: string[];
 	interceptNotifications: InterceptNotificationRule[];
+	statusEnhancements?: StatusEnhancementRule[];
 }
 
 const DEFAULT_CONFIG: RollingToolsConfig = {
@@ -65,6 +76,14 @@ const DEFAULT_CONFIG: RollingToolsConfig = {
 			match: "Money saved",
 			suppressToast: true,
 			rollIntoWidget: true,
+		},
+	],
+	statusEnhancements: [
+		{
+			keyPattern: "sol-pi*",
+			durationMs: 30000,
+			showRelativeTime: true,
+			colorize: true,
 		},
 	],
 };
@@ -215,6 +234,9 @@ function mergeConfig(base: RollingToolsConfig, override: Partial<RollingToolsCon
 		interceptNotifications: Array.isArray(override.interceptNotifications)
 			? [...override.interceptNotifications]
 			: base.interceptNotifications,
+		statusEnhancements: Array.isArray(override.statusEnhancements)
+			? [...override.statusEnhancements]
+			: base.statusEnhancements,
 	};
 }
 
@@ -747,27 +769,47 @@ class RollingToolsWidgetComponent implements Component {
 }
 
 /**
- * 格式化底部状态栏的 SoL-Pi 提示信息，赋予与主题一致的原生配色并附带相对时间
+ * 查找匹配的状态栏增强配置规则
  */
-function formatColoredSolPiStatus(rawText: string, elapsedSec?: number): string {
-	const match = rawText.match(/^⚡\s*(?:SoL-Pi\s*·\s*)?(.*?)\s*·\s*(.*)$/);
-	const timeSuffix = elapsedSec !== undefined ? ` (${elapsedSec}s ago)` : "";
-	if (match) {
-		const mechanism = match[1] || "Observation Pack";
-		const saving = match[2] || "";
-		return `\x1b[33m⚡\x1b[39m \x1b[1;36m${mechanism}\x1b[22;39m \x1b[90m·\x1b[39m \x1b[32m${saving}\x1b[39m \x1b[90m${timeSuffix}\x1b[39m`;
+function findStatusEnhancementRule(
+	key: string,
+	rules?: StatusEnhancementRule[],
+): StatusEnhancementRule | undefined {
+	if (!rules || !Array.isArray(rules)) return undefined;
+	return rules.find((rule) => matchesToolRule(rule.keyPattern, key));
+}
+
+/**
+ * 自适应语义色彩推导（抗上游格式变更，无需硬编码 SoL-Pi）
+ * 1. 结构化范式：[图标/Emoji] [模块/机制名] [分隔符] [结果/量化指标]
+ * 2. 指标高亮回退：自动提取数值与度量单位为强调绿色
+ */
+function autoColorizeStatusText(text: string): string {
+	if (!text) return text;
+
+	// 清理已有 ANSI 序列，防止嵌套污染
+	const clean = text.replace(/\x1b\[[0-9;]*m/g, "");
+
+	// 范式 1：前置符号 + 机制/标题 + 分隔符(·|:—-) + 详细数值
+	const structuredMatch = clean.match(/^([^\w\s\d]*\s*)([A-Za-z0-9_\-\s]+?)\s*([·|:—\-])\s*(.*)$/u);
+	if (structuredMatch) {
+		const symbol = structuredMatch[1] ? `\x1b[33m${structuredMatch[1]}\x1b[39m` : "";
+		const prefix = `\x1b[1;36m${structuredMatch[2]}\x1b[22;39m`;
+		const sep = `\x1b[90m${structuredMatch[3]}\x1b[39m`;
+		const detail = `\x1b[32m${structuredMatch[4]}\x1b[39m`;
+		return `${symbol}${prefix} ${sep} ${detail}`;
 	}
-	return rawText + (timeSuffix ? ` \x1b[90m${timeSuffix}\x1b[39m` : "");
+
+	// 范式 2：通用度量与数值强调回退
+	return clean.replace(
+		/(\b\d[\d,.]*\b(?:\s*(?:tokens|context tokens|MiB|KiB|B|ms|s|round-trip|avoided|removed|saved|%)|\b)?)/gi,
+		(m) => `\x1b[32m${m}\x1b[39m`,
+	);
 }
 
-function isSolPiStatusKey(key: string): boolean {
-	return key === "sol-pi" || key === "sol-pi-savings" || key.startsWith("sol-pi");
-}
-
-const SOL_PI_STATUS_MAX_DURATION_MS = 30_000;
-let solPiStatusInterval: any = null;
-let solPiStartTime = 0;
-let lastSolPiRawText = "";
+let activeStatusInterval: any = null;
+let activeStatusStartTime = 0;
+let lastActiveStatusRawText = "";
 
 /**
  * 安装原型劫持骨架（仅在进程初次加载时拦截一次，后续所有 reload 均由 dynamicHooks 委托热刷新）
@@ -854,39 +896,45 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		text: string | undefined,
 		origFn: Function,
 	) => {
-		if (isSolPiStatusKey(key)) {
+		const rule = findStatusEnhancementRule(key, currentConfig.statusEnhancements);
+		if (rule && rule.durationMs && rule.durationMs > 0) {
 			if (text) {
-				if (solPiStatusInterval) {
-					clearInterval(solPiStatusInterval);
-					solPiStatusInterval = null;
+				if (activeStatusInterval) {
+					clearInterval(activeStatusInterval);
+					activeStatusInterval = null;
 				}
-				lastSolPiRawText = text;
-				solPiStartTime = Date.now();
+				lastActiveStatusRawText = text;
+				activeStatusStartTime = Date.now();
+				const targetDuration = rule.durationMs;
 
 				const updateStatus = () => {
-					const elapsedSec = Math.floor((Date.now() - solPiStartTime) / 1000);
-					if (elapsedSec >= Math.floor(SOL_PI_STATUS_MAX_DURATION_MS / 1000)) {
-						if (solPiStatusInterval) {
-							clearInterval(solPiStatusInterval);
-							solPiStatusInterval = null;
+					const elapsedSec = Math.floor((Date.now() - activeStatusStartTime) / 1000);
+					if (elapsedSec >= Math.floor(targetDuration / 1000)) {
+						if (activeStatusInterval) {
+							clearInterval(activeStatusInterval);
+							activeStatusInterval = null;
 						}
-						lastSolPiRawText = "";
+						lastActiveStatusRawText = "";
 						origFn.call(target, key, undefined);
 						return;
 					}
-					const coloredText = formatColoredSolPiStatus(lastSolPiRawText, elapsedSec);
-					origFn.call(target, key, coloredText);
+					let formattedText = rule.colorize ? autoColorizeStatusText(lastActiveStatusRawText) : lastActiveStatusRawText;
+					if (rule.showRelativeTime) {
+						formattedText += ` \x1b[90m(${elapsedSec}s ago)\x1b[39m`;
+					}
+					origFn.call(target, key, formattedText);
 				};
 
 				updateStatus();
-				solPiStatusInterval = setInterval(updateStatus, 1000);
-				if (typeof solPiStatusInterval === "object" && "unref" in solPiStatusInterval) {
-					solPiStatusInterval.unref();
+				activeStatusInterval = setInterval(updateStatus, 1000);
+				if (typeof activeStatusInterval === "object" && "unref" in activeStatusInterval) {
+					activeStatusInterval.unref();
 				}
 				return;
 			} else {
-				const remaining = solPiStartTime + SOL_PI_STATUS_MAX_DURATION_MS - Date.now();
-				if (remaining > 0 && lastSolPiRawText) {
+				const targetDuration = rule.durationMs;
+				const remaining = activeStatusStartTime + targetDuration - Date.now();
+				if (remaining > 0 && lastActiveStatusRawText) {
 					return;
 				}
 			}
@@ -960,7 +1008,8 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		const originalSetStatus = ui.setStatus?.bind(ui);
 		if (originalSetStatus) {
 			ui.setStatus = (key: string, text: string | undefined) => {
-				if (isSolPiStatusKey(key) && text) {
+				const rule = findStatusEnhancementRule(key, currentConfig.statusEnhancements);
+				if (rule && text) {
 					state.solPiSavings = parseSolPiSavings(text);
 					syncWidget(ctx);
 				}
@@ -1133,9 +1182,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	// 9. 会话终止清理资源
 	pi.on("session_shutdown", async () => {
 		stopStatusTimer();
-		if (solPiStatusInterval) {
-			clearInterval(solPiStatusInterval);
-			solPiStatusInterval = null;
+		if (activeStatusInterval) {
+			clearInterval(activeStatusInterval);
+			activeStatusInterval = null;
 		}
 	});
 
