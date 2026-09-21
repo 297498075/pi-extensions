@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
+import { InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import type { Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { visibleWidth } from "@earendil-works/pi-tui";
 
@@ -768,10 +768,47 @@ function installToolExecutionRenderHook(getConfig: () => RollingToolsConfig): vo
 	};
 }
 
+/**
+ * 劫持 InteractiveMode.prototype.showExtensionNotify 与 setExtensionStatus
+ * 从全局 UI 根层级拦截通知与状态更新，实现 100% 可靠的静音与数据注入
+ */
+function installInteractiveModeNotificationHook(
+	getConfig: () => RollingToolsConfig,
+	onIntercept: (message: string) => void,
+): void {
+	const proto = InteractiveMode.prototype as any;
+	if (proto[UI_HOOKS_INSTALLED]) return;
+	proto[UI_HOOKS_INSTALLED] = true;
+
+	const originalShowExtensionNotify = proto.showExtensionNotify;
+	proto.showExtensionNotify = function (this: any, message: string, type?: string) {
+		const config = getConfig();
+		const matchedRule = matchNotificationRule(message, config.interceptNotifications);
+		if (matchedRule) {
+			if (matchedRule.rollIntoWidget) {
+				onIntercept(message);
+			}
+			if (matchedRule.suppressToast) {
+				return;
+			}
+		}
+		return originalShowExtensionNotify.call(this, message, type);
+	};
+
+	const originalSetExtensionStatus = proto.setExtensionStatus;
+	proto.setExtensionStatus = function (this: any, key: string, text: string | undefined) {
+		if (key === "sol-pi" && text) {
+			onIntercept(text);
+		}
+		return originalSetExtensionStatus.call(this, key, text);
+	};
+}
+
 export default function rollingTools(pi: ExtensionAPI): void {
 	let currentConfig: RollingToolsConfig = loadConfig(process.cwd());
 	let totalToolCount = 0;
 	let statusTimer: any = null;
+	let lastCtx: any = null;
 
 	const state: WidgetState = {
 		headerStatus: { type: "idle" },
@@ -783,8 +820,15 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		solPiSavings: null,
 	};
 
-	// 1. 安装正文静音 Hook
+	// 1. 安装正文静音 Hook 与全局通知拦截 Hook
 	installToolExecutionRenderHook(() => currentConfig);
+	installInteractiveModeNotificationHook(
+		() => currentConfig,
+		(message) => {
+			state.solPiSavings = parseSolPiSavings(message);
+			if (lastCtx) syncWidget(lastCtx);
+		},
+	);
 
 	function stopStatusTimer(): void {
 		if (statusTimer) {
@@ -863,6 +907,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 	// 2. 会话启动
 	pi.on("session_start", async (_event, ctx) => {
+		lastCtx = ctx;
 		currentConfig = loadConfig(ctx?.cwd || process.cwd());
 		installUiHooks(ctx);
 		syncWidget(ctx);
@@ -870,6 +915,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 	// 3. 用户提问开始（新一轮 Agent 运行）时重置
 	pi.on("agent_start", async (_event, ctx) => {
+		lastCtx = ctx;
 		installUiHooks(ctx);
 		(ctx.ui as any)?.setToolsExpanded?.(false);
 
@@ -881,7 +927,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		state.expandedItemId = null;
 		state.copyFeedbackMessage = null;
 		state.completedMessage = null;
-		state.solPiSavings = null;
+		// 注意：state.solPiSavings 在会话内保持展示，不随单轮提问清空，随时展示最新节省数据
 		syncWidget(ctx);
 	});
 
@@ -1042,6 +1088,15 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				currentConfig.enabled = true;
 				syncWidget(ctx);
 				ctx.ui?.notify?.("rolling-tools: 已启用正文静音与滚动条", "info");
+			} else if (action === "test-solpi") {
+				const mockMsg = "⚡ SoL-Pi · Observation Pack\nMoney saved · 18.5k context tokens avoided ($0.05)";
+				state.solPiSavings = parseSolPiSavings(mockMsg);
+				syncWidget(ctx);
+				ctx.ui?.notify?.("✓ rolling-tools: 已模拟注入 SoL-Pi 节省信息徽标至滚动条", "info");
+			} else if (action === "clear-solpi") {
+				state.solPiSavings = null;
+				syncWidget(ctx);
+				ctx.ui?.notify?.("✓ rolling-tools: 已清除 SoL-Pi 节省徽标", "info");
 			} else if (action === "status") {
 				const info = [
 					`rolling-tools 状态:`,

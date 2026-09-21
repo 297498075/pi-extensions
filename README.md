@@ -101,6 +101,7 @@ The extension has no network, file, command, or external state side effects. The
   - `/rolling-tools on` / `/rolling-tools off`: Explicitly enable or disable.
   - `/rolling-tools reload`: Hot-reload configuration from disk without restarting Pi.
   - `/rolling-tools status`: Display current active configuration, managed tools, and notification intercept rules.
+  - Hotkeys: Press `Ctrl+O` in interactive mode to expand the entire transcript and inspect raw tool executions.
 
 Example configuration (`~/.pi/agent/extensions/rolling-tools/config.json`):
 
