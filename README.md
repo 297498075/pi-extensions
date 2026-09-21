@@ -87,13 +87,57 @@ The extension has no network, file, command, or external state side effects. The
 
 ## Rolling Tools
 
-`extensions/rolling-tools.ts` displays a compact rolling widget for tool executions above the input editor while silencing verbose read-only and execution calls (`read`, `bash`, `grep`, `find`, `ls`) in the chat transcript.
+`extensions/rolling-tools.ts` displays a compact rolling widget for tool executions above the input editor while silencing verbose tool calls in the chat transcript.
 
-- **Non-intrusive transcript**: Read and execution tools (`read`, `bash`, `grep`, `find`, `ls`) occupy 0 lines when collapsed, preventing terminal scroll floods. Press `Ctrl+O` to expand if full outputs are needed.
+- **Non-intrusive transcript**: Managed tools (`read`, `bash`, `grep`, `find`, `ls`, `mcp`, `mcp__*`, `rider_execute_tool`, `obs_recall`, `update_plan`, etc.) occupy 0 lines when collapsed, preventing terminal scroll floods. Press `Ctrl+O` to expand if full outputs are needed.
 - **Diffs preserved**: File modifications (`edit`, `write`) keep their rich diff and content view in the transcript for immediate code review.
-- **Fixed-dock rolling widget**: Shows the latest 3 running/completed tools in a fixed dock above the editor with status, duration, and arguments summary.
+- **Universal tool & MCP support**: Uses dynamic in-place decoration on `ToolExecutionComponent`, supporting built-ins, MCP proxies (`mcp`, `mcp__*`), Rider MCP tools (`rider_execute_tool`), SoL-Pi tools, and arbitrary third-party tools with generic parameter heuristics.
+- **SoL-Pi savings interception**: Intercepts and suppresses intrusive SoL-Pi popup toast notifications, rolling token savings info cleanly into the widget status line with one-click clipboard copying.
+- **Configuration file support**: Supports global configuration (`~/.pi/agent/extensions/rolling-tools/config.json`) and local project overrides (`./.pi/rolling-tools.json`).
+- **Fixed-dock rolling widget**: Shows the latest running/completed tools in a fixed dock above the editor with status (`⏳`/`✓`/`✗`), duration, and arguments summary.
 - **Click-to-expand details**: Click any tool item to toggle details (`▸` / `▾`) such as full paths, multiline commands, and execution outputs without mouse hover flickering. Click details to copy to clipboard, or `Ctrl+Click` on paths to open files directly.
-- **Toggle command**: Use `/rolling-tools` (or `/rolling-tools on|off`) to toggle.
+- **Commands**:
+  - `/rolling-tools`: Toggle widget and transcript silencing on/off.
+  - `/rolling-tools on` / `/rolling-tools off`: Explicitly enable or disable.
+  - `/rolling-tools reload`: Hot-reload configuration from disk without restarting Pi.
+  - `/rolling-tools status`: Display current active configuration, managed tools, and notification intercept rules.
+
+Example configuration (`~/.pi/agent/extensions/rolling-tools/config.json`):
+
+```json
+{
+  "enabled": true,
+  "maxRecentTools": 3,
+  "managedTools": [
+    "read",
+    "bash",
+    "grep",
+    "find",
+    "ls",
+    "mcp",
+    "mcp__*",
+    "rider_execute_tool",
+    "obs_recall",
+    "update_plan"
+  ],
+  "genericPropertyFallbacks": [
+    "command",
+    "path",
+    "pattern",
+    "query",
+    "url",
+    "tool",
+    "prompt"
+  ],
+  "interceptNotifications": [
+    {
+      "match": "SoL-Pi",
+      "suppressToast": true,
+      "rollIntoWidget": true
+    }
+  ]
+}
+```
 
 Load directly:
 
