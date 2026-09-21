@@ -760,6 +760,10 @@ function formatColoredSolPiStatus(rawText: string, elapsedSec?: number): string 
 	return rawText + (timeSuffix ? ` \x1b[90m${timeSuffix}\x1b[39m` : "");
 }
 
+function isSolPiStatusKey(key: string): boolean {
+	return key === "sol-pi" || key === "sol-pi-savings" || key.startsWith("sol-pi");
+}
+
 const SOL_PI_STATUS_MAX_DURATION_MS = 30_000;
 let solPiStatusInterval: any = null;
 let solPiStartTime = 0;
@@ -850,7 +854,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		text: string | undefined,
 		origFn: Function,
 	) => {
-		if (key === "sol-pi") {
+		if (isSolPiStatusKey(key)) {
 			if (text) {
 				if (solPiStatusInterval) {
 					clearInterval(solPiStatusInterval);
@@ -956,7 +960,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		const originalSetStatus = ui.setStatus?.bind(ui);
 		if (originalSetStatus) {
 			ui.setStatus = (key: string, text: string | undefined) => {
-				if (key === "sol-pi" && text) {
+				if (isSolPiStatusKey(key) && text) {
 					state.solPiSavings = parseSolPiSavings(text);
 					syncWidget(ctx);
 				}

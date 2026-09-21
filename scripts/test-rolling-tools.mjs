@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { initTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
+import { initTheme, InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import rollingTools from "../extensions/rolling-tools.ts";
 
 initTheme();
@@ -105,6 +105,25 @@ fakeUi.notify(solPiMsg, "info");
 
 assert.equal(notifiedMessage, null, "SoL-Pi toast notification must be suppressed!");
 console.log("  ✓ SoL-Pi toast notification suppressed successfully.");
+
+// Test setStatus with key "sol-pi-savings"
+let updatedStatusKey = null;
+let updatedStatusText = null;
+const im = Object.create(InteractiveMode.prototype);
+im.footerDataProvider = {
+	setExtensionStatus(key, text) {
+		updatedStatusKey = key;
+		updatedStatusText = text;
+	},
+};
+im.ui = { requestRender() {} };
+
+im.setExtensionStatus("sol-pi-savings", "⚡ Observation Pack · 4,756 context tokens avoided");
+assert.equal(updatedStatusKey, "sol-pi-savings", "Must handle sol-pi-savings status key");
+assert.ok(updatedStatusText.includes("\x1b[33m⚡"), "Must format with ANSI warning yellow");
+assert.ok(updatedStatusText.includes("(0s ago)"), "Must include relative time ticker (0s ago)");
+console.log("  ✓ SoL-Pi 'sol-pi-savings' status key intercepted, colorized with ANSI and (0s ago):");
+console.log("    " + updatedStatusText);
 
 console.log("\n=== Test 4: Tool Call & Result Tracking ===");
 const toolCallHandlers = handlers.get("tool_call") || [];
