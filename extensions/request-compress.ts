@@ -103,12 +103,28 @@ export interface CompressionStats {
 	compressedBytes: number;
 }
 
-const stats: CompressionStats = {
-	totalRequests: 0,
-	compressedRequests: 0,
-	originalBytes: 0,
-	compressedBytes: 0,
-};
+const STATS_REF_SYMBOL = Symbol.for("__pi_request_compress_stats_ref__");
+if (!(globalThis as any)[STATS_REF_SYMBOL]) {
+	(globalThis as any)[STATS_REF_SYMBOL] = {
+		totalRequests: 0,
+		compressedRequests: 0,
+		originalBytes: 0,
+		compressedBytes: 0,
+	};
+}
+const stats: CompressionStats = (globalThis as any)[STATS_REF_SYMBOL];
+
+/**
+ * 检查二进制 Buffer 是否已经是压缩数据（避免重复压缩损坏 payload）
+ */
+export function isAlreadyCompressed(buf: Buffer): boolean {
+	if (buf.length < 4) return false;
+	// zstd 魔数: 0x28 0xB5 0x2F 0xFD (小端 0xFD2FB528)
+	if (buf.readUInt32LE(0) === 0xFD2FB528) return true;
+	// gzip 魔数: 0x1F 0x8B
+	if (buf[0] === 0x1F && buf[1] === 0x8B) return true;
+	return false;
+}
 
 export function matchesPattern(value: string, pattern: string): boolean {
 	if (pattern === "*") return true;
@@ -298,6 +314,7 @@ export function shouldCompressRequest(
 	urlStr: string,
 	method: string,
 	bodyRaw: Buffer | null,
+	existingEncoding: string | null | undefined,
 	config: RequestCompressConfig,
 	envCtx: PiEnvironmentContext,
 ): { shouldCompress: boolean; reason?: string; modelId?: string; providerId?: string } {
@@ -309,6 +326,17 @@ export function shouldCompressRequest(
 		return { shouldCompress: false, reason: "Not a POST request or body is empty" };
 	}
 
+	// 1. 如果请求头中已存在 Content-Encoding，禁止二次压缩
+	if (existingEncoding && existingEncoding !== "identity") {
+		return { shouldCompress: false, reason: `Request already has Content-Encoding: ${existingEncoding}` };
+	}
+
+	// 2. 检查数据流是否已是压缩二进制格式
+	if (isAlreadyCompressed(bodyRaw)) {
+		return { shouldCompress: false, reason: "Payload is already compressed binary data" };
+	}
+
+	// 3. 检查字节大小阈值
 	if (bodyRaw.length < config.minBytesThreshold) {
 		return {
 			shouldCompress: false,
@@ -340,7 +368,10 @@ export function shouldCompressRequest(
 				modelId = parsed.model;
 			}
 		}
-	} catch {}
+	} catch {
+		// 非合法 JSON 文本，避免对未知二进制乱压缩
+		return { shouldCompress: false, reason: "Body cannot be parsed as JSON text" };
+	}
 
 	let providerId: string | undefined;
 	if (modelId) {
@@ -387,21 +418,29 @@ export function shouldCompressRequest(
 	return { shouldCompress: true, modelId, providerId };
 }
 
-let isFetchHooked = false;
-let activeConfig: RequestCompressConfig = { ...DEFAULT_CONFIG };
-let activeEnvCtx: PiEnvironmentContext = {
-	defaultProvider: undefined,
-	providerBaseUrls: new Map(),
-	modelToProvider: new Map(),
-};
+const HOOKED_SYMBOL = Symbol.for("__pi_request_compress_fetch_hooked__");
+const ORIGINAL_FETCH_SYMBOL = Symbol.for("__pi_request_compress_original_fetch__");
+const CONFIG_REF_SYMBOL = Symbol.for("__pi_request_compress_config_ref__");
+const ENV_REF_SYMBOL = Symbol.for("__pi_request_compress_env_ref__");
 
 export function setupFetchHook(): void {
-	if (isFetchHooked) return;
-	isFetchHooked = true;
+	// 如果已经 Hook 过 globalThis.fetch，不重复包装，只更新全局配置引用
+	if ((globalThis as any)[HOOKED_SYMBOL]) {
+		return;
+	}
+	(globalThis as any)[HOOKED_SYMBOL] = true;
 
-	const originalFetch = globalThis.fetch;
+	const originalFetch = (globalThis as any)[ORIGINAL_FETCH_SYMBOL] || globalThis.fetch;
+	(globalThis as any)[ORIGINAL_FETCH_SYMBOL] = originalFetch;
 
 	globalThis.fetch = async function (input: any, init: RequestInit = {}) {
+		const liveConfig: RequestCompressConfig = (globalThis as any)[CONFIG_REF_SYMBOL] || DEFAULT_CONFIG;
+		const liveEnvCtx: PiEnvironmentContext = (globalThis as any)[ENV_REF_SYMBOL] || {
+			defaultProvider: undefined,
+			providerBaseUrls: new Map(),
+			modelToProvider: new Map(),
+		};
+
 		stats.totalRequests++;
 
 		let urlStr = "";
@@ -424,19 +463,23 @@ export function setupFetchHook(): void {
 			rawBuf = Buffer.from(reqBody);
 		}
 
-		const check = shouldCompressRequest(urlStr, method, rawBuf, activeConfig, activeEnvCtx);
+		// 提取现有请求头中的 Content-Encoding
+		const headers = new Headers(init.headers || (input instanceof Request ? input.headers : {}));
+		const existingEncoding = headers.get("content-encoding");
+
+		const check = shouldCompressRequest(urlStr, method, rawBuf, existingEncoding, liveConfig, liveEnvCtx);
 
 		if (!check.shouldCompress || !rawBuf) {
-			if (activeConfig.debug && rawBuf && rawBuf.length > 200) {
+			if (liveConfig.debug && rawBuf && rawBuf.length > 200) {
 				console.log(`[request-compress] Skipped: ${check.reason} (${urlStr})`);
 			}
 			return originalFetch(input, init);
 		}
 
-		const compressedRes = compressPayload(rawBuf, activeConfig.algorithm, activeConfig);
+		const compressedRes = compressPayload(rawBuf, liveConfig.algorithm, liveConfig);
 		if (!compressedRes) {
-			if (activeConfig.debug) {
-				console.warn(`[request-compress] Compression with ${activeConfig.algorithm} failed, fallback to plain.`);
+			if (liveConfig.debug) {
+				console.warn(`[request-compress] Compression with ${liveConfig.algorithm} failed, fallback to plain.`);
 			}
 			return originalFetch(input, init);
 		}
@@ -445,14 +488,13 @@ export function setupFetchHook(): void {
 		stats.originalBytes += rawBuf.length;
 		stats.compressedBytes += compressedRes.compressed.length;
 
-		if (activeConfig.debug) {
+		if (liveConfig.debug) {
 			const saved = (((rawBuf.length - compressedRes.compressed.length) / rawBuf.length) * 100).toFixed(1);
 			console.log(
 				`[request-compress] [${compressedRes.encoding}] Compressed ${check.providerId || "api"}/${check.modelId || "model"}: ${rawBuf.length}B -> ${compressedRes.compressed.length}B (saved ${saved}%)`,
 			);
 		}
 
-		const headers = new Headers(init.headers || (input instanceof Request ? input.headers : {}));
 		headers.set("Content-Encoding", compressedRes.encoding);
 		headers.delete("Content-Length");
 
@@ -462,6 +504,11 @@ export function setupFetchHook(): void {
 			body: new Uint8Array(compressedRes.compressed),
 		});
 	};
+}
+
+export function updateLiveContext(config: RequestCompressConfig, envCtx: PiEnvironmentContext): void {
+	(globalThis as any)[CONFIG_REF_SYMBOL] = config;
+	(globalThis as any)[ENV_REF_SYMBOL] = envCtx;
 }
 
 export function formatBytes(bytes: number): string {
@@ -482,31 +529,34 @@ export function resetStats(): void {
 }
 
 export default function requestCompressExtension(pi: ExtensionAPI): void {
-	activeConfig = loadConfig();
-	activeEnvCtx = resolvePiEnvironment();
+	const activeConfig = loadConfig();
+	const activeEnvCtx = resolvePiEnvironment();
 
+	updateLiveContext(activeConfig, activeEnvCtx);
 	setupFetchHook();
 
 	pi.registerCommand("request-compress", {
 		description: "View or toggle HTTP request body compression status (zstd/gzip)",
 		handler: async (args, ctx) => {
+			const currentConfig: RequestCompressConfig = (globalThis as any)[CONFIG_REF_SYMBOL] || activeConfig;
 			const sub = args?.trim().toLowerCase();
 
 			if (sub === "on") {
-				activeConfig.enabled = true;
-				ctx.ui.notify("Request compression enabled (algorithm: " + activeConfig.algorithm + ")", "info");
+				currentConfig.enabled = true;
+				ctx.ui.notify("Request compression enabled (algorithm: " + currentConfig.algorithm + ")", "info");
 				return;
 			}
 
 			if (sub === "off") {
-				activeConfig.enabled = false;
+				currentConfig.enabled = false;
 				ctx.ui.notify("Request compression disabled", "info");
 				return;
 			}
 
 			if (sub === "reload") {
-				activeConfig = loadConfig();
-				activeEnvCtx = resolvePiEnvironment();
+				const reloaded = loadConfig();
+				const env = resolvePiEnvironment();
+				updateLiveContext(reloaded, env);
 				ctx.ui.notify("Request compression configuration reloaded", "info");
 				return;
 			}
@@ -517,13 +567,14 @@ export default function requestCompressExtension(pi: ExtensionAPI): void {
 					? (((s.originalBytes - s.compressedBytes) / s.originalBytes) * 100).toFixed(1) + "%"
 					: "0%";
 
+			const currentEnv: PiEnvironmentContext = (globalThis as any)[ENV_REF_SYMBOL] || activeEnvCtx;
 			const lines = [
-				`Request Compression: ${activeConfig.enabled ? "Enabled (ON)" : "Disabled (OFF)"}`,
-				`Algorithm: ${activeConfig.algorithm}`,
-				`Providers: [${activeConfig.providers.join(", ")}] (Default: ${activeEnvCtx.defaultProvider || "none"})`,
-				`Models: [${activeConfig.models.join(", ")}]`,
-				`Min Threshold: ${activeConfig.minBytesThreshold} Bytes`,
-				`Debug Mode: ${activeConfig.debug ? "ON" : "OFF"}`,
+				`Request Compression: ${currentConfig.enabled ? "Enabled (ON)" : "Disabled (OFF)"}`,
+				`Algorithm: ${currentConfig.algorithm}`,
+				`Providers: [${currentConfig.providers.join(", ")}] (Default: ${currentEnv.defaultProvider || "none"})`,
+				`Models: [${currentConfig.models.join(", ")}]`,
+				`Min Threshold: ${currentConfig.minBytesThreshold} Bytes`,
+				`Debug Mode: ${currentConfig.debug ? "ON" : "OFF"}`,
 				`Config Path: ${getGlobalConfigPath()}`,
 				"",
 				`Traffic Stats:`,
