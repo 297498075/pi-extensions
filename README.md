@@ -154,6 +154,39 @@ Load directly:
 pi --extension ./extensions/rolling-tools.ts
 ```
 
+## Request Compress
+
+`extensions/request-compress.ts` 为 Pi 调用大模型 API 的 POST 请求透明注入上行请求体压缩（Request Body Compression），大幅降低 Prompt / Context 上传带宽和传输延迟。
+
+- **算法支持**: 默认使用 **`zstd`**（高性能且为官方 Codex 网关原生接受标准），同时支持 `gzip`、`deflate` 和 `br`。
+- **开箱即用**: 基于 Node.js 内置 `node:zlib`，零第三方运行时依赖，零 C++ 原生编译。
+- **智能策略**:
+  - 自动识别当前生效的 `defaultProvider` 及其下的所有模型；
+  - 支持通配符匹配（`yqdcc-*`, `gemini-*`）与黑白名单过滤；
+  - 内置大小阈值（`minBytesThreshold`，默认 1KB），小请求自动忽略，避免小包负收益。
+- **TUI 状态命令**: 提供 `/request-compress [status|on|off|reload]`，可随时查看实时压缩率、已节省带宽统计及动态热重载配置。
+
+### 配置文件
+
+全局配置文件路径：`~/.pi/agent/extensions/request-compress/config.json`（扩展首次启动自动生成默认配置）；亦支持当前工作区覆盖配置 `.pi/request-compress.json`。
+
+```json
+{
+  "enabled": true,
+  "algorithm": "zstd",
+  "providers": ["default"],
+  "models": ["*"],
+  "excludeProviders": [],
+  "excludeModels": [],
+  "minBytesThreshold": 1024,
+  "zstdLevel": 3,
+  "gzipLevel": 6,
+  "brotliQuality": 4,
+  "targetHosts": [],
+  "debug": false
+}
+```
+
 ## IDM Download (Skill)
 
 `skills/idm-download` 提供将大文件、模型权重（`.safetensors`, `.pth` 等）和数据集自动化推送到 Windows 本地 **Internet Download Manager (IDM / `IDMan.exe`)** 进行多线程后台下载的能力：

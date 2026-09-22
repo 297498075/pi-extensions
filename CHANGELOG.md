@@ -4,6 +4,7 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- feat(request-compress): add transparent HTTP request body compression extension supporting configurable algorithms (zstd, gzip, deflate, br) with default zstd for API proxies.
 - feat(compatibility): upgrade dependencies to Pi 0.86.1 (`@earendil-works/pi-coding-agent` & `@earendil-works/pi-tui`), maintaining `>=0.84.1` peer compatibility.
 - feat(rolling-tools): support Pi 0.86+ native `powershell` tool on Windows as a first-class shell command with automatic transcript silencing, multiline formatting, and backward-compatible config migration.
 - fix(rolling-tools): refine completion state handling with `agent_settled` to avoid premature completion labels during auto-retry or mid-run compactions.

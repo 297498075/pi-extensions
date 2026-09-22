@@ -6,7 +6,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "validate": "node ./scripts/validate-package.mjs",
-    "test": "npm run check && npm run validate && node ./scripts/test-rolling-tools.mjs"
+    "test": "npm run check && npm run validate && node ./scripts/test-rolling-tools.mjs && node ./scripts/test-request-compress.mjs"
   },
   "keywords": [
     "pi-package",
