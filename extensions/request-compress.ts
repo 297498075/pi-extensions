@@ -455,7 +455,7 @@ export function setupFetchHook(): void {
 		let method = (init.method || (input && typeof input.method === "string" ? input.method : "GET")).toUpperCase();
 
 		let rawBuf: Buffer | null = null;
-		const reqBody = init.body ?? (input && "body" in input ? input.body : undefined);
+		const reqBody = init.body ?? (typeof input === "object" && input !== null && "body" in input ? (input as any).body : undefined);
 
 		if (typeof reqBody === "string") {
 			rawBuf = Buffer.from(reqBody, "utf-8");
