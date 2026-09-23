@@ -154,6 +154,81 @@ Load directly:
 pi --extension ./extensions/rolling-tools.ts
 ```
 
+## Image Pager (Virtual Memory Paging for Multimodal Images)
+
+`extensions/image-pager.ts` 借鉴操作系统**虚拟内存换页（Virtual Memory Paging / Page-Out & Page-In）**思想，解决与多模态大模型（如 Google Gemini / OpenAI）多轮交互时历史图像累积引发的 **Payload 爆炸**与 **TPU 显存/注意力算力墙（128 秒+ 严重超时）**。
+
+### 痛点与根因
+
+1. **图像 Payload 累积**: 多轮交互中读取多张高清插图（例如 34 张 JPEG）会导致请求包膨胀至 40MB+，Base64 数据几乎占满 99% 的请求体积。
+2. **zstd 等压缩无效**: JPEG 本身已经过 Huffman 与离散余弦变换极限压缩，信息熵极高，通用压缩算法无法对其进行有效压缩。
+3. **TPU KV-Cache 算力墙**: 几十张高清图切片后突破数十万视觉 Token，大模型后端（如 Google TPU 集群）在跨芯片分布式调度 40GB+ KV-Cache 时耗时超过 120 秒。
+4. **历史模型回答完整**: 在前序轮次中，模型通常已经生成了详尽的文字分析与分镜描述，后续绝大多数问题完全依靠文本记忆即可解答。
+
+### 架构设计：智能指针与自愈唤醒
+
+- **热页与冷页分离 (Hot Pages vs Cold Pages)**:
+  - 队列中最新的一张或数张图片（默认 `keepRecentImages: 1`）作为活跃工作集（Hot Page），完整保留 Base64 像素供当轮深度推理。
+  - 更早的历史图片作为冷数据（Cold Page），在发给模型前进行非破坏性换出（Page-Out）。
+- **智能指针 (Smart Pointer)**:
+  - 自动通过 `toolCallId` 回溯定位 `read` 工具读取的原始物理文件路径（如 `d:/novel/分镜插图/shot_01.jpg`）。
+  - 将庞大的 Base64 替换为百字节的轻量自愈占位符，清晰记录文件路径与文件名。
+- **缺页自愈 (Page Fault & Page-In)**:
+  - 占位符内包含明确的自愈指令：*“If you need to inspect raw pixels of this image again, please invoke the 'read' tool on this path.”*
+  - 当第 N 轮用户需要模型重新核验像素微小细节时，模型可自主触发 `read` 工具重新将图片读回当前轮活跃上下文（Page-In）。
+- **前缀缓存友好（Prefix-Cache-Friendly / 轮次边界不可变性）**:
+  - 采用 **`strategy: "turn-boundary"`**（默认推荐）：当前活跃轮次（最后一条用户提问后读取的图片）保留原始 Base64 像素供模型当轮睁眼分析；
+  - 历史已完成轮次的图片在跨入新轮次时**立即固化为静态智能指针并永久冻结**；
+  - 彻底规避传统滑动窗口在第 50 轮突然加入新图时破坏第 1 轮前缀、导致全量 KV-Cache 毁灭性击穿的隐患。历史长前缀在数十轮文字交互中 100% 保持幂等命中。
+- **零破坏性 (Non-destructive)**:
+  - 仅在 `pi.on("context")` 阶段针对发往大模型的上下文进行替换；本地 session JSONL 文件中的原始执行记录毫发无损，随时可全量回溯。
+
+### 占位符示例
+
+```markdown
+[System Note: Image "shot_01_14.jpg" has been paged out from context to save memory and inference time.
+• Original File Path: "d:/novel/分镜插图/第0001章_重制版/shot_01_14.jpg"
+• MIME Type: image/jpeg
+• Paged-out Size: 1.25 MB (Base64)
+• Self-Healing Guideline: The raw pixel data of this image is currently paged out from working memory. If you need to re-inspect or verify visual pixel details of this image that are not already documented in the conversation text above, invoke the 'read' tool on this path to page it back into context.]
+```
+
+### 命令与配置
+
+提供交互式斜杠命令 `/image-pager`（别名 `/image-paging`）：
+
+| 命令 | 说明 |
+| --- | --- |
+| `/image-pager [status]` | 查看当前换页状态、策略、已节省带宽与预估 Token 统计 |
+| `/image-pager on` / `off` | 启用或禁用智能图片换页 |
+| `/image-pager strategy <turn-boundary\|fifo>` | 切换换页策略（默认 `turn-boundary` 前缀缓存友好模式） |
+| `/image-pager keep <n>` | 设置保留活跃图片数（默认 `1`） |
+| `/image-pager lang en` / `zh` | 切换智能指针自愈提示词语言（支持英文与中文） |
+| `/image-pager reload` | 重新从磁盘载入配置 |
+| `/image-pager reset` | 重置统计计数器 |
+
+全局配置文件路径：`~/.pi/agent/extensions/image-pager/config.json`（工作区亦支持 `.pi/image-pager.json` 覆盖）：
+
+```json
+{
+  "enabled": true,
+  "strategy": "turn-boundary",
+  "keepRecentImages": 1,
+  "models": ["*"],
+  "excludeModels": [],
+  "minBytesThreshold": 0,
+  "noticeLanguage": "en",
+  "notifyOnPageOut": false,
+  "debug": false
+}
+```
+
+Load directly:
+
+```bash
+pi --extension ./extensions/image-pager.ts
+```
+
 ## Request Compress
 
 `extensions/request-compress.ts` 为 Pi 调用大模型 API 的 POST 请求透明注入上行请求体压缩（Request Body Compression），大幅降低 Prompt / Context 上传带宽和传输延迟。
