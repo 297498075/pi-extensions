@@ -6,7 +6,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "validate": "node ./scripts/validate-package.mjs",
-    "test": "npm run check && npm run validate && node ./scripts/test-rolling-tools.mjs && node ./scripts/test-request-compress.mjs && node ./scripts/test-image-pager.mjs"
+    "test": "npm run check && npm run validate && node ./scripts/test-rolling-tools.mjs && node ./scripts/test-request-compress.mjs && node ./scripts/test-image-pager.mjs && node ./scripts/test-ask-user.mjs"
   },
   "keywords": [
     "pi-package",
@@ -55,6 +55,7 @@
     "@earendil-works/pi-coding-agent": "^1.2.0",
     "@earendil-works/pi-tui": "^1.2.0",
     "@types/node": "^24.0.0",
+    "typebox": "^1.3.37",
     "typescript": "^5.9.3"
   }
 }
