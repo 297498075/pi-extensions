@@ -180,6 +180,53 @@ assert.equal(updatedStatusKey, "some-plugin", "any plugin status key must be han
 assert.ok(updatedStatusText.includes("\x1b[32m"), "must apply adaptive colorization");
 console.log("  ✓ any plugin status key handled uniformly.");
 
+// 常驻状态 key（blackhole / mcp）：必须完全放行
+// 1) 设置时不被加倒计时（文本原样透传，不强制着色）
+// 2) 插件自己的清除调用（undefined）必须放行，不能被吞掉
+const persistentCalls = [];
+const im2 = Object.create(InteractiveMode.prototype);
+im2.footerDataProvider = {
+	setExtensionStatus(key, text) {
+		persistentCalls.push({ key, text });
+	},
+};
+im2.ui = { requestRender() {} };
+
+for (const key of ["blackhole", "mcp"]) {
+	persistentCalls.length = 0;
+	im2.setExtensionStatus(key, "bh O▕██░▏ P▕█░░▏ X▕███▏");
+	assert.equal(persistentCalls.length, 1, `${key} set must pass through`);
+	assert.equal(
+		persistentCalls[0].text,
+		"bh O▕██░▏ P▕█░░▏ X▕███▏",
+		`${key} text must NOT be rewritten (no forced colorize on persistent keys)`,
+	);
+	// 插件主动清除：必须放行
+	im2.setExtensionStatus(key, undefined);
+	assert.equal(persistentCalls.length, 2, `${key} clear must pass through`);
+	assert.equal(persistentCalls[1].text, undefined, `${key} clear must reach the footer`);
+}
+console.log("  ✓ persistent status keys (blackhole / mcp) pass through untouched, including their clears.");
+
+// 默认不倒计时：未配 durationMs 的普通 key 设置后不应被自动清除
+const plainCalls = [];
+const im3 = Object.create(InteractiveMode.prototype);
+im3.footerDataProvider = {
+	setExtensionStatus(key, text) {
+		plainCalls.push({ key, text });
+	},
+};
+im3.ui = { requestRender() {} };
+im3.setExtensionStatus("some-plugin", "Plugin X · 123 things done");
+const afterSet = plainCalls.length;
+await new Promise((r) => setTimeout(r, 1500));
+assert.equal(
+	plainCalls.length,
+	afterSet,
+	"without durationMs, the status must NOT be auto-cleared (colorize only)",
+);
+console.log("  ✓ no auto-clear when durationMs is unset (colorize only).");
+
 console.log("\n=== Test 4: Tool Call & Result Tracking ===");
 const toolCallHandlers = handlers.get("tool_call") || [];
 const toolResultHandlers = handlers.get("tool_result") || [];
@@ -678,7 +725,16 @@ assert.equal(migrated.configVersion, 3, "migrate must write configVersion 3");
 // v3 通知默认值
 assert.deepEqual(migrated.interceptNotifications, [{ match: "*", suppressToast: true }], "migrate must write wildcard notify rule");
 assert.equal(migrated.statusEnhancements[0].keyPattern, "*", "migrate must write wildcard status rule");
-assert.equal(migrated.statusEnhancements[0].durationMs, 8000, "migrate must write 8s status duration");
+assert.equal(
+	migrated.statusEnhancements[0].durationMs,
+	undefined,
+	"migrate must NOT set a status duration by default (colorize only)",
+);
+assert.deepEqual(
+	migrated.statusEnhancements[0].persistentKeys,
+	["blackhole", "mcp"],
+	"migrate must protect persistent status keys",
+);
 assert.equal(migrated.statusEnhancements[0].showRelativeTime, false, "migrate must disable relative-time ticker");
 assert.equal(migrated.stripToolNotificationHeaders, true, "migrate must enable header stripping");
 assert.ok(Array.isArray(migrated.notificationKeywords), "migrate must write notificationKeywords");

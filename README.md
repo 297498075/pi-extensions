@@ -99,7 +99,7 @@ The extension has no network, file, command, or external state side effects. The
 - **Lazy loading with wheel scroll**: The overlay supports native mouse-wheel scrolling. Scrolling up past the top of the list lazily loads the next `lazyLoadStep` (default 10) older entries, so long histories stay responsive without loading everything at once.
 - **Persistent across turns and sessions**: The rolling block no longer resets on each new task. History is kept in memory across turns and persisted to the session via `pi.appendEntry()` (custom type `rolling-tools-history`), so it is restored on `reload`, `resume`, and `fork` when `persistAcrossSessions` is enabled.
 - **Universal tool & MCP support**: Uses dynamic in-place decoration on `ToolExecutionComponent`, supporting built-ins, MCP proxies (`mcp`, `mcp__*`), Rider MCP tools (`rider_execute_tool`), SoL-Pi tools, and arbitrary third-party tools with generic parameter heuristics.
-- **Unified tips handling**: Plugin tips (`ui.notify`) are suppressed from the transcript, while `ui.setStatus` tips show only in the footer status line and auto-clear after `durationMs` (default 8s) or are replaced by the next tip. `error` / `warning` messages and any message containing a `notificationKeywords` word always pass through. Plugin headers such as SoL-Pi's `⚡ SoL-Pi · …` / `Money saved · …` are stripped from tool rows.
+- **Unified tips handling**: Plugin tips (`ui.notify`) are suppressed from the transcript. `ui.setStatus` tips stay in the footer and are colorized, but are only auto-cleared when their rule sets `durationMs`; persistent keys (`persistentKeys`, default `["blackhole", "mcp"]`) pass through untouched so long-lived gauges such as pi-blackhole's footer bar and the MCP server status keep working. `error` / `warning` messages and any message containing a `notificationKeywords` word always pass through. Plugin headers such as SoL-Pi's `⚡ SoL-Pi · …` / `Money saved · …` are stripped from tool rows.
 - **Configuration file support**: Supports global configuration (`~/.pi/agent/extensions/rolling-tools/config.json`) and local project overrides (`./.pi/rolling-tools.json`).
 - **Fixed-dock rolling widget**: Shows the latest running/completed tools in a fixed dock above the editor with status (`⏳`/`✓`/`✗`), duration, and arguments summary.
 - **Click-to-expand details**: Click any tool item to toggle details (`▸` / `▾`) such as full paths, multiline commands, and execution outputs without mouse hover flickering. Click details to copy to clipboard, or `Ctrl+Click` on paths to open files directly.
@@ -151,9 +151,9 @@ Example configuration (`~/.pi/agent/extensions/rolling-tools/config.json`):
   "statusEnhancements": [
     {
       "keyPattern": "*",
-      "durationMs": 8000,
       "showRelativeTime": false,
-      "colorize": true
+      "colorize": true,
+      "persistentKeys": ["blackhole", "mcp"]
     }
   ],
   "notificationKeywords": [
@@ -179,7 +179,20 @@ Plugins commonly emit tips through two channels. Rolling Tools unifies both so t
 | Channel | Behavior |
 | --- | --- |
 | `ui.notify(message, "info")` | Suppressed by default (`interceptNotifications: [{ "match": "*" }]`). It never reaches the transcript. |
-| `ui.setStatus(key, text)` | Kept, but shown only in the footer status line and cleared after `durationMs` (default 8s), or replaced by the next tip. |
+| `ui.setStatus(key, text)` | Kept and colorized. It is **not** auto-cleared unless the matching rule sets `durationMs`. |
+
+**Persistent status keys** (`persistentKeys`, default `["blackhole", "mcp"]`) are passed through completely untouched: no countdown, no forced colorization, and their own clear calls (`setStatus(key, undefined)`) are never swallowed. This protects long-lived gauges such as pi-blackhole's footer bar and the MCP adapter's server status.
+
+To make a transient tip disappear on its own, add `durationMs` to its rule:
+
+```json
+"statusEnhancements": [
+  { "keyPattern": "*", "colorize": true, "persistentKeys": ["blackhole", "mcp"] },
+  { "keyPattern": "sol-pi*", "durationMs": 8000, "colorize": true }
+]
+```
+
+Rules are matched in order, so put the more specific `durationMs` rule before or after the wildcard as needed (the first match wins). `persistentKeys` from the defaults are always unioned into your rules, so you cannot accidentally drop that protection.
 
 Two escape hatches keep important messages visible:
 

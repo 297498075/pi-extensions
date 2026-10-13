@@ -7,7 +7,8 @@ All notable changes to this project will be documented here.
 - feat(rolling-tools): unify plugin tips into the footer status line (config schema v3).
   - `interceptNotifications` now defaults to `[{ "match": "*", "suppressToast": true }]`, so every plugin's `notify(..., "info")` tip is suppressed from the transcript instead of only SoL-Pi's.
   - `error` / `warning` notifications, and any `info` message containing a `notificationKeywords` word (default: `error`, `failed`, `failure`, `warning`, `错误`, `失败`, `警告`, `⚠`, `❌`, `🔴`), always pass through.
-  - `statusEnhancements` now defaults to `keyPattern: "*"` with `durationMs: 8000` and `showRelativeTime: false`, so any plugin's `setStatus` tip shows only in the footer and auto-clears (or is replaced by the next tip).
+  - `statusEnhancements` now defaults to `keyPattern: "*"` with `colorize: true` and **no** `durationMs`, so a plugin's footer status is colorized but its lifecycle is left alone. Add `durationMs` to a rule to make a transient tip auto-clear.
+  - Add `persistentKeys` (default `["blackhole", "mcp"]`): keys listed here are passed through completely untouched — no countdown, no forced colorization, and their own `setStatus(key, undefined)` clears are never swallowed. This fixes pi-blackhole's footer gauge and the MCP server status being wrongly cleared. Default `persistentKeys` are always unioned into user rules.
   - Add `stripToolNotificationHeaders` (default `true`): strip plugin-inserted headers such as SoL-Pi's `⚡ SoL-Pi · Action Fusion` / `Money saved · …` from tool rows via `pi.registerToolRenderer` (silently degrades on Pi versions without it).
   - Remove the now-unused `rollIntoWidget` notification rule field and the `solPiSavings` widget state.
   - Every new field has a default, so the config file is entirely optional; a one-time v2→v3 notice documents the new defaults and `/rolling-tools migrate` writes them out.

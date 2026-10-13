@@ -23,9 +23,17 @@ interface InterceptNotificationRule {
  */
 interface StatusEnhancementRule {
 	keyPattern: string;
+	/**
+	 * 自动消失时长（毫秒）。不设则不倒计时，仅做着色（最安全，不会误伤常驻状态）。
+	 */
 	durationMs?: number;
 	showRelativeTime?: boolean;
 	colorize?: boolean;
+	/**
+	 * 常驻状态 key 列表（支持通配）。命中的 key 完全放行：不倒计时、不拦截、
+	 * 也不吞掉它们自己的清除调用（如 pi-blackhole 的仪表盘、MCP 的服务器状态）。
+	 */
+	persistentKeys?: string[];
 }
 
 /**
@@ -106,11 +114,14 @@ const DEFAULT_CONFIG: RollingToolsConfig = {
 	],
 	statusEnhancements: [
 		{
-			// 默认统一所有插件的 footer 状态行：8 秒后自动消失（可被下一个 tips 替换）。
+			// 默认对所有插件的 footer 状态行只做着色，不主动倒计时。
+			// 因为“通配 + 倒计时”会误伤常驻状态（如 pi-blackhole 的仪表盘）。
+			// 需要“一闪而过”的 tips 请在规则里显式配 durationMs。
 			keyPattern: "*",
-			durationMs: 8000,
 			showRelativeTime: false,
 			colorize: true,
+			// 常驻状态：完全放行，不倒计时、不拦截其清除调用。
+			persistentKeys: ["blackhole", "mcp"],
 		},
 	],
 	notificationKeywords: [...DEFAULT_NOTIFICATION_KEYWORDS],
@@ -248,6 +259,25 @@ function getLocalConfigPath(cwd: string): string {
 	return join(cwd, ".pi", "rolling-tools.json");
 }
 
+/**
+ * 合并 statusEnhancements：用户配置优先，但**始终并集**默认的 persistentKeys，
+ * 避免用户自定义规则时意外丢掉对常驻状态（blackhole / mcp）的保护。
+ */
+function mergeStatusEnhancements(
+	base?: StatusEnhancementRule[],
+	override?: StatusEnhancementRule[],
+): StatusEnhancementRule[] {
+	const incoming = (override ?? []).map((r) => ({ ...r }));
+	const defaultPersistent = (base ?? []).flatMap((r) => r.persistentKeys ?? []);
+	if (defaultPersistent.length === 0 || incoming.length === 0) return incoming;
+
+	// 将默认 persistentKeys 并集到用户规则的每一条上
+	return incoming.map((rule) => {
+		const merged = new Set([...(rule.persistentKeys ?? []), ...defaultPersistent]);
+		return { ...rule, persistentKeys: [...merged] };
+	});
+}
+
 function mergeConfig(base: RollingToolsConfig, override: Partial<RollingToolsConfig>): RollingToolsConfig {
 	let mergedManagedTools = base.managedTools;
 	if (Array.isArray(override.managedTools)) {
@@ -295,7 +325,7 @@ function mergeConfig(base: RollingToolsConfig, override: Partial<RollingToolsCon
 			? [...override.interceptNotifications]
 			: base.interceptNotifications,
 		statusEnhancements: Array.isArray(override.statusEnhancements)
-			? [...override.statusEnhancements]
+			? mergeStatusEnhancements(base.statusEnhancements, override.statusEnhancements)
 			: base.statusEnhancements,
 		lazyLoadStep:
 			typeof override.lazyLoadStep === "number" && override.lazyLoadStep > 0
@@ -403,7 +433,12 @@ function migrateConfigToLatest(cwd: string): {
 			widgetTools: ["*"],
 			interceptNotifications: [{ match: "*", suppressToast: true }],
 			statusEnhancements: [
-				{ keyPattern: "*", durationMs: 8000, showRelativeTime: false, colorize: true },
+				{
+					keyPattern: "*",
+					showRelativeTime: false,
+					colorize: true,
+					persistentKeys: ["blackhole", "mcp"],
+				},
 			],
 			notificationKeywords: [...DEFAULT_NOTIFICATION_KEYWORDS],
 			stripToolNotificationHeaders: true,
@@ -456,11 +491,12 @@ function buildLegacyNotice(legacyPath?: string, fromVersion = 1): string {
 	return [
 		"rolling-tools: 检测到 v2 配置，已按 v3 新默认运行（旧字段自动忽略，不写配置文件也可用）。",
 		"v3 变化：",
-		"• 所有插件的 info 提示只在界面最下方显示，8 秒后自动消失（error / warning 与关键词例外仍保留）",
+		"• 所有插件的 info 提示只在界面最下方显示（error / warning 与关键词例外仍保留）",
 		"• 工具行里重复的 “Money saved” 提示头已自动隐藏",
+		"• 常驻状态（blackhole / mcp）不受影响；需要“一闪而过”的 tips 请显式配 durationMs",
 		"如需自定义，可在配置文件中添加以下字段（全部可选，省略即用默认值）：",
 		'  "interceptNotifications": [{ "match": "*", "suppressToast": true }]',
-		'  "statusEnhancements": [{ "keyPattern": "*", "durationMs": 8000, "showRelativeTime": false, "colorize": true }]',
+		'  "statusEnhancements": [{ "keyPattern": "*", "showRelativeTime": false, "colorize": true, "persistentKeys": ["blackhole", "mcp"] }]',
 		'  "notificationKeywords": ["error", "failed", "failure", "warning", "错误", "失败", "警告", "⚠", "❌", "🔴"]',
 		'  "stripToolNotificationHeaders": true',
 		`或执行 /rolling-tools migrate 写入完整默认配置。${where}`,
@@ -1565,6 +1601,18 @@ function findStatusEnhancementRule(
 }
 
 /**
+ * 判断某个 status key 是否属于“常驻状态”。
+ * 常驻状态（如 pi-blackhole 的仪表盘、MCP 的服务器状态）完全放行：
+ * 不倒计时，也不拦截它自己的清除调用。
+ */
+function isPersistentStatusKey(key: string, rules?: StatusEnhancementRule[]): boolean {
+	if (!rules || !Array.isArray(rules)) return false;
+	return rules.some((rule) =>
+		(rule.persistentKeys ?? []).some((pattern) => matchesToolRule(pattern, key)),
+	);
+}
+
+/**
  * 自适应语义色彩推导（抗上游格式变更，无需硬编码 SoL-Pi）
  * 1. 结构化范式：[图标/Emoji] [模块/机制名] [分隔符] [结果/量化指标]
  * 2. 指标高亮回退：自动提取数值与度量单位为强调绿色
@@ -1753,7 +1801,16 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		text: string | undefined,
 		origFn: Function,
 	) => {
+		// 常驻状态（如 blackhole 仪表盘、MCP 服务器状态）：完全放行。
+		// 不倒计时，也不拦截它们自己的清除调用，否则会卡住不消失。
+		if (isPersistentStatusKey(key, currentConfig.statusEnhancements)) {
+			return origFn.call(target, key, text);
+		}
+
 		const rule = findStatusEnhancementRule(key, currentConfig.statusEnhancements);
+
+		// 只有显式配置了 durationMs 的规则才做“自动消失”。
+		// 默认（durationMs 不设）仅做着色，不接管生命周期。
 		if (rule && rule.durationMs && rule.durationMs > 0) {
 			if (text) {
 				if (activeStatusInterval) {
@@ -1789,12 +1846,18 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				}
 				return;
 			} else {
-				const targetDuration = rule.durationMs;
-				const remaining = activeStatusStartTime + targetDuration - Date.now();
+				// 外部（插件）主动清除：若仍在倒计时窗口内，交给我们的定时器统一收尾；
+				// 否则直接放行。
+				const remaining = activeStatusStartTime + rule.durationMs - Date.now();
 				if (remaining > 0 && lastActiveStatusRawText) {
 					return;
 				}
 			}
+		}
+
+		// 未配 durationMs，或规则未命中：仅做着色（如果有 colorize），不接管生命周期。
+		if (rule?.colorize && typeof text === "string" && text.length > 0) {
+			return origFn.call(target, key, autoColorizeStatusText(text));
 		}
 		return origFn.call(target, key, text);
 	};
