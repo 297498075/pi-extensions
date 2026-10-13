@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import type { Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
 
 /**
  * 通知拦截规则
@@ -38,24 +38,30 @@ interface RollingToolsConfig {
 	genericPropertyFallbacks: string[];
 	interceptNotifications: InterceptNotificationRule[];
 	statusEnhancements?: StatusEnhancementRule[];
+	/** 懒加载步长：overlay 中每次向上加载的条数 */
+	lazyLoadStep?: number;
+	/** 是否在会话间持久化工具滚动历史 */
+	persistAcrossSessions?: boolean;
+	/** 配置结构版本，用于旧版本自动迁移与提示 */
+	configVersion?: number;
 }
+
+/** 当前配置结构版本。1 = 旧白名单语义；2 = 通配符全工具语义。 */
+const CONFIG_VERSION = 2;
 
 const DEFAULT_CONFIG: RollingToolsConfig = {
 	enabled: true,
 	maxRecentTools: 3,
-	managedTools: [
-		"read",
-		"bash",
-		"powershell",
-		"grep",
-		"find",
-		"ls",
-		"mcp",
-		"mcp__*",
-		"rider_execute_tool",
-		"obs_recall",
-		"update_plan",
-	],
+	// 默认托管全部工具（含 edit / write / codemode 及任意三方工具）。
+	// 具体静音与收录范围由 silencedTools / widgetTools 决定。
+	managedTools: ["*"],
+	// 默认：所有被托管的工具都从正文中静音（隐藏），仅出现在滚动块中。
+	silencedTools: ["*"],
+	// 默认：所有被托管的工具都收入滚动块。
+	widgetTools: ["*"],
+	lazyLoadStep: 10,
+	persistAcrossSessions: true,
+	configVersion: CONFIG_VERSION,
 	genericPropertyFallbacks: [
 		"command",
 		"path",
@@ -98,6 +104,10 @@ interface ToolItem {
 	fullPath?: string;
 	fullCommand?: string;
 	output?: string;
+	/** 完整可展示内容（如 edit/write 的 diff 或写入正文），用于 overlay 大窗体 */
+	detailContent?: string;
+	/** detailContent 的语义标签，用于 overlay 标题 */
+	detailKind?: "diff" | "content" | "command" | "output";
 	status: "running" | "done" | "error";
 	durationMs?: number;
 	startTime: number;
@@ -139,9 +149,13 @@ interface RenderedLineInfo {
 	width: number;
 	kind: LineKind;
 	textToCopy?: string;
+	/** 该行最右侧是否存在 [⤢] 展开按钮 */
+	hasOverlayButton?: boolean;
 }
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/** 内存中保留的工具历史上限（widget 只展示最近 maxRecentTools 条，overlay 可浏览全部） */
+const HISTORY_MEMORY_LIMIT = 500;
 const DYNAMIC_HOOKS_KEY = Symbol.for("pi-rolling-tools.dynamicHooks.v3");
 
 interface DynamicHooksState {
@@ -230,6 +244,18 @@ function mergeConfig(base: RollingToolsConfig, override: Partial<RollingToolsCon
 		}
 	}
 
+	// 旧版本（无 configVersion 或 < 2）迁移：
+	// 旧配置只有 managedTools 白名单，没有 silencedTools / widgetTools。
+	// 若直接回退到新默认 ["*"]，会把用户从未选择过的工具（edit/write/三方工具）也一并静音，
+	// 属于破坏性行为。因此旧配置下把 silencedTools / widgetTools 继承自旧 managedTools，
+	// 保持原有语义不变；用户可通过 /rolling-tools migrate 主动升级到全工具语义。
+	const overrideVersion = typeof override.configVersion === "number" ? override.configVersion : 1;
+	const isLegacy = overrideVersion < CONFIG_VERSION;
+	const hasExplicitSilenced = Array.isArray(override.silencedTools);
+	const hasExplicitWidget = Array.isArray(override.widgetTools);
+
+	const legacyManaged = Array.isArray(override.managedTools) ? mergedManagedTools : base.managedTools;
+
 	return {
 		enabled: typeof override.enabled === "boolean" ? override.enabled : base.enabled,
 		maxRecentTools:
@@ -237,8 +263,16 @@ function mergeConfig(base: RollingToolsConfig, override: Partial<RollingToolsCon
 				? override.maxRecentTools
 				: base.maxRecentTools,
 		managedTools: mergedManagedTools,
-		silencedTools: Array.isArray(override.silencedTools) ? [...override.silencedTools] : base.silencedTools,
-		widgetTools: Array.isArray(override.widgetTools) ? [...override.widgetTools] : base.widgetTools,
+		silencedTools: hasExplicitSilenced
+			? [...override.silencedTools!]
+			: isLegacy
+				? [...legacyManaged]
+				: base.silencedTools,
+		widgetTools: hasExplicitWidget
+			? [...override.widgetTools!]
+			: isLegacy
+				? [...legacyManaged, "edit", "write"]
+				: base.widgetTools,
 		genericPropertyFallbacks: Array.isArray(override.genericPropertyFallbacks)
 			? [...override.genericPropertyFallbacks]
 			: base.genericPropertyFallbacks,
@@ -248,20 +282,43 @@ function mergeConfig(base: RollingToolsConfig, override: Partial<RollingToolsCon
 		statusEnhancements: Array.isArray(override.statusEnhancements)
 			? [...override.statusEnhancements]
 			: base.statusEnhancements,
+		lazyLoadStep:
+			typeof override.lazyLoadStep === "number" && override.lazyLoadStep > 0
+				? override.lazyLoadStep
+				: base.lazyLoadStep,
+		persistAcrossSessions:
+			typeof override.persistAcrossSessions === "boolean"
+				? override.persistAcrossSessions
+				: base.persistAcrossSessions,
+		configVersion: CONFIG_VERSION,
 	};
 }
 
 /**
  * 读取并合并配置（默认值 -> 全局配置 -> 本地配置）
  */
-function loadConfig(cwd: string): RollingToolsConfig {
+interface LoadConfigResult {
+	config: RollingToolsConfig;
+	/** 是否检测到旧版本配置并做了兼容性迁移（用于向用户展示一次性提示） */
+	legacyDetected: boolean;
+	/** 检测到旧配置的文件路径（便于提示用户去修改） */
+	legacyPath?: string;
+}
+
+function loadConfig(cwd: string): LoadConfigResult {
 	let config: RollingToolsConfig = { ...DEFAULT_CONFIG };
+	let legacyDetected = false;
+	let legacyPath: string | undefined;
 
 	const globalPath = getGlobalConfigPath();
 	try {
 		if (existsSync(globalPath)) {
 			const raw = readFileSync(globalPath, "utf-8");
 			const parsed = JSON.parse(raw);
+			if (typeof parsed?.configVersion !== "number" || parsed.configVersion < CONFIG_VERSION) {
+				legacyDetected = true;
+				legacyPath = globalPath;
+			}
 			config = mergeConfig(config, parsed);
 		} else {
 			ensureDirectoryExists(dirname(globalPath));
@@ -276,13 +333,75 @@ function loadConfig(cwd: string): RollingToolsConfig {
 		if (existsSync(localPath)) {
 			const raw = readFileSync(localPath, "utf-8");
 			const parsed = JSON.parse(raw);
+			if (typeof parsed?.configVersion !== "number" || parsed.configVersion < CONFIG_VERSION) {
+				legacyDetected = true;
+				legacyPath = localPath;
+			}
 			config = mergeConfig(config, parsed);
 		}
 	} catch (e) {
 		console.error("[rolling-tools] Failed to load local config:", e);
 	}
 
-	return config;
+	return { config, legacyDetected, legacyPath };
+}
+
+/**
+ * 将磁盘上的配置文件升级到最新结构版本（全工具语义）。
+ * 保留用户已有的其他字段，仅将 managedTools / silencedTools / widgetTools 设为 ["*"]
+ * 并写入 configVersion。优先升级本地配置（若存在），否则升级全局配置。
+ */
+function migrateConfigToLatest(cwd: string): {
+	ok: boolean;
+	config?: RollingToolsConfig;
+	path?: string;
+	error?: string;
+} {
+	try {
+		const localPath = getLocalConfigPath(cwd);
+		const globalPath = getGlobalConfigPath();
+		const targetPath = existsSync(localPath) ? localPath : globalPath;
+
+		let existing: Record<string, unknown> = {};
+		if (existsSync(targetPath)) {
+			existing = JSON.parse(readFileSync(targetPath, "utf-8")) as Record<string, unknown>;
+		}
+
+		const upgraded: Record<string, unknown> = {
+			...existing,
+			managedTools: ["*"],
+			silencedTools: ["*"],
+			widgetTools: ["*"],
+			configVersion: CONFIG_VERSION,
+		};
+		if (typeof upgraded.lazyLoadStep !== "number") upgraded.lazyLoadStep = DEFAULT_CONFIG.lazyLoadStep;
+		if (typeof upgraded.persistAcrossSessions !== "boolean") {
+			upgraded.persistAcrossSessions = DEFAULT_CONFIG.persistAcrossSessions;
+		}
+
+		ensureDirectoryExists(dirname(targetPath));
+		writeFileSync(targetPath, JSON.stringify(upgraded, null, 2), "utf-8");
+
+		const reloaded = loadConfig(cwd);
+		return { ok: true, config: reloaded.config, path: targetPath };
+	} catch (e) {
+		return { ok: false, error: e instanceof Error ? e.message : String(e) };
+	}
+}
+
+/**
+ * 构造旧配置迁移提示文案。
+ * 旧版本（configVersion < 2）只有 managedTools 白名单，新版默认改为通配符全工具。
+ * 为避免破坏性变更，旧配置会保持原语义，并提示用户如何主动升级。
+ */
+function buildLegacyNotice(legacyPath?: string): string {
+	const where = legacyPath ? `\n• 配置文件: ${legacyPath}` : "";
+	return [
+		"rolling-tools: 检测到旧版配置，已自动保持原有行为（未强制切换为全工具）。",
+		"新版默认会将所有工具（含 edit / write / codemode / 三方工具）收入滚动块并隐藏正文。",
+		"如需启用新语义，请将配置中的 managedTools / silencedTools / widgetTools 设为 [\"*\"]，",
+		`或执行 /rolling-tools migrate 自动升级。${where}`,
+	].join("\n");
 }
 
 /**
@@ -377,7 +496,14 @@ function extractSummaryAndMetadata(
 	input: any,
 	cwd: string,
 	config: RollingToolsConfig,
-): { summaryDisplay: string; fullPath?: string; fullCommand?: string; displayName?: string } {
+): {
+	summaryDisplay: string;
+	fullPath?: string;
+	fullCommand?: string;
+	displayName?: string;
+	detailContent?: string;
+	detailKind?: "diff" | "content" | "command" | "output";
+} {
 	if (!input || typeof input !== "object") {
 		return { summaryDisplay: "" };
 	}
@@ -391,11 +517,38 @@ function extractSummaryAndMetadata(
 		return { summaryDisplay: display, fullCommand: rawCmd };
 	}
 
+	// 1.5 codemode：脚本全文存入 detailContent，便于在 overlay 中完整查看
+	if (name === "codemode") {
+		const code = typeof input.code === "string" ? input.code : "";
+		if (!code) return { summaryDisplay: "" };
+		const firstLine = code.split("\n").find((l: string) => l.trim().length > 0) || "";
+		const lineCount = code.split("\n").length;
+		return {
+			summaryDisplay: `${truncate(firstLine.trim(), 42)} (${lineCount} lines)`,
+			detailContent: code,
+			detailKind: "content",
+		};
+	}
+
 	// 2. 内置文件工具：read / edit / write
 	if (name === "read" || name === "edit" || name === "write") {
 		const rawPath = typeof input.path === "string" ? input.path : "";
 		if (!rawPath) return { summaryDisplay: "" };
 		const absPath = resolve(cwd, rawPath);
+		// write：正文即待写入内容，可在 overlay 中完整展示
+		if (name === "write" && typeof input.content === "string") {
+			const lineCount = input.content.split("\n").length;
+			return {
+				summaryDisplay: `${truncate(rawPath, 40)} (+${lineCount} lines)`,
+				fullPath: absPath,
+				detailContent: input.content,
+				detailKind: "content",
+			};
+		}
+		// edit：diff 在 tool_result.details.diff 中回填，这里先给出摘要
+		if (name === "edit") {
+			return { summaryDisplay: truncate(rawPath, 50), fullPath: absPath, detailKind: "diff" };
+		}
 		return { summaryDisplay: truncate(rawPath, 50), fullPath: absPath };
 	}
 
@@ -456,12 +609,16 @@ function extractSummaryAndMetadata(
 		let innerSummary = "";
 		let fullCmd: string | undefined;
 		let fullPth: string | undefined;
+		let innerDetail: string | undefined;
+		let innerDetailKind: "diff" | "content" | "command" | "output" | undefined;
 
 		if (input.args && typeof input.args === "object") {
 			const inner = extractSummaryAndMetadata(targetTool || "inner", input.args, cwd, config);
 			innerSummary = inner.summaryDisplay ? ` (${inner.summaryDisplay})` : "";
 			fullCmd = inner.fullCommand;
 			fullPth = inner.fullPath;
+			innerDetail = inner.detailContent;
+			innerDetailKind = inner.detailKind;
 		}
 
 		let prefix = "";
@@ -478,6 +635,8 @@ function extractSummaryAndMetadata(
 			summaryDisplay: truncate(prefix + innerSummary, 55),
 			fullCommand: fullCmd,
 			fullPath: fullPth,
+			detailContent: innerDetail,
+			detailKind: innerDetailKind,
 		};
 	}
 
@@ -507,11 +666,86 @@ function extractSummaryAndMetadata(
 		cwd,
 		config.genericPropertyFallbacks,
 	);
+	// 为三方工具附带可展示的长文本内容（如 subagent 的 prompt、recall 的 id 等）
+	const genericDetail = pickGenericDetailContent(input);
 	return {
 		summaryDisplay: summary ? truncate(summary, 50) : truncate(JSON.stringify(input), 50),
 		fullPath,
 		fullCommand,
+		detailContent: genericDetail?.content ?? fullCommand,
+		detailKind: genericDetail?.kind ?? (fullCommand ? "command" : undefined),
 	};
+}
+
+/**
+ * 从任意三方工具输入中挑选适合在 overlay 中完整展示的长文本字段。
+ * 仅做纯读取，不修改输入。
+ */
+function pickGenericDetailContent(
+	input: any,
+): { content: string; kind: "diff" | "content" | "command" | "output" } | undefined {
+	if (!input || typeof input !== "object") return undefined;
+	const candidates: Array<{ key: string; kind: "diff" | "content" | "command" | "output" }> = [
+		{ key: "prompt", kind: "content" },
+		{ key: "content", kind: "content" },
+		{ key: "command", kind: "command" },
+		{ key: "message", kind: "content" },
+		{ key: "query", kind: "content" },
+	];
+	for (const { key, kind } of candidates) {
+		const val = input[key];
+		if (typeof val === "string" && val.trim().length > 0) {
+			return { content: val, kind };
+		}
+	}
+	return undefined;
+}
+
+/**
+ * 会话持久化：写入滚动历史的快照（不参与 LLM 上下文）。
+ * 只保留最近 N 条，并裁剪过长字段，避免 session 文件膨胀。
+ */
+const HISTORY_ENTRY_TYPE = "rolling-tools-history";
+const PERSIST_MAX_ITEMS = 200;
+const PERSIST_MAX_FIELD = 20000;
+
+function serializeHistory(items: ToolItem[], total: number): { total: number; items: any[] } {
+	const trimmed = items.slice(-PERSIST_MAX_ITEMS).map((t) => ({
+		id: t.id,
+		index: t.index,
+		name: t.name,
+		displayName: t.displayName,
+		summaryDisplay: t.summaryDisplay,
+		fullPath: t.fullPath,
+		fullCommand: t.fullCommand ? t.fullCommand.slice(0, PERSIST_MAX_FIELD) : undefined,
+		output: t.output ? t.output.slice(0, PERSIST_MAX_FIELD) : undefined,
+		detailContent: t.detailContent ? t.detailContent.slice(0, PERSIST_MAX_FIELD) : undefined,
+		detailKind: t.detailKind,
+		status: t.status,
+		durationMs: t.durationMs,
+		startTime: t.startTime,
+	}));
+	return { total, items: trimmed };
+}
+
+function deserializeHistory(data: any): { items: ToolItem[]; total: number } | null {
+	if (!data || !Array.isArray(data.items)) return null;
+	const items: ToolItem[] = data.items.map((raw: any) => ({
+		id: String(raw.id ?? ""),
+		index: Number(raw.index ?? 0),
+		name: String(raw.name ?? ""),
+		displayName: raw.displayName,
+		summaryDisplay: String(raw.summaryDisplay ?? ""),
+		fullPath: raw.fullPath,
+		fullCommand: raw.fullCommand,
+		output: raw.output,
+		detailContent: raw.detailContent,
+		detailKind: raw.detailKind,
+		status: raw.status === "error" ? "error" : raw.status === "running" ? "done" : "done",
+		durationMs: typeof raw.durationMs === "number" ? raw.durationMs : undefined,
+		startTime: Number(raw.startTime ?? Date.now()),
+	}));
+	return { items, total: Number(data.total ?? items.length) };
 }
 
 /**
@@ -578,23 +812,37 @@ class RollingToolsWidgetComponent implements Component {
 	private state: WidgetState;
 	private lineMap: RenderedLineInfo[] = [];
 	private copyFeedbackTimer: any = null;
+	/** 点击 [⤢] 按钮时的回调，由外部注入以打开 overlay 大窗体 */
+	private onOpenOverlay: ((item?: ToolItem) => void) | null = null;
+	/** widget 中最多展示的条目数（overlay 仍可浏览全部历史） */
+	private displayLimit: number;
 
-	constructor(tui: any, theme: any, state: WidgetState) {
+	constructor(
+		tui: any,
+		theme: any,
+		state: WidgetState,
+		onOpenOverlay?: (item?: ToolItem) => void,
+		displayLimit = 3,
+	) {
 		this.tui = tui;
 		this.theme = theme;
 		this.state = state;
+		this.onOpenOverlay = onOpenOverlay ?? null;
+		this.displayLimit = Math.max(1, displayLimit);
 	}
 
-	render(_width: number): string[] {
+	render(width: number): string[] {
 		this.lineMap = [];
 		const lines: string[] = [];
 		const theme = this.theme;
+		const renderWidth = Math.max(20, width);
 
 		const pushLine = (
 			text: string,
 			item: ToolItem | null = null,
 			kind: LineKind = "other",
 			textToCopy?: string,
+			hasOverlayButton = false,
 		) => {
 			lines.push(text);
 			this.lineMap.push({
@@ -602,31 +850,36 @@ class RollingToolsWidgetComponent implements Component {
 				width: visibleWidth(text),
 				kind,
 				textToCopy,
+				hasOverlayButton,
 			});
 		};
 
-		// 1. 顶层状态行（等待服务器响应 ➔ 思考中 ➔ 思考完成，共用一行平滑过渡）
-		if (this.state.headerStatus.type === "waiting_server") {
-			const elapsedSec = ((Date.now() - this.state.headerStatus.startTime) / 1000).toFixed(1);
-			const spinner = SPINNER_FRAMES[Math.floor(Date.now() / 150) % SPINNER_FRAMES.length];
-			pushLine(
-				` ${theme.fg("accent", "🌐")} ${theme.bold(theme.fg("toolTitle", `${spinner} 等待服务器响应...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`,
-			);
-		} else if (this.state.headerStatus.type === "thinking") {
-			const elapsedSec = ((Date.now() - this.state.headerStatus.startTime) / 1000).toFixed(1);
-			const spinner = SPINNER_FRAMES[Math.floor(Date.now() / 150) % SPINNER_FRAMES.length];
-			pushLine(
-				` ${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", `${spinner} 思考中...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`,
-			);
-		} else if (this.state.headerStatus.type === "thinking_completed") {
-			const elapsedSec = (this.state.headerStatus.durationMs / 1000).toFixed(1);
-			pushLine(
-				` ${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", "思考完成"))} ${theme.fg("muted", `(${elapsedSec}s)`)}`,
-			);
+		// 1. 常驻状态行（等待服务器响应 ➔ 思考中 ➔ 思考完成，共用一行平滑过渡）
+		// 该行始终存在，作为滚动块的固定头部；[⤢] 大窗体按钮固定显示在本行最右侧。
+		{
+			const button = theme.fg("accent", "[⤢]");
+			let statusText: string;
+			if (this.state.headerStatus.type === "waiting_server") {
+				const elapsedSec = ((Date.now() - this.state.headerStatus.startTime) / 1000).toFixed(1);
+				const spinner = SPINNER_FRAMES[Math.floor(Date.now() / 150) % SPINNER_FRAMES.length];
+				statusText = ` ${theme.fg("accent", "🌐")} ${theme.bold(theme.fg("toolTitle", `${spinner} 等待服务器响应...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`;
+			} else if (this.state.headerStatus.type === "thinking") {
+				const elapsedSec = ((Date.now() - this.state.headerStatus.startTime) / 1000).toFixed(1);
+				const spinner = SPINNER_FRAMES[Math.floor(Date.now() / 150) % SPINNER_FRAMES.length];
+				statusText = ` ${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", `${spinner} 思考中...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`;
+			} else if (this.state.headerStatus.type === "thinking_completed") {
+				const elapsedSec = (this.state.headerStatus.durationMs / 1000).toFixed(1);
+				statusText = ` ${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", "思考完成"))} ${theme.fg("muted", `(${elapsedSec}s)`)}`;
+			} else {
+				statusText = ` ${theme.fg("accent", "•")} ${theme.fg("muted", "就绪")}`;
+			}
+			const pad = Math.max(1, renderWidth - visibleWidth(statusText) - visibleWidth(button) - 1);
+			pushLine(`${statusText}${' '.repeat(pad)}${button}`, null, "header", undefined, true);
 		}
 
-		// 2. 滚动工具列表
-		for (const t of this.state.recentTools) {
+		// 2. 滚动工具列表（widget 只展示最近 displayLimit 条，完整历史在 overlay 中查看）
+		const visibleTools = this.state.recentTools.slice(-this.displayLimit);
+		for (const t of visibleTools) {
 			const isExpanded = this.state.expandedItemId === t.id;
 			let icon = theme.fg("accent", "⏳");
 			if (t.status === "done") icon = theme.fg("success", "✓");
@@ -731,6 +984,15 @@ class RollingToolsWidgetComponent implements Component {
 		}
 
 		if (event.type === "click" && isWithinText) {
+			// 0. 点击最右侧 [⤢] 按钮：打开 overlay 大窗体
+			if (lineEntry?.hasOverlayButton && event.button !== "right") {
+				const buttonStart = Math.max(0, lineEntry.width - 4);
+				if (event.x >= buttonStart) {
+					this.onOpenOverlay?.(targetItem ?? undefined);
+					return { handled: true };
+				}
+			}
+
 			// 1. 点击了可复制行（包括 SoL-Pi 节省行或工具详情输出）
 			if (lineEntry?.kind === "detail_copyable" && lineEntry.textToCopy) {
 				const label = targetItem?.fullPath
@@ -769,6 +1031,472 @@ class RollingToolsWidgetComponent implements Component {
 				// 4. 左键点击标题行：切换展开/折叠状态
 				this.state.expandedItemId = this.state.expandedItemId === targetItem.id ? null : targetItem.id;
 				this.tui?.requestRender?.();
+				return { handled: true };
+			}
+		}
+
+		return undefined;
+	}
+
+	invalidate(): void {}
+}
+
+/**
+ * 工具历史大窗体（overlay dialog）。
+ *
+ * 设计要点：
+ * - 在 overlay 中承载完整工具历史，支持鼠标滚轮滚动。
+ * - 向上滚动到顶部时，自动再加载 `step` 条更早的历史（懒加载）。
+ * - 选中某条工具后，右侧详情区展示完整内容（edit diff / write 正文 / 命令 / 输出）。
+ *
+ * 注意：overlay 组件会收到 `wheel` 事件（TUI 在 routeWheel 之前先 dispatchMouseToOverlay），
+ * 因此这里可以原生实现滚轮与“上滑到顶加载更多”。
+ */
+class ToolHistoryOverlayComponent implements Component {
+	private tui: any;
+	private theme: any;
+	private allItems: ToolItem[];
+	private step: number;
+	private onClose: () => void;
+	private requestRender: () => void;
+
+	/** 当前已加载（可见）的条目数，从最新往回数 */
+	private loadedCount: number;
+	/** 当前选中的条目下标（相对于 allItems） */
+	private selectedIndex: number;
+	/** 详情区滚动偏移 */
+	private detailScrollTop = 0;
+	/** 列表区滚动偏移（已加载条目内的行偏移） */
+	private listScrollTop = 0;
+	/** 渲染缓存：用于鼠标命中检测 */
+	private listRowMap: Array<{ row: number; index: number }> = [];
+	private listViewportHeight = 1;
+	private detailLineCount = 0;
+	private detailViewportHeight = 1;
+	private lastWidth = 80;
+	/** 是否自动跟随最新条目（用户手动选择后关闭） */
+	private followTail = true;
+	/** 复制反馈（就地显示在底部提示行） */
+	private copyFeedback: string | null = null;
+	private copyFeedbackTimer: any = null;
+	/** 居中方框在 overlay 内的几何位置（用于区分框内/框外点击） */
+	private boxTop = 0;
+	private boxLeft = 0;
+	private boxWidth = 0;
+	private boxHeight = 0;
+
+	constructor(
+		tui: any,
+		theme: any,
+		items: ToolItem[],
+		step: number,
+		onClose: () => void,
+		requestRender: () => void,
+	) {
+		this.tui = tui;
+		this.theme = theme;
+		this.allItems = items;
+		this.step = Math.max(1, step);
+		this.onClose = onClose;
+		this.requestRender = requestRender;
+		// 初始只加载最近 step 条（懒加载起点）
+		this.loadedCount = Math.min(this.step, items.length);
+		this.selectedIndex = items.length > 0 ? items.length - 1 : -1;
+	}
+
+	/**
+	 * 外部（agent 运行中）调用：同步最新历史。
+	 * - 若用户未手动选择（followTail），自动选中最新条目。
+	 * - 若用户未手动锁定已加载范围，自动扩展以包含新条目。
+	 */
+	refresh(): void {
+		const total = this.allItems.length;
+		if (total === 0) return;
+		if (this.followTail) {
+			this.selectedIndex = total - 1;
+			this.detailScrollTop = 0;
+		}
+		// 新条目会追加到末尾，已加载窗口从末尾往前数，因此无需改动 loadedCount
+		if (this.loadedCount > total) this.loadedCount = total;
+		this.requestRender();
+	}
+
+	/** 已加载条目在 allItems 中的起始下标 */
+	private get loadedStart(): number {
+		return Math.max(0, this.allItems.length - this.loadedCount);
+	}
+
+	/** 外部指定选中项（用于从某一工具直接打开大窗体） */
+	selectIndex(index: number): void {
+		if (index < 0 || index >= this.allItems.length) return;
+		this.selectedIndex = index;
+		this.detailScrollTop = 0;
+		this.followTail = index === this.allItems.length - 1;
+		if (index < this.loadedStart) {
+			this.loadedCount = Math.min(this.allItems.length, this.allItems.length - index);
+		}
+		const relIndex = index - this.loadedStart;
+		if (relIndex < this.listScrollTop) this.listScrollTop = relIndex;
+		if (relIndex >= this.listScrollTop + this.listViewportHeight) {
+			this.listScrollTop = relIndex - this.listViewportHeight + 1;
+		}
+		this.requestRender();
+	}
+
+	private get loadedItems(): ToolItem[] {
+		return this.allItems.slice(this.loadedStart);
+	}
+
+	/** 再加载 step 条更早的历史；返回是否真的加载了 */
+	private loadMore(): boolean {
+		if (this.loadedCount >= this.allItems.length) return false;
+		this.loadedCount = Math.min(this.allItems.length, this.loadedCount + this.step);
+		return true;
+	}
+
+	private get selectedItem(): ToolItem | undefined {
+		return this.selectedIndex >= 0 ? this.allItems[this.selectedIndex] : undefined;
+	}
+
+	private statusIcon(t: ToolItem): string {
+		const theme = this.theme;
+		if (t.status === "done") return theme.fg("success", "✓");
+		if (t.status === "error") return theme.fg("error", "✗");
+		return theme.fg("accent", "⏳");
+	}
+
+	render(width: number): string[] {
+		this.lastWidth = width;
+		const theme = this.theme;
+		this.listRowMap = [];
+
+		const termRows = Math.max(10, this.tui?.terminal?.rows ?? 30);
+		const termCols = Math.max(30, width);
+
+		// 方框尺寸：占终端 90% 宽 / 80% 高（与 overlayOptions 一致），并居中
+		const boxW = Math.max(30, Math.min(termCols - 2, Math.floor(termCols * 0.9)));
+		const boxH = Math.max(8, Math.min(termRows - 2, Math.floor(termRows * 0.8)));
+		const boxTop = Math.max(0, Math.floor((termRows - boxH) / 2));
+		const boxLeft = Math.max(0, Math.floor((termCols - boxW) / 2));
+		this.boxTop = boxTop;
+		this.boxLeft = boxLeft;
+		this.boxWidth = boxW;
+		this.boxHeight = boxH;
+
+		const borderColor = (s: string) => theme.fg("accent", s);
+		const inner = Math.max(20, boxW - 4);
+		const listWidth = Math.max(20, Math.floor(inner * 0.45));
+		const detailWidth = Math.max(20, inner - listWidth - 3);
+
+		const total = this.allItems.length;
+		const loaded = this.loadedCount;
+		const canLoadMore = loaded < total;
+		const titleHint = canLoadMore
+			? theme.fg("dim", `↑ 上滑到顶加载更多 (${loaded}/${total})`)
+			: theme.fg("dim", `已全部加载 (${total})`);
+
+		// 方框内部行（不含外框）
+		const boxLines: string[] = [];
+		const titleText = ` ${theme.bold(theme.fg("toolTitle", "工具历史"))}  ${titleHint}   ${theme.fg("muted", "[Esc/点击外部 关闭] · 点击左侧行复制详情")}`;
+		const titlePad = Math.max(0, boxW - 2 - visibleWidth(titleText));
+		boxLines.push(`${borderColor("┌")}${titleText}${' '.repeat(titlePad)}${borderColor("┐")}`);
+		boxLines.push(`${borderColor("├")}${theme.fg("dim", "─".repeat(boxW - 2))}${borderColor("┤")}`);
+
+		// 内容区高度 = 方框高 - 标题(1) - 标题分隔(1) - 底部分隔(1) - 提示(1) - 底边(1)
+		const viewportHeight = Math.max(3, boxH - 5);
+		this.listViewportHeight = viewportHeight;
+		this.detailViewportHeight = viewportHeight;
+
+		// 左栏：已加载的工具列表（带滚动偏移）
+		const loadedItems = this.loadedItems;
+		const listStart = Math.min(this.listScrollTop, Math.max(0, loadedItems.length - viewportHeight));
+		this.listScrollTop = listStart;
+		const listEnd = Math.min(loadedItems.length, listStart + viewportHeight);
+
+		const listRows: string[] = [];
+		for (let i = listStart; i < listEnd; i++) {
+			const t = loadedItems[i];
+			const absIndex = this.loadedStart + i;
+			const isSel = absIndex === this.selectedIndex;
+			const marker = isSel ? theme.fg("accent", "▸") : " ";
+			const badge = theme.fg("dim", `[${t.index}]`);
+			const name = isSel
+				? theme.bold(theme.fg("accent", t.displayName || t.name))
+				: theme.fg("toolTitle", t.displayName || t.name);
+			const summary = theme.fg("dim", truncate(t.summaryDisplay, Math.max(8, listWidth - 18)));
+			const row = `${marker}${this.statusIcon(t)} ${badge} ${name} ${summary}`;
+			// 行号：标题(0) + 分隔(1) + 内容起始(2)
+			this.listRowMap.push({ row: 2 + listRows.length, index: absIndex });
+			listRows.push(row);
+		}
+
+		// 右栏：选中条目详情
+		const detailLines = this.buildDetailLines(detailWidth);
+		this.detailLineCount = detailLines.length;
+		const detailStart = Math.min(this.detailScrollTop, Math.max(0, detailLines.length - viewportHeight));
+		this.detailScrollTop = detailStart;
+		const detailEnd = Math.min(detailLines.length, detailStart + viewportHeight);
+
+		for (let row = 0; row < viewportHeight; row++) {
+			const left = listRows[row] ?? "";
+			const right = detailLines[detailStart + row] ?? "";
+			const leftPadded = left + " ".repeat(Math.max(0, listWidth - visibleWidth(left)));
+			const sep = theme.fg("dim", " │ ");
+			const content = `${leftPadded}${sep}${right}`;
+			const pad = Math.max(0, boxW - 2 - visibleWidth(content));
+			boxLines.push(`${borderColor("│")}${content}${' '.repeat(pad)}${borderColor("│")}`);
+		}
+
+		// 底部提示（优先显示复制反馈）
+		boxLines.push(`${borderColor("├")}${theme.fg("dim", "─".repeat(boxW - 2))}${borderColor("┤")}`);
+		let hintText: string;
+		if (this.copyFeedback) {
+			hintText = theme.fg("success", `✓ ${this.copyFeedback}`);
+		} else if (this.detailLineCount > viewportHeight) {
+			hintText = theme.fg("muted", `详情 ${detailStart + 1}-${detailEnd}/${this.detailLineCount} · 滚轮滚动 · ↑↓ 选择 · Esc 关闭`);
+		} else {
+			hintText = theme.fg("muted", "滚轮滚动 · ↑↓ 选择 · 点击左侧行复制详情 · Esc 关闭");
+		}
+		const hintPad = Math.max(0, boxW - 2 - visibleWidth(hintText) - 1);
+		boxLines.push(`${borderColor("│")} ${hintText}${' '.repeat(hintPad)}${borderColor("│")}`);
+		boxLines.push(`${borderColor("└")}${theme.fg("dim", "─".repeat(boxW - 2))}${borderColor("┘")}`);
+
+		// 把方框合成到全屏画布上（框外为空白），从而能接收框外点击以关闭
+		const blank = " ".repeat(termCols);
+		const lines: string[] = [];
+		for (let r = 0; r < boxTop; r++) lines.push(blank);
+		for (const bl of boxLines) {
+			const leftPad = " ".repeat(boxLeft);
+			const rightPad = " ".repeat(Math.max(0, termCols - boxLeft - visibleWidth(bl)));
+			lines.push(`${leftPad}${bl}${rightPad}`);
+		}
+		const used = boxTop + boxLines.length;
+		for (let r = used; r < termRows; r++) lines.push(blank);
+
+		return lines;
+	}
+
+	/** 构建右侧详情行（已按宽度换行/截断） */
+	private buildDetailLines(width: number): string[] {
+		const theme = this.theme;
+		const t = this.selectedItem;
+		const out: string[] = [];
+		if (!t) {
+			out.push(theme.fg("muted", "(无选中条目)"));
+			return out;
+		}
+
+		out.push(theme.bold(theme.fg("toolTitle", `${t.displayName || t.name}  [${t.index}]`)));
+		if (t.durationMs !== undefined) {
+			out.push(theme.fg("muted", `耗时 ${t.durationMs}ms · 状态 ${t.status}`));
+		}
+		if (t.fullPath) out.push(theme.fg("accent", `路径: ${t.fullPath}`));
+		out.push("");
+
+		// 优先展示 detailContent（edit diff / write 正文 / 三方工具长文本）
+		const detail = t.detailContent;
+		if (detail && detail.trim().length > 0) {
+			const kindLabel =
+				t.detailKind === "diff"
+					? "变更 diff"
+					: t.detailKind === "content"
+						? "内容"
+						: t.detailKind === "command"
+							? "命令"
+							: "详情";
+			out.push(theme.fg("accent", `── ${kindLabel} ──`));
+			for (const raw of detail.split("\n")) {
+				out.push(...this.wrapLine(raw, width, (line) => this.colorizeDetailLine(line, t.detailKind)));
+			}
+			out.push("");
+		} else if (t.fullCommand) {
+			out.push(theme.fg("accent", "── 命令 ──"));
+			for (const raw of t.fullCommand.split("\n")) {
+				out.push(...this.wrapLine(raw, width, (line) => theme.fg("accent", line)));
+			}
+			out.push("");
+		}
+
+		// 输出内容
+		if (t.output && t.output.trim().length > 0) {
+			out.push(theme.fg("accent", "── 输出 ──"));
+			for (const raw of t.output.replace(/\r\n/g, "\n").split("\n")) {
+				out.push(...this.wrapLine(raw, width, (line) => theme.fg("muted", line)));
+			}
+		}
+
+		if (out.length === 0) out.push(theme.fg("muted", "(无详情)"));
+		return out;
+	}
+
+	private colorizeDetailLine(line: string, kind?: string): string {
+		const theme = this.theme;
+		if (kind === "diff") {
+			if (line.startsWith("+")) return theme.fg("success", line);
+			if (line.startsWith("-")) return theme.fg("error", line);
+			if (line.startsWith("@@")) return theme.fg("accent", line);
+			return theme.fg("dim", line);
+		}
+		return line;
+	}
+
+	/** 按显示宽度硬换行（保留 ANSI 无关的纯文本换行） */
+	private wrapLine(raw: string, width: number, style: (line: string) => string): string[] {
+		if (visibleWidth(raw) <= width) return [style(raw)];
+		const out: string[] = [];
+		let remaining = raw;
+		while (visibleWidth(remaining) > width) {
+			// 简化处理：按可见宽度切片（不处理 ANSI，因为源文本通常无 ANSI）
+			let cut = 0;
+			let w = 0;
+			for (const ch of remaining) {
+				const cw = visibleWidth(ch);
+				if (w + cw > width) break;
+				w += cw;
+				cut += ch.length;
+			}
+			if (cut === 0) break;
+			out.push(style(remaining.slice(0, cut)));
+			remaining = remaining.slice(cut);
+		}
+		if (remaining.length > 0) out.push(style(remaining));
+		return out;
+	}
+
+	handleInput(data: string): void {
+		// Esc / q 关闭
+		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || data === "q") {
+			this.onClose();
+			return;
+		}
+		// 上下选择
+		if (matchesKey(data, "up") || data === "k") {
+			this.moveSelection(-1);
+			return;
+		}
+		if (matchesKey(data, "down") || data === "j") {
+			this.moveSelection(1);
+			return;
+		}
+		// PageUp/PageDown 滚动详情
+		if (matchesKey(data, "pageUp")) {
+			this.detailScrollTop = Math.max(0, this.detailScrollTop - this.detailViewportHeight);
+			this.requestRender();
+			return;
+		}
+		if (matchesKey(data, "pageDown")) {
+			this.detailScrollTop = Math.min(
+				Math.max(0, this.detailLineCount - this.detailViewportHeight),
+				this.detailScrollTop + this.detailViewportHeight,
+			);
+			this.requestRender();
+		}
+	}
+
+	private moveSelection(delta: number): void {
+		if (this.allItems.length === 0) return;
+		const next = Math.max(0, Math.min(this.allItems.length - 1, this.selectedIndex + delta));
+		if (next === this.selectedIndex) return;
+		this.selectedIndex = next;
+		this.detailScrollTop = 0;
+		// 只要用户手动移动选择，就停止自动跟随最新条目
+		this.followTail = false;
+		// 确保选中项在已加载范围内
+		if (next < this.loadedStart) {
+			this.loadedCount = Math.min(this.allItems.length, this.allItems.length - next);
+		}
+		// 确保选中项在列表视口内
+		const relIndex = next - this.loadedStart;
+		if (relIndex < this.listScrollTop) this.listScrollTop = relIndex;
+		if (relIndex >= this.listScrollTop + this.listViewportHeight) {
+			this.listScrollTop = relIndex - this.listViewportHeight + 1;
+		}
+		this.requestRender();
+	}
+
+	/** 将某条工具的详情文本复制到剪贴板，并就地显示反馈 */
+	private copyItemDetail(t: ToolItem): void {
+		const text =
+			t.detailContent ??
+			t.fullCommand ??
+			t.fullPath ??
+			t.output ??
+			t.summaryDisplay;
+		if (!text) return;
+		copyToClipboard(text);
+		const label = t.detailContent
+			? t.detailKind === "diff"
+				? "diff"
+				: "内容"
+			: t.fullCommand
+				? "命令"
+				: t.fullPath
+					? "路径"
+					: "输出";
+		this.copyFeedback = `已复制${label}: ${truncate(text.replace(/\r?\n/g, " "), 50)}`;
+		if (this.copyFeedbackTimer) clearTimeout(this.copyFeedbackTimer);
+		this.copyFeedbackTimer = setTimeout(() => {
+			this.copyFeedback = null;
+			this.requestRender();
+		}, 2500);
+		this.requestRender();
+	}
+
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		// 点击方框外部 → 关闭窗体
+		if (event.type === "click") {
+			const inside =
+				event.y >= this.boxTop &&
+				event.y < this.boxTop + this.boxHeight &&
+				event.x >= this.boxLeft &&
+				event.x < this.boxLeft + this.boxWidth;
+			if (!inside) {
+				this.onClose();
+				return { handled: true };
+			}
+		}
+
+		if (event.type === "wheel") {
+			const delta = event.wheelDelta ?? 0;
+			// 判断鼠标位于左栏还是右栏（内容区从边框内开始，x 偏移 1）
+			const inner = Math.max(20, this.boxWidth - 4);
+			const listWidth = Math.max(20, Math.floor(inner * 0.45));
+			const inList = event.x <= this.boxLeft + listWidth + 3;
+
+			if (inList) {
+				const loadedItems = this.loadedItems;
+				const maxScroll = Math.max(0, loadedItems.length - this.listViewportHeight);
+				const next = this.listScrollTop + delta;
+				if (next < 0) {
+					// 上滑到顶：先尝试加载更多
+					if (this.loadMore()) {
+						this.listScrollTop = 0;
+						this.requestRender();
+						return { handled: true };
+					}
+					this.listScrollTop = 0;
+				} else {
+					this.listScrollTop = Math.min(maxScroll, next);
+				}
+			} else {
+				const maxScroll = Math.max(0, this.detailLineCount - this.detailViewportHeight);
+				this.detailScrollTop = Math.max(0, Math.min(maxScroll, this.detailScrollTop + delta));
+			}
+			this.requestRender();
+			return { handled: true };
+		}
+
+		if (event.type === "click") {
+			// 列表行命中：选中并复制该行详情
+			const hit = this.listRowMap.find((m) => m.row === event.y - this.boxTop);
+			if (hit) {
+				this.selectedIndex = hit.index;
+				this.detailScrollTop = 0;
+				// 点击了最后一条则恢复跟随，否则停止跟随
+				this.followTail = hit.index === this.allItems.length - 1;
+				const item = this.allItems[hit.index];
+				if (item) this.copyItemDetail(item);
+				this.requestRender();
 				return { handled: true };
 			}
 		}
@@ -856,10 +1584,16 @@ function ensureGlobalPrototypeHooksInstalled(): void {
 }
 
 export default function rollingTools(pi: ExtensionAPI): void {
-	let currentConfig: RollingToolsConfig = loadConfig(process.cwd());
+	let initialLoad = loadConfig(process.cwd());
+	let currentConfig: RollingToolsConfig = initialLoad.config;
 	let totalToolCount = 0;
 	let statusTimer: any = null;
 	let lastCtx: any = null;
+	/** 待展示的旧配置迁移提示（仅提示一次） */
+	let pendingLegacyNotice: string | undefined;
+	if (initialLoad.legacyDetected) {
+		pendingLegacyNotice = buildLegacyNotice(initialLoad.legacyPath);
+	}
 
 	const state: WidgetState = {
 		headerStatus: { type: "idle" },
@@ -870,6 +1604,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		completedMessage: null,
 		solPiSavings: null,
 	};
+
+	/** 当前打开的历史大窗体（用于实时刷新与去重） */
+	let activeOverlay: ToolHistoryOverlayComponent | null = null;
 
 	// 1. 安装底层全局原型钩子骨架（单例）
 	ensureGlobalPrototypeHooksInstalled();
@@ -967,15 +1704,42 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		}, 100);
 	}
 
+	/**
+	 * 从当前 session 的 entries 中恢复最近一次滚动历史快照。
+	 */
+	function restoreHistoryFromSession(ctx: any): { items: ToolItem[]; total: number } | null {
+		try {
+			const entries = ctx?.sessionManager?.getEntries?.();
+			if (!Array.isArray(entries)) return null;
+			for (let i = entries.length - 1; i >= 0; i--) {
+				const entry = entries[i];
+				if (entry?.type === "custom" && entry?.customType === HISTORY_ENTRY_TYPE) {
+					return deserializeHistory(entry.data);
+				}
+			}
+		} catch (e) {
+			console.error("[rolling-tools] Failed to restore history:", e);
+		}
+		return null;
+	}
+
+	/**
+	 * 将当前滚动历史快照写入 session（不参与 LLM 上下文）。
+	 */
+	function persistHistory(): void {
+		if (!currentConfig.persistAcrossSessions) return;
+		try {
+			pi.appendEntry(HISTORY_ENTRY_TYPE, serializeHistory(state.recentTools, totalToolCount));
+		} catch (e) {
+			console.error("[rolling-tools] Failed to persist history:", e);
+		}
+	}
+
 	function syncWidget(ctx: any): void {
 		if (!ctx?.hasUI) return;
 
-		const hasContent =
-			currentConfig.enabled &&
-			(state.headerStatus.type !== "idle" ||
-				state.recentTools.length > 0 ||
-				state.activeError !== null ||
-				state.completedMessage !== null);
+		// 状态行为常驻行，因此只要功能开启就始终显示 widget
+		const hasContent = currentConfig.enabled;
 
 		if (!hasContent) {
 			ctx.ui.setWidget("rolling-tools", undefined);
@@ -984,9 +1748,85 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 		ctx.ui.setWidget(
 			"rolling-tools",
-			(tui: any, theme: any) => new RollingToolsWidgetComponent(tui, theme, state),
+			(tui: any, theme: any) =>
+				new RollingToolsWidgetComponent(
+					tui,
+					theme,
+					state,
+					(item?: ToolItem) => {
+						openHistoryOverlay(ctx, item);
+					},
+					currentConfig.maxRecentTools,
+				),
 			{ placement: "aboveEditor" },
 		);
+
+		// 若大窗体已打开，同步刷新它，使运行中的工具状态实时更新
+		activeOverlay?.refresh();
+	}
+
+	/**
+	 * 打开工具历史大窗体（overlay dialog）。
+	 * 支持鼠标滚轮滚动，以及“上滑到顶再加载 step 条”的懒加载。
+	 */
+	function openHistoryOverlay(ctx: any, initialItem?: ToolItem): void {
+		if (!ctx?.hasUI || !ctx.ui?.custom) {
+			ctx?.ui?.notify?.("rolling-tools: 当前环境不支持大窗体", "warning");
+			return;
+		}
+		if (activeOverlay) {
+			// 已打开：仅切换选中项，不重复弹窗
+			if (initialItem) {
+				const idx = state.recentTools.findIndex((t) => t.id === initialItem.id);
+				if (idx >= 0) activeOverlay.selectIndex(idx);
+			}
+			return;
+		}
+		if (state.recentTools.length === 0) {
+			ctx.ui.notify("rolling-tools: 暂无工具历史", "info");
+			return;
+		}
+		const step = currentConfig.lazyLoadStep && currentConfig.lazyLoadStep > 0 ? currentConfig.lazyLoadStep : 10;
+		// 传入实时数组引用（而非快照），使 agent 运行中新增的工具能实时反映到大窗体
+		const liveItems = state.recentTools;
+
+		void ctx.ui
+			.custom(
+				(tui: any, theme: any, _keybindings: any, done: (result: unknown) => void) => {
+					const component = new ToolHistoryOverlayComponent(
+						tui,
+						theme,
+						liveItems,
+						step,
+						() => {
+							activeOverlay = null;
+							done(undefined);
+						},
+						() => tui?.requestRender?.(),
+					);
+					activeOverlay = component;
+					// 若指定了初始条目，直接选中它
+					if (initialItem) {
+						const idx = liveItems.findIndex((t) => t.id === initialItem.id);
+						if (idx >= 0) component.selectIndex(idx);
+					}
+					return component;
+				},
+				{
+					overlay: true,
+					overlayOptions: {
+						// 全屏 overlay：方框在组件内部居中绘制，从而能接收框外点击以关闭
+						width: "100%",
+						maxHeight: "100%",
+						anchor: "top-left",
+						margin: 0,
+					},
+				},
+			)
+			.catch((err: unknown) => {
+				activeOverlay = null;
+				console.error("[rolling-tools] overlay error:", err);
+			});
 	}
 
 	/**
@@ -1030,22 +1870,51 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	}
 
 	// 2. 会话启动
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		lastCtx = ctx;
-		currentConfig = loadConfig(ctx?.cwd || process.cwd());
+		const loaded = loadConfig(ctx?.cwd || process.cwd());
+		currentConfig = loaded.config;
+		if (loaded.legacyDetected) {
+			pendingLegacyNotice = buildLegacyNotice(loaded.legacyPath);
+		}
 		installUiHooks(ctx);
+
+		// 恢复历史：
+		// - reload/new/resume/fork：都尝试从当前 session 的 entries 中恢复。
+		//   注意：/reload 会重新加载扩展模块，内存中的 state 是全新的，必须从 session 恢复。
+		// - startup：全新进程，session 通常为空，恢复失败也不影响。
+		if (currentConfig.persistAcrossSessions) {
+			const restored = restoreHistoryFromSession(ctx);
+			if (restored && restored.items.length > 0) {
+				state.recentTools = restored.items;
+				totalToolCount = restored.total;
+			}
+		}
+
 		syncWidget(ctx);
+
+		// 旧配置迁移提示（一次性，延后到 UI 就绪后展示）
+		if (pendingLegacyNotice) {
+			const notice = pendingLegacyNotice;
+			pendingLegacyNotice = undefined;
+			setTimeout(() => {
+				try {
+					ctx.ui?.notify?.(notice, "warning");
+				} catch {
+					/* ignore */
+				}
+			}, 800);
+		}
 	});
 
-	// 3. 用户提问开始（新一轮 Agent 运行）时重置
+	// 3. 用户提问开始（新一轮 Agent 运行）：保留已有滚动历史，仅重置瞬时状态
 	pi.on("agent_start", async (_event, ctx) => {
 		lastCtx = ctx;
 		installUiHooks(ctx);
 		(ctx.ui as any)?.setToolsExpanded?.(false);
 
 		stopStatusTimer();
-		state.recentTools = [];
-		totalToolCount = 0;
+		// 注意：不再清空 state.recentTools / totalToolCount，使滚动块跨轮次持续存在
 		state.headerStatus = { type: "idle" };
 		state.activeError = null;
 		state.expandedItemId = null;
@@ -1086,14 +1955,17 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			syncWidget(ctx);
 		}
 
-		// 正文流式输出时：顶层状态行正式退场让位给正文
+		// 正文流式输出时：保留“思考完成”状态作为常驻头部；仅清理临时错误
 		const isTextStreaming =
 			ev.type === "text_start" ||
 			(ev.type === "text_delta" && typeof ev.delta === "string" && ev.delta.trim().length > 0);
 
 		if (isTextStreaming) {
-			state.headerStatus = { type: "idle" };
 			stopStatusTimer();
+			// 若仍处于等待/思考中，退回到已完成/就绪（不再保留计时器）
+			if (state.headerStatus.type === "waiting_server" || state.headerStatus.type === "thinking") {
+				state.headerStatus = { type: "idle" };
+			}
 			state.activeError = null;
 			syncWidget(ctx);
 		}
@@ -1113,13 +1985,20 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	// 6. 任务结束处理与 settled 最终状态标记
 	pi.on("agent_end", async (_event, ctx) => {
 		stopStatusTimer();
-		state.headerStatus = { type: "idle" };
+		// 保留“思考完成”状态；仅将等待/思考中收敛为就绪
+		if (state.headerStatus.type === "waiting_server" || state.headerStatus.type === "thinking") {
+			state.headerStatus = { type: "idle" };
+		}
+		// 持久化一次即可：每次工具都写会在 session 中产生 O(N²) 体积的快照
+		persistHistory();
 		syncWidget(ctx);
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
 		stopStatusTimer();
-		state.headerStatus = { type: "idle" };
+		if (state.headerStatus.type === "waiting_server" || state.headerStatus.type === "thinking") {
+			state.headerStatus = { type: "idle" };
+		}
 		state.completedMessage = "Completed";
 		syncWidget(ctx);
 	});
@@ -1137,12 +2016,8 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 		totalToolCount++;
 		const cwd = ctx?.cwd || process.cwd();
-		const { summaryDisplay, fullPath, fullCommand, displayName } = extractSummaryAndMetadata(
-			event.toolName,
-			event.input,
-			cwd,
-			currentConfig,
-		);
+		const { summaryDisplay, fullPath, fullCommand, displayName, detailContent, detailKind } =
+			extractSummaryAndMetadata(event.toolName, event.input, cwd, currentConfig);
 
 		state.recentTools.push({
 			id: event.toolCallId,
@@ -1152,12 +2027,15 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			summaryDisplay,
 			fullPath,
 			fullCommand,
+			detailContent,
+			detailKind,
 			status: "running",
 			startTime: Date.now(),
 		});
 
-		if (state.recentTools.length > currentConfig.maxRecentTools) {
-			state.recentTools.shift();
+		// 内存中的完整历史保留一个上限，避免无限增长；widget 只展示最近 maxRecentTools 条
+		if (state.recentTools.length > HISTORY_MEMORY_LIMIT) {
+			state.recentTools.splice(0, state.recentTools.length - HISTORY_MEMORY_LIMIT);
 		}
 
 		if (state.expandedItemId && !state.recentTools.some((t) => t.id === state.expandedItemId)) {
@@ -1178,6 +2056,13 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			if (textContent && typeof textContent.text === "string") {
 				item.output = textContent.text;
 			}
+
+			// edit：从 details.diff 回填完整 diff，供 overlay 大窗体展示
+			const details = (event as any).details;
+			if (!item.detailContent && details && typeof details.diff === "string" && details.diff.length > 0) {
+				item.detailContent = details.diff;
+				item.detailKind = "diff";
+			}
 		}
 
 		if (event.isError) {
@@ -1193,11 +2078,14 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			state.activeError = null;
 		}
 
+		// 不在此处持久化：逐个工具写快照会使 session 体积呈 O(N²) 增长，
+		// 改由 agent_end / session_shutdown 在轮次边界统一写入。
 		syncWidget(ctx);
 	});
 
 	// 9. 会话终止清理资源
 	pi.on("session_shutdown", async () => {
+		persistHistory();
 		stopStatusTimer();
 		if (activeStatusInterval) {
 			clearInterval(activeStatusInterval);
@@ -1211,9 +2099,26 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			const action = (args || "").trim();
 			if (action === "reload") {
-				currentConfig = loadConfig(ctx?.cwd || process.cwd());
+				const loaded = loadConfig(ctx?.cwd || process.cwd());
+				currentConfig = loaded.config;
 				syncWidget(ctx);
-				ctx.ui?.notify?.("✓ rolling-tools: 配置已重载", "info");
+				if (loaded.legacyDetected) {
+					ctx.ui?.notify?.(buildLegacyNotice(loaded.legacyPath), "warning");
+				} else {
+					ctx.ui?.notify?.("✓ rolling-tools: 配置已重载", "info");
+				}
+			} else if (action === "migrate") {
+				const result = migrateConfigToLatest(ctx?.cwd || process.cwd());
+				if (result.ok) {
+					currentConfig = result.config!;
+					syncWidget(ctx);
+					ctx.ui?.notify?.(
+						`✓ rolling-tools: 已升级到全工具语义（v${CONFIG_VERSION}）\n• 静音/收录规则已设为 ["*"]\n• 已写入: ${result.path}`,
+						"info",
+					);
+				} else {
+					ctx.ui?.notify?.(`rolling-tools: 升级失败 - ${result.error}`, "error");
+				}
 			} else if (action === "off") {
 				currentConfig.enabled = false;
 				syncWidget(ctx);
@@ -1226,11 +2131,17 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				const info = [
 					`rolling-tools 状态:`,
 					`• 运行状态: ${currentConfig.enabled ? "已开启" : "已关闭"}`,
-					`• 最大滚动数: ${currentConfig.maxRecentTools}`,
-					`• 静音工具规则: ${currentConfig.managedTools.join(", ")}`,
+					`• widget 展示条数: ${currentConfig.maxRecentTools}（历史共 ${state.recentTools.length} 条）`,
+					`• 静音工具规则: ${(currentConfig.silencedTools ?? currentConfig.managedTools).join(", ")}`,
+					`• 收录工具规则: ${(currentConfig.widgetTools ?? currentConfig.managedTools).join(", ")}`,
+					`• 懒加载步长: ${currentConfig.lazyLoadStep ?? 10} 条/次`,
+					`• 跨会话持久化: ${currentConfig.persistAcrossSessions ? "已开启" : "已关闭"}`,
+					`• 配置版本: v${currentConfig.configVersion ?? 1}${(currentConfig.configVersion ?? 1) < CONFIG_VERSION ? "（旧版，可执行 /rolling-tools migrate 升级）" : ""}`,
 					`• 通知拦截规则: ${currentConfig.interceptNotifications.length} 条`,
 				].join("\n");
 				ctx.ui?.notify?.(info, "info");
+			} else if (action === "history" || action === "open") {
+				openHistoryOverlay(ctx);
 			} else {
 				currentConfig.enabled = !currentConfig.enabled;
 				syncWidget(ctx);
