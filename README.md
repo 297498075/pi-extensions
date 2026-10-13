@@ -48,7 +48,9 @@ pi --extension ./extensions/example.ts
 
 ## Stream Read Retry
 
-`extensions/stream-read-retry.ts` fixes a gap in Pi's built-in retry classification. Pi already has agent-level retry with exponential backoff, but `stream_read_error` is not included in the transient-error matcher, so the run ends immediately. This extension rewrites only that assistant error to include `Network error`, which lets Pi's existing retry flow handle it while preserving the original text.
+`extensions/stream-read-retry.ts` fixes a gap in Pi's built-in retry classification. Pi already has agent-level retry with exponential backoff, but its transient-error matcher (`isRetryableAssistantError` in `pi-ai/dist/utils/retry.js`) does not cover every premature stream ending. In particular, a stream that closes before its terminal completion event — for example `stream error: stream disconnected before completion: stream closed before response.completed` — is not recognized, so the run ends immediately instead of retrying.
+
+This extension matches a set of transport-level premature-stream-end signatures (stream/connection resets, unexpected end of stream, `closed before response.completed`, ...) and rewrites only those assistant errors to include `Network error`, which lets Pi's existing retry flow handle them. Messages that Pi already classifies as retryable, and deterministic errors such as quota/billing or invalid-request failures, are left untouched. The original error text is preserved after the prefix.
 
 Load the package or the extension directly:
 
