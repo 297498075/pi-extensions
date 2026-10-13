@@ -99,7 +99,7 @@ The extension has no network, file, command, or external state side effects. The
 - **Lazy loading with wheel scroll**: The overlay supports native mouse-wheel scrolling. Scrolling up past the top of the list lazily loads the next `lazyLoadStep` (default 10) older entries, so long histories stay responsive without loading everything at once.
 - **Persistent across turns and sessions**: The rolling block no longer resets on each new task. History is kept in memory across turns and persisted to the session via `pi.appendEntry()` (custom type `rolling-tools-history`), so it is restored on `reload`, `resume`, and `fork` when `persistAcrossSessions` is enabled.
 - **Universal tool & MCP support**: Uses dynamic in-place decoration on `ToolExecutionComponent`, supporting built-ins, MCP proxies (`mcp`, `mcp__*`), Rider MCP tools (`rider_execute_tool`), SoL-Pi tools, and arbitrary third-party tools with generic parameter heuristics.
-- **SoL-Pi savings interception**: Intercepts and suppresses intrusive SoL-Pi popup toast notifications, rolling token savings info cleanly into the widget status line with one-click clipboard copying.
+- **Unified tips handling**: Plugin tips (`ui.notify`) are suppressed from the transcript, while `ui.setStatus` tips show only in the footer status line and auto-clear after `durationMs` (default 8s) or are replaced by the next tip. `error` / `warning` messages and any message containing a `notificationKeywords` word always pass through. Plugin headers such as SoL-Pi's `⚡ SoL-Pi · …` / `Money saved · …` are stripped from tool rows.
 - **Configuration file support**: Supports global configuration (`~/.pi/agent/extensions/rolling-tools/config.json`) and local project overrides (`./.pi/rolling-tools.json`).
 - **Fixed-dock rolling widget**: Shows the latest running/completed tools in a fixed dock above the editor with status (`⏳`/`✓`/`✗`), duration, and arguments summary.
 - **Click-to-expand details**: Click any tool item to toggle details (`▸` / `▾`) such as full paths, multiline commands, and execution outputs without mouse hover flickering. Click details to copy to clipboard, or `Ctrl+Click` on paths to open files directly.
@@ -126,13 +126,15 @@ which rewrites the config (`configVersion: 2`) while preserving your other setti
 
 Example configuration (`~/.pi/agent/extensions/rolling-tools/config.json`):
 
+> Every field is optional. Omit the file entirely to use the defaults below.
+
 ```json
 {
   "enabled": true,
   "maxRecentTools": 3,
   "lazyLoadStep": 10,
   "persistAcrossSessions": true,
-  "configVersion": 2,
+  "configVersion": 3,
   "managedTools": ["*"],
   "silencedTools": ["*"],
   "widgetTools": ["*"],
@@ -145,23 +147,46 @@ Example configuration (`~/.pi/agent/extensions/rolling-tools/config.json`):
     "tool",
     "prompt"
   ],
-  "interceptNotifications": [
-    {
-      "match": "SoL-Pi",
-      "suppressToast": true,
-      "rollIntoWidget": true
-    }
-  ],
+  "interceptNotifications": [{ "match": "*", "suppressToast": true }],
   "statusEnhancements": [
     {
-      "keyPattern": "sol-pi*",
-      "durationMs": 30000,
-      "showRelativeTime": true,
+      "keyPattern": "*",
+      "durationMs": 8000,
+      "showRelativeTime": false,
       "colorize": true
     }
-  ]
+  ],
+  "notificationKeywords": [
+    "error",
+    "failed",
+    "failure",
+    "warning",
+    "错误",
+    "失败",
+    "警告",
+    "⚠",
+    "❌",
+    "🔴"
+  ],
+  "stripToolNotificationHeaders": true
 }
 ```
+
+### Notification and tips handling
+
+Plugins commonly emit tips through two channels. Rolling Tools unifies both so they no longer clutter the transcript:
+
+| Channel | Behavior |
+| --- | --- |
+| `ui.notify(message, "info")` | Suppressed by default (`interceptNotifications: [{ "match": "*" }]`). It never reaches the transcript. |
+| `ui.setStatus(key, text)` | Kept, but shown only in the footer status line and cleared after `durationMs` (default 8s), or replaced by the next tip. |
+
+Two escape hatches keep important messages visible:
+
+1. **Type-based** — `error` and `warning` notifications always pass through (Pi routes them to `showError` / `showWarning`).
+2. **Keyword-based** — any `info` message containing a word from `notificationKeywords` (default: `error`, `failed`, `failure`, `warning`, `错误`, `失败`, `警告`, `⚠`, `❌`, `🔴`) also passes through.
+
+Additionally, `stripToolNotificationHeaders` (default `true`) removes plugin-inserted headers such as SoL-Pi's `⚡ SoL-Pi · Action Fusion` / `Money saved · …` lines from tool rows, so the same information is not repeated next to the tool. This uses `pi.registerToolRenderer` and degrades silently on Pi versions that lack it.
 
 > **Note on widget vs. overlay scrolling**: Pi's dock does not forward mouse-wheel events to widgets, so the small rolling widget itself is not scrollable. Mouse-wheel scrolling and top-edge lazy loading are provided inside the `[⤢]` overlay dialog, where the TUI dispatches wheel events directly to the overlay component.
 

@@ -4,6 +4,13 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- feat(rolling-tools): unify plugin tips into the footer status line (config schema v3).
+  - `interceptNotifications` now defaults to `[{ "match": "*", "suppressToast": true }]`, so every plugin's `notify(..., "info")` tip is suppressed from the transcript instead of only SoL-Pi's.
+  - `error` / `warning` notifications, and any `info` message containing a `notificationKeywords` word (default: `error`, `failed`, `failure`, `warning`, `错误`, `失败`, `警告`, `⚠`, `❌`, `🔴`), always pass through.
+  - `statusEnhancements` now defaults to `keyPattern: "*"` with `durationMs: 8000` and `showRelativeTime: false`, so any plugin's `setStatus` tip shows only in the footer and auto-clears (or is replaced by the next tip).
+  - Add `stripToolNotificationHeaders` (default `true`): strip plugin-inserted headers such as SoL-Pi's `⚡ SoL-Pi · Action Fusion` / `Money saved · …` from tool rows via `pi.registerToolRenderer` (silently degrades on Pi versions without it).
+  - Remove the now-unused `rollIntoWidget` notification rule field and the `solPiSavings` widget state.
+  - Every new field has a default, so the config file is entirely optional; a one-time v2→v3 notice documents the new defaults and `/rolling-tools migrate` writes them out.
 - feat(rolling-tools): click a left-list row in the history dialog to copy that tool's detail (diff / script / command / path / output) to the clipboard, with in-dialog feedback.
 - feat(rolling-tools): render the history dialog as a centered box on a full-screen canvas so clicking outside the box closes it.
 - feat(rolling-tools): add dedicated `codemode` formatting (script preview + line count, full script body available in the overlay dialog).

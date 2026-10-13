@@ -129,6 +129,29 @@ fakeUi.notify(solPiMsg, "info");
 assert.equal(notifiedMessage, null, "SoL-Pi toast notification must be suppressed!");
 console.log("  ✓ SoL-Pi toast notification suppressed successfully.");
 
+// 通配拦截：任意插件的普通 info tips 都应被吞
+notifiedMessage = null;
+fakeUi.notify("some other plugin tip", "info");
+assert.equal(notifiedMessage, null, "any plugin info tip must be suppressed by the '*' rule");
+console.log("  ✓ any plugin info tip suppressed (wildcard match).");
+
+// 例外 1：error / warning 类型必须放行
+notifiedMessage = null;
+fakeUi.notify("something broke", "error");
+assert.ok(notifiedMessage, "error notifications must NOT be suppressed");
+notifiedMessage = null;
+fakeUi.notify("be careful", "warning");
+assert.ok(notifiedMessage, "warning notifications must NOT be suppressed");
+console.log("  ✓ error / warning notifications pass through.");
+
+// 例外 2：info 类型但命中关键词也必须放行
+for (const kw of ["error", "failed", "failure", "warning", "错误", "失败", "警告", "⚠", "❌", "🔴"]) {
+	notifiedMessage = null;
+	fakeUi.notify(`plugin says: ${kw} happened`, "info");
+	assert.ok(notifiedMessage, `info notification containing "${kw}" must NOT be suppressed`);
+}
+console.log("  ✓ info notifications with error/failed/warning keywords pass through.");
+
 // Test setStatus with key "sol-pi-savings"
 let updatedStatusKey = null;
 let updatedStatusText = null;
@@ -144,9 +167,18 @@ im.ui = { requestRender() {} };
 im.setExtensionStatus("sol-pi-savings", "⚡ Observation Pack · 4,756 context tokens avoided");
 assert.equal(updatedStatusKey, "sol-pi-savings", "Must handle sol-pi-savings status key");
 assert.ok(updatedStatusText.includes("\x1b[33m⚡"), "Must format with ANSI warning yellow");
-assert.ok(updatedStatusText.includes("(0s ago)"), "Must include relative time ticker (0s ago)");
-console.log("  ✓ SoL-Pi 'sol-pi-savings' status key intercepted, colorized with ANSI and (0s ago):");
+assert.ok(
+	!updatedStatusText.includes("ago)"),
+	"relative-time ticker must be off by default (showRelativeTime: false)",
+);
+console.log("  ✓ status key intercepted and colorized (no relative-time ticker):");
 console.log("    " + updatedStatusText);
+
+// 任意插件的 status key 都应被统一处理（keyPattern: "*"）
+im.setExtensionStatus("some-plugin", "Plugin X · 123 things done");
+assert.equal(updatedStatusKey, "some-plugin", "any plugin status key must be handled");
+assert.ok(updatedStatusText.includes("\x1b[32m"), "must apply adaptive colorization");
+console.log("  ✓ any plugin status key handled uniformly.");
 
 console.log("\n=== Test 4: Tool Call & Result Tracking ===");
 const toolCallHandlers = handlers.get("tool_call") || [];
@@ -636,14 +668,21 @@ const editComp = new ToolExecutionComponent(
 assert.ok(editComp.render(80).length > 0, "legacy config must NOT silence edit (preserve old behavior)");
 console.log("  ✓ legacy config preserves old behavior (edit not silenced).");
 
-// 执行 /rolling-tools migrate，应升级为全工具语义
+// 执行 /rolling-tools migrate，应升级为全工具语义 + v3 通知默认值
 await registeredCommand2.handler("migrate", ctx2);
 const migrated = JSON.parse(readFileSync(globalCfgPath, "utf-8"));
 assert.deepEqual(migrated.managedTools, ["*"], "migrate must set managedTools to ['*']");
 assert.deepEqual(migrated.silencedTools, ["*"], "migrate must set silencedTools to ['*']");
 assert.deepEqual(migrated.widgetTools, ["*"], "migrate must set widgetTools to ['*']");
-assert.equal(migrated.configVersion, 2, "migrate must write configVersion 2");
-console.log("  ✓ /rolling-tools migrate upgrades config to v2 (all-tools semantics).");
+assert.equal(migrated.configVersion, 3, "migrate must write configVersion 3");
+// v3 通知默认值
+assert.deepEqual(migrated.interceptNotifications, [{ match: "*", suppressToast: true }], "migrate must write wildcard notify rule");
+assert.equal(migrated.statusEnhancements[0].keyPattern, "*", "migrate must write wildcard status rule");
+assert.equal(migrated.statusEnhancements[0].durationMs, 8000, "migrate must write 8s status duration");
+assert.equal(migrated.statusEnhancements[0].showRelativeTime, false, "migrate must disable relative-time ticker");
+assert.equal(migrated.stripToolNotificationHeaders, true, "migrate must enable header stripping");
+assert.ok(Array.isArray(migrated.notificationKeywords), "migrate must write notificationKeywords");
+console.log("  ✓ /rolling-tools migrate upgrades config to v3 (all-tools + unified notifications).");
 
 // 升级后 edit 应被静音
 const editComp2 = new ToolExecutionComponent(
@@ -749,6 +788,109 @@ restoredWidget.handleMouse({
 });
 assert.ok(reloadOverlayFactory, "[⤢] must open the overlay after /reload restore");
 console.log("  ✓ [⤢] works after /reload restore.");
+
+console.log("\n=== Test 10: Tool-Header Stripping (channel C) & v2→v3 Notice ===");
+// (a) NotificationHeaderStripper: 通过 registerToolRenderer 注册的 resolver 应能剥掉提示头
+let registeredRendererResolver = null;
+const fakePi3 = {
+	on() {},
+	registerCommand() {},
+	appendEntry() {},
+	registerToolRenderer(resolver) {
+		registeredRendererResolver = resolver;
+	},
+};
+rollingTools(fakePi3);
+assert.ok(registeredRendererResolver, "extension must register a tool renderer resolver");
+
+// 模拟 SoL-Pi 的 renderCall：返回一个含 ⚡/Money saved 两行的 Container
+const solPiLikeRenderer = {
+	renderCall: () => ({
+		render: () => ["⚡ SoL-Pi · Action Fusion", "Money saved · 1 model round-trip avoided", "edit src/a.ts"],
+		handleMouse: () => undefined,
+		invalidate: () => {},
+	}),
+};
+const resolved = registeredRendererResolver("edit", () => solPiLikeRenderer);
+const stripped = resolved.renderCall();
+const strippedLines = stripped.render(80);
+assert.ok(
+	!strippedLines.some((l) => /SoL-Pi ·|Money saved ·/.test(l)),
+	"SoL-Pi header lines must be stripped from the tool renderer output",
+);
+assert.ok(
+	strippedLines.some((l) => l.includes("edit src/a.ts")),
+	"the real tool content must be preserved after stripping",
+);
+console.log("  ✓ plugin notification headers stripped from tool rows, content preserved.");
+
+// 非 SoL-Pi 的普通渲染器应原样通过（不误伤）
+const plainRenderer = { renderCall: () => ({ render: () => ["plain output line"], invalidate: () => {} }) };
+const resolvedPlain = registeredRendererResolver("bash", () => plainRenderer);
+assert.deepEqual(resolvedPlain.renderCall().render(80), ["plain output line"], "plain renderers must pass through unchanged");
+console.log("  ✓ plain (non-plugin) tool renderers are untouched.");
+
+// (b) v2 配置应触发 v2→v3 升级提醒（提示新字段与默认值）
+const cfgDir2 = join(TEST_AGENT_DIR, "extensions", "rolling-tools");
+mkdirSync(cfgDir2, { recursive: true });
+const cfgPath2 = join(cfgDir2, "config.json");
+writeFileSync(
+	cfgPath2,
+	JSON.stringify(
+		{
+			enabled: true,
+			maxRecentTools: 3,
+			managedTools: ["*"],
+			silencedTools: ["*"],
+			widgetTools: ["*"],
+			configVersion: 2,
+		},
+		null,
+		2,
+	),
+	"utf-8",
+);
+
+const notices3 = [];
+const handlers3 = new Map();
+const fakeUi3 = {
+	setWidget() {},
+	notify(msg, type) {
+		notices3.push({ msg, type });
+	},
+	setStatus() {},
+	setToolsExpanded() {},
+	requestRender() {},
+	custom() {
+		return Promise.resolve();
+	},
+};
+const fakePi4 = {
+	on(e, h) {
+		const l = handlers3.get(e) || [];
+		l.push(h);
+		handlers3.set(e, l);
+	},
+	registerCommand() {},
+	appendEntry() {},
+	registerToolRenderer() {},
+};
+const ctx3 = {
+	hasUI: true,
+	ui: fakeUi3,
+	cwd: process.cwd(),
+	sessionManager: { getEntries: () => [] },
+};
+rollingTools(fakePi4);
+for (const h of handlers3.get("session_start") || []) await h({ reason: "startup" }, ctx3);
+await new Promise((r) => setTimeout(r, 1000));
+
+const v2Notice = notices3.find((n) => n.type === "warning" && n.msg.includes("v2"));
+assert.ok(v2Notice, "a v2 config must trigger a v2→v3 upgrade notice");
+assert.ok(v2Notice.msg.includes("durationMs"), "the notice must document the new statusEnhancements default");
+assert.ok(v2Notice.msg.includes("stripToolNotificationHeaders"), "the notice must document stripToolNotificationHeaders");
+assert.ok(v2Notice.msg.includes("notificationKeywords"), "the notice must document notificationKeywords");
+console.log("  ✓ v2 config triggers a v2→v3 notice documenting new defaults.");
 
 // 清理临时目录
 rmSync(TEST_AGENT_DIR, { recursive: true, force: true });

@@ -9,11 +9,13 @@ import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
 
 /**
  * 通知拦截规则
+ *
+ * match 支持：精确子串、`*`（匹配全部）或 `regex:<pattern>`。
+ * 被拦截的通知仅在界面最下方的 footer 状态行显示，不再写入正文。
  */
 interface InterceptNotificationRule {
 	match: string;
 	suppressToast?: boolean;
-	rollIntoWidget?: boolean;
 }
 
 /**
@@ -42,12 +44,33 @@ interface RollingToolsConfig {
 	lazyLoadStep?: number;
 	/** 是否在会话间持久化工具滚动历史 */
 	persistAcrossSessions?: boolean;
+	/**
+	 * 不被拦截的通知关键词（例外白名单）。
+	 * 含任一关键词的 info 通知仍会进入正文；error / warning 类型始终放行。
+	 */
+	notificationKeywords?: string[];
+	/** 是否剥掉插件在工具行里重复插入的提示头（如 SoL-Pi 的 “Money saved” 行） */
+	stripToolNotificationHeaders?: boolean;
 	/** 配置结构版本，用于旧版本自动迁移与提示 */
 	configVersion?: number;
 }
 
-/** 当前配置结构版本。1 = 旧白名单语义；2 = 通配符全工具语义。 */
-const CONFIG_VERSION = 2;
+/** 当前配置结构版本。1 = 旧白名单；2 = 通配符全工具；3 = 通知统一收敛到 footer。 */
+const CONFIG_VERSION = 3;
+
+/** 通知例外关键词默认值：命中则不拦截（error / warning 类型另行始终放行）。 */
+const DEFAULT_NOTIFICATION_KEYWORDS = [
+	"error",
+	"failed",
+	"failure",
+	"warning",
+	"错误",
+	"失败",
+	"警告",
+	"⚠",
+	"❌",
+	"🔴",
+];
 
 const DEFAULT_CONFIG: RollingToolsConfig = {
 	enabled: true,
@@ -75,24 +98,23 @@ const DEFAULT_CONFIG: RollingToolsConfig = {
 	],
 	interceptNotifications: [
 		{
-			match: "SoL-Pi",
+			// 默认拦截所有插件的 info 提示：只在界面最下方显示，不再写入正文。
+			// error / warning 类型与命中 notificationKeywords 的通知仍会显示。
+			match: "*",
 			suppressToast: true,
-			rollIntoWidget: true,
-		},
-		{
-			match: "Money saved",
-			suppressToast: true,
-			rollIntoWidget: true,
 		},
 	],
 	statusEnhancements: [
 		{
-			keyPattern: "sol-pi*",
-			durationMs: 30000,
-			showRelativeTime: true,
+			// 默认统一所有插件的 footer 状态行：8 秒后自动消失（可被下一个 tips 替换）。
+			keyPattern: "*",
+			durationMs: 8000,
+			showRelativeTime: false,
 			colorize: true,
 		},
 	],
+	notificationKeywords: [...DEFAULT_NOTIFICATION_KEYWORDS],
+	stripToolNotificationHeaders: true,
 };
 
 interface ToolItem {
@@ -120,12 +142,6 @@ interface ActiveError {
 	message: string;
 }
 
-interface SolPiSavingsState {
-	summary: string;
-	fullMessage: string;
-	timestamp: number;
-}
-
 type HeaderStatus =
 	| { type: "idle" }
 	| { type: "waiting_server"; startTime: number }
@@ -139,7 +155,6 @@ interface WidgetState {
 	expandedItemId: string | null;
 	copyFeedbackMessage: string | null;
 	completedMessage: string | null;
-	solPiSavings: SolPiSavingsState | null;
 }
 
 type LineKind = "header" | "detail_copyable" | "detail_info" | "other";
@@ -290,6 +305,13 @@ function mergeConfig(base: RollingToolsConfig, override: Partial<RollingToolsCon
 			typeof override.persistAcrossSessions === "boolean"
 				? override.persistAcrossSessions
 				: base.persistAcrossSessions,
+		notificationKeywords: Array.isArray(override.notificationKeywords)
+			? [...override.notificationKeywords]
+			: base.notificationKeywords,
+		stripToolNotificationHeaders:
+			typeof override.stripToolNotificationHeaders === "boolean"
+				? override.stripToolNotificationHeaders
+				: base.stripToolNotificationHeaders,
 		configVersion: CONFIG_VERSION,
 	};
 }
@@ -303,21 +325,26 @@ interface LoadConfigResult {
 	legacyDetected: boolean;
 	/** 检测到旧配置的文件路径（便于提示用户去修改） */
 	legacyPath?: string;
+	/** 检测到的旧配置版本（用于生成对应版本的升级提示） */
+	legacyVersion?: number;
 }
 
 function loadConfig(cwd: string): LoadConfigResult {
 	let config: RollingToolsConfig = { ...DEFAULT_CONFIG };
 	let legacyDetected = false;
 	let legacyPath: string | undefined;
+	let legacyVersion: number | undefined;
 
 	const globalPath = getGlobalConfigPath();
 	try {
 		if (existsSync(globalPath)) {
 			const raw = readFileSync(globalPath, "utf-8");
 			const parsed = JSON.parse(raw);
-			if (typeof parsed?.configVersion !== "number" || parsed.configVersion < CONFIG_VERSION) {
+			const v = typeof parsed?.configVersion === "number" ? parsed.configVersion : 1;
+			if (v < CONFIG_VERSION) {
 				legacyDetected = true;
 				legacyPath = globalPath;
+				legacyVersion = v;
 			}
 			config = mergeConfig(config, parsed);
 		} else {
@@ -333,9 +360,11 @@ function loadConfig(cwd: string): LoadConfigResult {
 		if (existsSync(localPath)) {
 			const raw = readFileSync(localPath, "utf-8");
 			const parsed = JSON.parse(raw);
-			if (typeof parsed?.configVersion !== "number" || parsed.configVersion < CONFIG_VERSION) {
+			const v = typeof parsed?.configVersion === "number" ? parsed.configVersion : 1;
+			if (v < CONFIG_VERSION) {
 				legacyDetected = true;
 				legacyPath = localPath;
+				legacyVersion = v;
 			}
 			config = mergeConfig(config, parsed);
 		}
@@ -343,7 +372,7 @@ function loadConfig(cwd: string): LoadConfigResult {
 		console.error("[rolling-tools] Failed to load local config:", e);
 	}
 
-	return { config, legacyDetected, legacyPath };
+	return { config, legacyDetected, legacyPath, legacyVersion };
 }
 
 /**
@@ -372,12 +401,29 @@ function migrateConfigToLatest(cwd: string): {
 			managedTools: ["*"],
 			silencedTools: ["*"],
 			widgetTools: ["*"],
+			interceptNotifications: [{ match: "*", suppressToast: true }],
+			statusEnhancements: [
+				{ keyPattern: "*", durationMs: 8000, showRelativeTime: false, colorize: true },
+			],
+			notificationKeywords: [...DEFAULT_NOTIFICATION_KEYWORDS],
+			stripToolNotificationHeaders: true,
 			configVersion: CONFIG_VERSION,
 		};
 		if (typeof upgraded.lazyLoadStep !== "number") upgraded.lazyLoadStep = DEFAULT_CONFIG.lazyLoadStep;
 		if (typeof upgraded.persistAcrossSessions !== "boolean") {
 			upgraded.persistAcrossSessions = DEFAULT_CONFIG.persistAcrossSessions;
 		}
+		// 清理已废弃字段（v2 的 rollIntoWidget 等）
+		if (Array.isArray(upgraded.interceptNotifications)) {
+			upgraded.interceptNotifications = (upgraded.interceptNotifications as any[]).map((r) => {
+				if (r && typeof r === "object" && "rollIntoWidget" in r) {
+					const { rollIntoWidget, ...rest } = r as any;
+					return rest;
+				}
+				return r;
+			});
+		}
+		delete upgraded.solPiSavings;
 
 		ensureDirectoryExists(dirname(targetPath));
 		writeFileSync(targetPath, JSON.stringify(upgraded, null, 2), "utf-8");
@@ -391,16 +437,33 @@ function migrateConfigToLatest(cwd: string): {
 
 /**
  * 构造旧配置迁移提示文案。
- * 旧版本（configVersion < 2）只有 managedTools 白名单，新版默认改为通配符全工具。
- * 为避免破坏性变更，旧配置会保持原语义，并提示用户如何主动升级。
+ * - v1 → v2：旧白名单语义，保持原行为，提示如何切到全工具。
+ * - v2 → v3：通知统一收敛到 footer，提示新字段与默认值（不写配置文件也可用）。
  */
-function buildLegacyNotice(legacyPath?: string): string {
+function buildLegacyNotice(legacyPath?: string, fromVersion = 1): string {
 	const where = legacyPath ? `\n• 配置文件: ${legacyPath}` : "";
+
+	if (fromVersion < 2) {
+		return [
+			"rolling-tools: 检测到旧版配置，已自动保持原有行为（未强制切换为全工具）。",
+			"新版默认会将所有工具（含 edit / write / codemode / 三方工具）收入滚动块并隐藏正文。",
+			"如需启用新语义，请将配置中的 managedTools / silencedTools / widgetTools 设为 [\"*\"]，",
+			`或执行 /rolling-tools migrate 自动升级。${where}`,
+		].join("\n");
+	}
+
+	// v2 → v3
 	return [
-		"rolling-tools: 检测到旧版配置，已自动保持原有行为（未强制切换为全工具）。",
-		"新版默认会将所有工具（含 edit / write / codemode / 三方工具）收入滚动块并隐藏正文。",
-		"如需启用新语义，请将配置中的 managedTools / silencedTools / widgetTools 设为 [\"*\"]，",
-		`或执行 /rolling-tools migrate 自动升级。${where}`,
+		"rolling-tools: 检测到 v2 配置，已按 v3 新默认运行（旧字段自动忽略，不写配置文件也可用）。",
+		"v3 变化：",
+		"• 所有插件的 info 提示只在界面最下方显示，8 秒后自动消失（error / warning 与关键词例外仍保留）",
+		"• 工具行里重复的 “Money saved” 提示头已自动隐藏",
+		"如需自定义，可在配置文件中添加以下字段（全部可选，省略即用默认值）：",
+		'  "interceptNotifications": [{ "match": "*", "suppressToast": true }]',
+		'  "statusEnhancements": [{ "keyPattern": "*", "durationMs": 8000, "showRelativeTime": false, "colorize": true }]',
+		'  "notificationKeywords": ["error", "failed", "failure", "warning", "错误", "失败", "警告", "⚠", "❌", "🔴"]',
+		'  "stripToolNotificationHeaders": true',
+		`或执行 /rolling-tools migrate 写入完整默认配置。${where}`,
 	].join("\n");
 }
 
@@ -749,41 +812,8 @@ function deserializeHistory(data: any): { items: ToolItem[]; total: number } | n
 }
 
 /**
- * 解析 SoL-Pi 节省信息文本
- */
-function parseSolPiSavings(message: string): SolPiSavingsState {
-	const lines = message.split("\n").map((l) => l.trim()).filter(Boolean);
-	let summary = "";
-
-	for (const line of lines) {
-		if (line.includes("Money saved ·")) {
-			const parts = line.split("Money saved ·");
-			summary = parts[1]?.trim() || line;
-			break;
-		} else if (line.includes("Money saved")) {
-			summary = line;
-			break;
-		} else if (line.includes("tokens")) {
-			summary = line;
-			break;
-		}
-	}
-
-	if (!summary && lines.length > 0) {
-		summary = lines[lines.length - 1] ?? "";
-	}
-
-	summary = summary.replace(/^⚡\s*/u, "").trim();
-
-	return {
-		summary,
-		fullMessage: message,
-		timestamp: Date.now(),
-	};
-}
-
-/**
- * 匹配通知拦截规则
+ * 匹配通知拦截规则。
+ * 支持 `*`（全部）、精确子串与 `regex:<pattern>`。
  */
 function matchNotificationRule(
 	message: string,
@@ -791,6 +821,7 @@ function matchNotificationRule(
 ): InterceptNotificationRule | undefined {
 	for (const rule of rules) {
 		if (!rule || !rule.match) continue;
+		if (rule.match === "*") return rule;
 		if (rule.match.startsWith("regex:")) {
 			try {
 				const reg = new RegExp(rule.match.slice(6));
@@ -801,6 +832,21 @@ function matchNotificationRule(
 		}
 	}
 	return undefined;
+}
+
+/**
+ * 判断一条通知是否属于“重要信息”，重要信息不被拦截。
+ * - error / warning 类型：pi 会分流到 showError / showWarning，始终放行。
+ * - info 类型但命中关键词（如 error / failed / 失败 / 警告）：放行。
+ */
+function isImportantNotification(
+	message: string,
+	type: string | undefined,
+	keywords: string[] | undefined,
+): boolean {
+	if (type === "error" || type === "warning") return true;
+	const lower = message.toLowerCase();
+	return (keywords ?? []).some((k) => k && lower.includes(k.toLowerCase()));
 }
 
 /**
@@ -1551,6 +1597,69 @@ let activeStatusStartTime = 0;
 let lastActiveStatusRawText = "";
 
 /**
+ * 匹配插件在工具行里重复插入的提示头（如 SoL-Pi 的 “⚡ SoL-Pi · X” / “Money saved · Y”）。
+ * 带上 `·` 分隔符以尽量避免误伤工具自身的输出。
+ */
+const TOOL_NOTIFICATION_HEADER_RE = /(SoL-Pi\s*·|Money saved\s*·)/;
+
+/**
+ * 包装组件：渲染后过滤掉插件插入的提示头行。
+ * 对任意三方插件通用，不依赖具体插件名或内部组件结构。
+ */
+class NotificationHeaderStripper implements Component {
+	private inner: Component;
+
+	constructor(inner: Component) {
+		this.inner = inner;
+	}
+
+	render(width: number): string[] {
+		const lines = this.inner.render(width);
+		const filtered = lines.filter((line) => !TOOL_NOTIFICATION_HEADER_RE.test(line));
+		return filtered;
+	}
+
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		return this.inner.handleMouse?.(event);
+	}
+
+	invalidate(): void {
+		this.inner.invalidate?.();
+	}
+}
+
+/**
+ * 注册工具渲染器：剥掉插件在工具行里重复画的提示头（通道 C）。
+ * 旧版 Pi 没有 registerToolRenderer 时静默降级。
+ */
+function installToolNotificationStripper(
+	pi: ExtensionAPI,
+	isEnabled: () => boolean,
+): void {
+	const register = (pi as any).registerToolRenderer;
+	if (typeof register !== "function") return;
+
+	register.call(pi, (toolName: string, next: () => any) => {
+		const base = next();
+		if (!base || !isEnabled()) return base;
+
+		const wrap = (fn: any) => {
+			if (typeof fn !== "function") return fn;
+			return (...args: any[]) => {
+				const component = fn(...args);
+				return component ? new NotificationHeaderStripper(component) : component;
+			};
+		};
+
+		return {
+			...base,
+			renderCall: wrap(base.renderCall),
+			renderResult: wrap(base.renderResult),
+		};
+	});
+}
+
+/**
  * 安装原型劫持骨架（仅在进程初次加载时拦截一次，后续所有 reload 均由 dynamicHooks 委托热刷新）
  */
 function ensureGlobalPrototypeHooksInstalled(): void {
@@ -1592,7 +1701,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	/** 待展示的旧配置迁移提示（仅提示一次） */
 	let pendingLegacyNotice: string | undefined;
 	if (initialLoad.legacyDetected) {
-		pendingLegacyNotice = buildLegacyNotice(initialLoad.legacyPath);
+		pendingLegacyNotice = buildLegacyNotice(initialLoad.legacyPath, initialLoad.legacyVersion);
 	}
 
 	const state: WidgetState = {
@@ -1602,7 +1711,6 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		expandedItemId: null,
 		copyFeedbackMessage: null,
 		completedMessage: null,
-		solPiSavings: null,
 	};
 
 	/** 当前打开的历史大窗体（用于实时刷新与去重） */
@@ -1610,6 +1718,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 	// 1. 安装底层全局原型钩子骨架（单例）
 	ensureGlobalPrototypeHooksInstalled();
+
+	// 1.5 注册工具渲染器：剥掉插件在工具行里重复画的提示头（通道 C）
+	installToolNotificationStripper(pi, () => currentConfig.enabled && currentConfig.stripToolNotificationHeaders !== false);
 
 	// 2. 动态更新委派处理函数（支持任意次数的 /reload 即刻生效！）
 	dynamicHooks.handleToolRender = (target: any, width: number, origRender: Function) => {
@@ -1625,15 +1736,13 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		type: string | undefined,
 		origFn: Function,
 	) => {
+		// 重要信息（error / warning 类型，或命中关键词）不被拦截
+		if (isImportantNotification(message, type, currentConfig.notificationKeywords)) {
+			return origFn.call(target, message, type);
+		}
 		const matchedRule = matchNotificationRule(message, currentConfig.interceptNotifications);
-		if (matchedRule) {
-			if (matchedRule.rollIntoWidget) {
-				state.solPiSavings = parseSolPiSavings(message);
-				if (lastCtx) syncWidget(lastCtx);
-			}
-			if (matchedRule.suppressToast) {
-				return;
-			}
+		if (matchedRule?.suppressToast) {
+			return;
 		}
 		return origFn.call(target, message, type);
 	};
@@ -1842,15 +1951,13 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		const originalNotify = ui.notify?.bind(ui);
 		if (originalNotify) {
 			ui.notify = (message: string, type?: string) => {
+				// 重要信息（error / warning 类型，或命中关键词）不被拦截
+				if (isImportantNotification(message, type, currentConfig.notificationKeywords)) {
+					return originalNotify(message, type);
+				}
 				const matchedRule = matchNotificationRule(message, currentConfig.interceptNotifications);
-				if (matchedRule) {
-					if (matchedRule.rollIntoWidget) {
-						state.solPiSavings = parseSolPiSavings(message);
-						syncWidget(ctx);
-					}
-					if (matchedRule.suppressToast) {
-						return;
-					}
+				if (matchedRule?.suppressToast) {
+					return;
 				}
 				return originalNotify(message, type);
 			};
@@ -1859,11 +1966,6 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		const originalSetStatus = ui.setStatus?.bind(ui);
 		if (originalSetStatus) {
 			ui.setStatus = (key: string, text: string | undefined) => {
-				const rule = findStatusEnhancementRule(key, currentConfig.statusEnhancements);
-				if (rule && text) {
-					state.solPiSavings = parseSolPiSavings(text);
-					syncWidget(ctx);
-				}
 				return originalSetStatus(key, text);
 			};
 		}
@@ -1875,7 +1977,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		const loaded = loadConfig(ctx?.cwd || process.cwd());
 		currentConfig = loaded.config;
 		if (loaded.legacyDetected) {
-			pendingLegacyNotice = buildLegacyNotice(loaded.legacyPath);
+			pendingLegacyNotice = buildLegacyNotice(loaded.legacyPath, loaded.legacyVersion);
 		}
 		installUiHooks(ctx);
 
@@ -1920,7 +2022,6 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		state.expandedItemId = null;
 		state.copyFeedbackMessage = null;
 		state.completedMessage = null;
-		state.solPiSavings = null;
 		syncWidget(ctx);
 	});
 
@@ -2103,7 +2204,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				currentConfig = loaded.config;
 				syncWidget(ctx);
 				if (loaded.legacyDetected) {
-					ctx.ui?.notify?.(buildLegacyNotice(loaded.legacyPath), "warning");
+					ctx.ui?.notify?.(buildLegacyNotice(loaded.legacyPath, loaded.legacyVersion), "warning");
 				} else {
 					ctx.ui?.notify?.("✓ rolling-tools: 配置已重载", "info");
 				}
@@ -2137,7 +2238,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 					`• 懒加载步长: ${currentConfig.lazyLoadStep ?? 10} 条/次`,
 					`• 跨会话持久化: ${currentConfig.persistAcrossSessions ? "已开启" : "已关闭"}`,
 					`• 配置版本: v${currentConfig.configVersion ?? 1}${(currentConfig.configVersion ?? 1) < CONFIG_VERSION ? "（旧版，可执行 /rolling-tools migrate 升级）" : ""}`,
-					`• 通知拦截规则: ${currentConfig.interceptNotifications.length} 条`,
+					`• 通知拦截: ${currentConfig.interceptNotifications.map((r) => r.match).join(", ") || "（无）"}（例外关键词 ${(currentConfig.notificationKeywords ?? []).length} 个）`,
+					`• status 时长: ${currentConfig.statusEnhancements?.[0]?.durationMs ?? "默认"}ms`,
+					`• 剥离工具行提示头: ${currentConfig.stripToolNotificationHeaders !== false ? "已开启" : "已关闭"}`,
 				].join("\n");
 				ctx.ui?.notify?.(info, "info");
 			} else if (action === "history" || action === "open") {
