@@ -805,9 +805,9 @@ function getStatusGlyph(status: TodoStatus): { glyph: string; colorKey: string }
 		case "completed":
 			return { glyph: "✓", colorKey: "success" };
 		case "in_progress":
-			return { glyph: "◐", colorKey: "accent" };
+			return { glyph: "⏳", colorKey: "accent" };
 		case "cancelled":
-			return { glyph: "✗", colorKey: "muted" };
+			return { glyph: "✗", colorKey: "error" };
 		case "pending":
 		default:
 			return { glyph: "○", colorKey: "text" };
@@ -923,7 +923,7 @@ export class TodoTreeWidgetComponent implements Component {
 			// Display all parallel in-progress tasks, strictly bounded by width
 			for (let i = 1; i < activeItems.length; i++) {
 				const item = activeItems[i];
-				const glyph = "  └─ ◐ ";
+				const glyph = "  └─ ⏳ ";
 				const glyphStyled = this.theme.fg("accent", glyph);
 				const glyphWidth = visibleWidth(glyph);
 				const availableSub = Math.max(0, width - glyphWidth);
