@@ -1777,9 +1777,12 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 			ctx.ui?.notify?.("Todo Tree list cleared.", "info");
 		} else if (trimmed === "status") {
 			const stats = store.getProgressStats();
+			const activeTools = pi.getActiveTools?.() ?? [];
+			const isToolActive = activeTools.includes("todo");
 			const info = [
 				`Todo Tree Status:`,
 				`• State: ${config.enabled ? "ENABLED" : "DISABLED (default)"}`,
+				`• Active in Model: ${isToolActive ? "YES (declared to LLM)" : "NO (hidden from LLM)"}`,
 				`• Shortcut: ${config.shortcut}`,
 				`• Tasks: ${stats.total + stats.cancelled} (${stats.completed} completed, ${stats.inProgress} in progress, ${stats.pending} pending, ${stats.cancelled} cancelled)`,
 				`• Progress: ${stats.percent}%`,
