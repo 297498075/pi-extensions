@@ -1095,6 +1095,17 @@ class RollingToolsWidgetComponent implements Component {
 			});
 		}
 
+		// 1.5 错误提示行（单行紧凑展示，running / fixed 两种模式下均可见；
+		// 展开详情可查看完整错误输出，避免错误信息在 running 模式下无处可达）
+		if (this.state.activeError) {
+			const err = this.state.activeError;
+			const label = `[#${err.index} ${err.toolName}]`;
+			const prefix = ` ${theme.fg("error", "✗")} ${theme.bold(theme.fg("error", label))}`;
+			const budget = Math.max(8, renderWidth - visibleWidth(prefix) - 2);
+			const msg = truncate(err.message.replace(/\r?\n/g, " "), budget);
+			pushLine(`${prefix} ${theme.fg("muted", msg)}`, null, "detail_info");
+		}
+
 		// 2. 滚动工具列表（仅在 fixed 模式下在下方展示固定行数；running 模式下已合并至状态行，避免频繁上下闪烁）
 		if (this.state.viewMode === "fixed") {
 			const visibleTools = this.state.recentTools.slice(-this.displayLimit);
@@ -1215,7 +1226,7 @@ class RollingToolsWidgetComponent implements Component {
 				if (
 					modeBtnStart !== undefined &&
 					overlayBtnStart !== undefined &&
-					event.x >= modeBtnStart - 1 &&
+					event.x >= modeBtnStart &&
 					event.x < overlayBtnStart
 				) {
 					this.state.viewMode = this.state.viewMode === "fixed" ? "running" : "fixed";
@@ -2340,12 +2351,13 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		if (state.headerStatus.type === "waiting_server") {
 			state.headerStatus = { type: "idle" };
 		}
-		// 任务执行期间保持/开启动态计时器，使秒数与 spinner 平滑刷新
-		startStatusTimer(ctx);
-
 		if (!shouldIncludeInWidget(event.toolName, currentConfig)) {
 			return;
 		}
+
+		// 任务执行期间保持/开启动态计时器，使秒数与 spinner 平滑刷新。
+		// 仅对纳入 widget 的工具启动，避免被静音工具留下无人停止的 100ms 重渲染定时器。
+		startStatusTimer(ctx);
 
 		totalToolCount++;
 		const cwd = ctx?.cwd || process.cwd();

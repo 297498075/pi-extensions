@@ -1101,6 +1101,103 @@ assert.equal(lines11.slice(1).filter((l) => l.includes("[") && l.includes("]")).
 assert.ok(lines11[0].includes("🔽"), "header shows 🔽 in fixed mode");
 console.log("  ✓ /rolling-tools mode command switches viewMode correctly.");
 
+console.log("\n=== Test 12: Error Line Visible in Both View Modes ===");
+const handlers12 = new Map();
+let widgetFactory12 = null;
+const fakeUi12 = {
+	setWidget(k, c) {
+		if (typeof c === "function") widgetFactory12 = c;
+	},
+	notify() {},
+	setStatus() {},
+	setToolsExpanded() {},
+	requestRender() {},
+	custom() {
+		return Promise.resolve();
+	},
+};
+const fakePi12 = {
+	on(e, h) {
+		const l = handlers12.get(e) || [];
+		l.push(h);
+		handlers12.set(e, l);
+	},
+	registerCommand() {},
+	appendEntry() {},
+};
+const ctx12 = {
+	hasUI: true,
+	ui: fakeUi12,
+	cwd: process.cwd(),
+	sessionManager: { getEntries: () => [] },
+};
+
+rollingTools(fakePi12);
+for (const h of handlers12.get("session_start") || []) await h({ reason: "startup" }, ctx12);
+
+// 一次失败的工具调用
+for (const h of handlers12.get("tool_call") || []) {
+	await h({ toolCallId: "call_err", toolName: "bash", input: { command: "exit 1" } }, ctx12);
+}
+for (const h of handlers12.get("tool_result") || []) {
+	await h(
+		{
+			toolCallId: "call_err",
+			toolName: "bash",
+			isError: true,
+			content: [{ type: "text", text: "boom: command failed with exit code 1" }],
+		},
+		ctx12,
+	);
+}
+
+let w12 = widgetFactory12(dummyTui, dummyTheme);
+let lines12 = w12.render(100);
+const errLine12 = lines12.find((l) => l.includes("boom: command failed"));
+assert.ok(errLine12, "fixed mode must render a compact single-line error message");
+assert.ok(errLine12.includes("✗"), "error line must carry the ✗ marker");
+assert.ok(errLine12.includes("[#1 bash]"), "error line must identify the failing tool and index");
+assert.equal(lines12[0].includes("✗"), false, "error must not be merged into the header row");
+console.log("  ✓ fixed mode renders a compact error line with ✗ marker and tool id.");
+
+// 切到 running 模式，错误行仍须可见（此前 running 模式会完全吞掉错误信息）
+for (const h of handlers12.get("tool_call") || []) {
+	await h({ toolCallId: "call_run", toolName: "bash", input: { command: "sleep 10" } }, ctx12);
+}
+// 直接通过头部按钮切到 running 模式
+const rowW12 = visibleWidth(lines12[0]);
+w12.handleMouse({
+	type: "click",
+	button: "left",
+	x: rowW12 - 3,
+	y: 0,
+	screenX: rowW12 - 3,
+	screenY: 0,
+	width: 100,
+	height: lines12.length,
+	shift: false,
+	alt: false,
+	ctrl: false,
+});
+lines12 = w12.render(100);
+assert.ok(lines12[0].includes("⏏️"), "header switches to ⏏️ in running mode");
+const errLineRunning = lines12.find((l) => l.includes("boom: command failed"));
+assert.ok(errLineRunning, "running mode must still surface the error message on its own line");
+assert.ok(errLineRunning.includes("✗"), "running-mode error line must carry the ✗ marker");
+console.log("  ✓ running mode still surfaces the error line (no longer swallowed by the header).");
+
+// 成功工具调用应清空错误行
+for (const h of handlers12.get("tool_result") || []) {
+	await h({ toolCallId: "call_run", toolName: "bash", isError: false, content: [] }, ctx12);
+}
+lines12 = w12.render(100);
+assert.equal(
+	lines12.some((l) => l.includes("boom: command failed")),
+	false,
+	"a successful tool result must clear the error line",
+);
+console.log("  ✓ successful tool result clears the error line.");
+
 // 清理临时目录
 rmSync(TEST_AGENT_DIR, { recursive: true, force: true });
 

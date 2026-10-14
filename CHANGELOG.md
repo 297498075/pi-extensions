@@ -9,7 +9,10 @@ All notable changes to this project will be documented here.
   - Switched view mode toggle button to `🔽` (fixed recent rows) and `⏏️` (single-line running mode).
   - In `running` mode, active tasks are merged directly into the header row (zero vertical height jump/flicker).
   - Active running tasks now display a live elapsed timer (`(19ms)`, `(2.5s)`) both in the header row and in the multi-row list.
-  - Simplified error rendering: tool failure displays the red cross `✗` on its row; removed redundant multiline `[Error in #N ...]` alert block from the rolling widget.
+  - Error rendering: tool failure shows the red cross `✗` on its row, plus a compact single-line `✗ [#N tool] <message>` line that stays visible in **both** `fixed` and `running` modes (the multiline `[Error in #N ...]` block was removed; a successful tool result clears the line).
+  - `running` mode no longer swallows error information behind the running-task header.
+  - Fixed a leaked 100ms re-render timer: the status timer is now started only for tools included in the widget, so silenced/excluded tools can no longer leave an orphaned interval running until the next turn boundary.
+  - Normalized the view-mode toggle hit region to match the `➕` button (no longer extends one column to the left).
 - feat(rolling-tools): unify plugin tips into the footer status line (config schema v3).
   - `interceptNotifications` now defaults to `[{ "match": "*", "suppressToast": true }]`, so every plugin's `notify(..., "info")` tip is suppressed from the transcript instead of only SoL-Pi's.
   - `error` / `warning` notifications, and any `info` message containing a `notificationKeywords` word (default: `error`, `failed`, `failure`, `warning`, `错误`, `失败`, `警告`, `⚠`, `❌`, `🔴`), always pass through.
