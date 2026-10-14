@@ -352,100 +352,27 @@ assert.ok(
 
 console.log("✓ Declarative defaultActive: false and native setActiveTools verified.");
 
-console.log("=== Test 11: Structural Assertion: Frozen Request Tools & Transcript Tool Delta ===");
-// Double Assertion on Cache Safety:
-// 1. In caching architectures, Provider Request's payload.tools definition list must remain STRICTLY
-//    FROZEN (identical schemas & ordering) across turns.
-// 2. Dynamic runtime tool activation/deactivation (via setActiveTools) MUST be represented as
-//    structured transcript metadata (toolsAdded / toolsRemoved / tool_addition deltas),
-//    WITHOUT mutating the immutable base request tools definition array or invalidating prefix cache.
+console.log("=== Test 11: Source-level Guard & Invariant Assertion ===");
+// 方案 1（最优）：断言扩展源码中不存在 payload 篡改钩子
+// 这是唯一能真正防住"有人加回 payload 补丁"的办法，且不依赖对 Pi 内部行为的模拟
+import { readFileSync } from "node:fs";
 
-// Fixed registered tools definitions (The frozen API tool definitions)
-const frozenBaseTools = [
-	{ name: "read", description: "Read file contents" },
-	{ name: "bash", description: "Execute bash command" },
-	{ name: "edit", description: "Edit file" },
-	{ name: "todo", description: "Hierarchical todo list" },
-];
-
-const simulateBuildRequestPayload = (
-	activeTools,
-	transcriptDeltas,
-) => {
-	return {
-		systemPrompt: "You are a helpful coding assistant.",
-		tools: [...frozenBaseTools],
-		messages: [
-			{ role: "user", content: "Initial project setup" },
-			{ role: "assistant", content: "Working on it..." },
-			...transcriptDeltas.map((d) => ({
-				role: "system",
-				content: d.toolsAdded ? `[tool_addition]: ${d.toolsAdded.join(",")}` : `[tool_removal]: ${d.toolsRemoved?.join(",")}`,
-				...d,
-			})),
-		],
-	};
-};
-
-// 1. Initial turn: Todo is disabled (off)
-await cmdHandler("off", { hasUI: false, ui: null, sessionManager: { getBranch: () => [] } });
-assert.ok(!activeToolsList.includes("todo"), "State off: todo must not be in activeToolsList");
-
-const payloadBeforeToggle = simulateBuildRequestPayload(activeToolsList, []);
-const frozenToolsSnapshotJson = JSON.stringify(payloadBeforeToggle.tools);
-
-// 2. User/Agent executes '/todo on' mid-session
-await cmdHandler("on", { hasUI: false, ui: null, sessionManager: { getBranch: () => [] } });
-assert.ok(activeToolsList.includes("todo"), "State on: todo must be in activeToolsList");
-
-// Build payload after activation: tool_addition delta appears in transcript
-const payloadAfterToggle = simulateBuildRequestPayload(activeToolsList, [
-	{ toolsAdded: ["todo"] },
-]);
-
-// CRITICAL ASSERTION 1: Request-level tools array MUST be strictly frozen!
-assert.equal(
-	JSON.stringify(payloadAfterToggle.tools),
-	frozenToolsSnapshotJson,
-	"MUTATION DETECTED! Provider request-level tools array MUST be completely frozen to protect KV/Prefix cache!",
+const src = readFileSync(new URL("../extensions/todo-tree.ts", import.meta.url), "utf8");
+assert.ok(
+	!/before_provider_request/.test(src),
+	"todo-tree 不得注册 before_provider_request 钩子（禁止篡改 payload.tools，否则前缀缓存击穿）",
 );
 
-// CRITICAL ASSERTION 2: Activation delta MUST appear in transcript metadata / message stream
-const transcriptDeltas = payloadAfterToggle.messages.filter(
-	(m) => m.toolsAdded?.includes("todo") || m.content.includes("[tool_addition]: todo"),
-);
-assert.equal(
-	transcriptDeltas.length,
-	1,
-	"Transcript MUST contain exactly one tool_addition event for 'todo'!",
+// 验证必须声明 defaultActive: false（源头声明式隔离）
+assert.ok(
+	/defaultActive:\s*false/.test(src),
+	"todo-tree 工具注册必须声明 defaultActive: false，确保注册时默认处于非激活状态",
 );
 
-// 3. User executes '/todo off'
-await cmdHandler("off", { hasUI: false, ui: null, sessionManager: { getBranch: () => [] } });
-assert.ok(!activeToolsList.includes("todo"), "State off: todo must be removed from activeToolsList");
-
-const payloadAfterOff = simulateBuildRequestPayload(activeToolsList, [
-	{ toolsAdded: ["todo"] },
-	{ toolsRemoved: ["todo"] },
-]);
-
-// Re-verify request-level tools remains completely frozen
-assert.equal(
-	JSON.stringify(payloadAfterOff.tools),
-	frozenToolsSnapshotJson,
-	"Provider request-level tools array remained frozen after deactivation!",
-);
-
-const removalDeltas = payloadAfterOff.messages.filter(
-	(m) => m.toolsRemoved?.includes("todo") || m.content.includes("[tool_removal]: todo"),
-);
-assert.equal(removalDeltas.length, 1, "Transcript MUST contain tool_removal delta!");
-
-// CRITICAL ASSERTION 3: session_tree syncActiveTools verification
+// 验证 session_tree 事件下必须同步 syncActiveTools(config.enabled)
 const sessionTreeHandler = registeredEventHandlers.get("session_tree")?.[0];
 assert.ok(sessionTreeHandler, "session_tree event handler must be registered");
 
-// Setup mock branch with custom entry enabled: true
 const mockTreeContext = {
 	sessionManager: {
 		getBranch: () => [
@@ -458,15 +385,15 @@ const mockTreeContext = {
 	},
 };
 
-// Currently off -> triggering session_tree with enabled: true snapshot MUST call syncActiveTools(true)
+// 当前状态为 off -> 触发带有 enabled: true 快照的 session_tree 必须同步拉起 syncActiveTools(true)
 assert.ok(!activeToolsList.includes("todo"), "Precondition: todo is inactive");
 sessionTreeHandler({}, mockTreeContext);
 assert.ok(
 	activeToolsList.includes("todo"),
-	"session_tree handler MUST synchronize active tools via syncActiveTools(config.enabled)!",
+	"session_tree handler 必须同步执行 syncActiveTools(config.enabled)！",
 );
 
-console.log("✓ Structural assertion: Request-level tools frozen + transcript delta + session_tree sync verified.");
+console.log("✓ 源码级禁止 before_provider_request 钩子与 session_tree 状态同步断言验证通过。");
 
 console.log("\n=======================================================");
 console.log("ALL VERIFICATION & RIGOROUS TESTS PASSED SUCCESSFULLY! 🎉");
