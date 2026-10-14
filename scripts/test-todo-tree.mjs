@@ -271,7 +271,60 @@ assert.ok(userNotePromptTaskId !== null, "Key 'n' via handleInput must trigger n
 
 overlay.handleInput(Key.escape);
 assert.ok(overlayClosed, "handleInput with Key.escape must close modal");
-console.log("✓ Modal handleInput keyboard controls and c/x persistence callback verified.");
+
+// Test mouse interaction on tree fold icon
+const mouseTestStore = new TodoTreeStore();
+const rootTask = mouseTestStore.createTask({ id: "1", subject: "Parent Module" });
+mouseTestStore.createTask({ id: "1.1", parentId: "1", subject: "Submodule A" });
+
+let mouseOverlayClosed = false;
+const mouseOverlay = new TodoTreeOverlayComponent(
+	{ terminal: { rows: 24, cols: 80 }, requestRender: () => {} },
+	fakeTheme,
+	mouseTestStore,
+	() => {
+		mouseOverlayClosed = true;
+	},
+);
+
+mouseOverlay.render(80);
+assert.equal(mouseTestStore.isCollapsed("1"), false, "Initially root task 1 should not be collapsed");
+
+// In 80x24 terminal:
+// boxWidth = min(100, max(50, floor(80*0.88))) = 70
+// boxLeft = floor((80-70)/2) = 5
+// boxHeight = min(32, max(14, floor(24*0.82))) = 19
+// boxTop = floor((24-19)/2) = 2
+// Row 0 of tree list is at screen Y = boxTop + 3 = 5
+// Fold icon is around X = boxLeft + 3 = 8
+const clickFoldResult = mouseOverlay.handleMouse({
+	type: "click",
+	button: "left",
+	x: 8,
+	y: 5,
+});
+assert.equal(clickFoldResult?.handled, true, "Clicking fold icon must handle mouse event");
+assert.equal(mouseTestStore.isCollapsed("1"), true, "Clicking fold icon must toggle task to collapsed");
+
+// Clicking again must expand
+mouseOverlay.handleMouse({
+	type: "click",
+	button: "left",
+	x: 8,
+	y: 5,
+});
+assert.equal(mouseTestStore.isCollapsed("1"), false, "Clicking fold icon again must toggle task back to expanded");
+
+// Clicking outside the box must close overlay
+mouseOverlay.handleMouse({
+	type: "click",
+	button: "left",
+	x: 0,
+	y: 0,
+});
+assert.ok(mouseOverlayClosed, "Clicking outside modal bounding box must close modal");
+
+console.log("✓ Modal handleInput keyboard controls, fold icon mouse clicks, and c/x persistence callback verified.");
 
 console.log("=== Test 10: Declarative defaultActive: false & Tool Registration (Bug 4) ===");
 const registeredTools = new Map();

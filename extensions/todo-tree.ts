@@ -988,6 +988,7 @@ export class TodoTreeOverlayComponent implements Component {
 	private onClose: () => void;
 	private onPromptUserNote?: (taskId: string) => void;
 	private onPersist?: () => void;
+	private unsubscribeStore?: () => void;
 
 	private selectedIndex = 0;
 	private scrollTop = 0;
@@ -1014,11 +1015,20 @@ export class TodoTreeOverlayComponent implements Component {
 		this.onPromptUserNote = onPromptUserNote;
 		this.onPersist = onPersist;
 
+		this.unsubscribeStore = this.store.subscribe(() => {
+			this.tui?.requestRender?.();
+		});
+
 		const flat = this.store.getFlattenedTree();
 		const inProgIdx = flat.findIndex((f) => f.node.item.status === "in_progress");
 		if (inProgIdx >= 0) {
 			this.selectedIndex = inProgIdx;
 		}
+	}
+
+	private close(): void {
+		this.unsubscribeStore?.();
+		this.onClose();
 	}
 
 	invalidate(): void {
@@ -1052,6 +1062,11 @@ export class TodoTreeOverlayComponent implements Component {
 
 		const lines: string[] = [];
 		const innerWidth = this.boxWidth - 2;
+
+		// Top padding to vertically center the box on terminal canvas
+		for (let i = 0; i < this.boxTop; i++) {
+			lines.push("");
+		}
 
 		// 1. Top border
 		const titleStr = " 📋 Todo Tree ";
@@ -1231,6 +1246,12 @@ export class TodoTreeOverlayComponent implements Component {
 		// 8. Bottom border
 		lines.push(`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "└" + "─".repeat(innerWidth) + "┘")}`);
 
+		// Bottom padding
+		const totalRendered = this.boxTop + this.boxHeight;
+		for (let i = totalRendered; i < totalLines; i++) {
+			lines.push("");
+		}
+
 		return lines;
 	}
 
@@ -1248,7 +1269,7 @@ export class TodoTreeOverlayComponent implements Component {
 			data === "\n" ||
 			data === "enter"
 		) {
-			this.onClose();
+			this.close();
 			return;
 		}
 
@@ -1342,24 +1363,92 @@ export class TodoTreeOverlayComponent implements Component {
 				event.y < this.boxTop + this.boxHeight;
 
 			if (!isInside) {
-				this.onClose();
+				this.close();
 				return { handled: true };
 			}
 
-			const listRelativeY = event.y - (this.boxTop + 3);
+			const boxY = event.y - this.boxTop;
+
+			// Top border right hint: click close
+			if (boxY === 0 && event.x >= this.boxLeft + this.boxWidth - 28) {
+				this.close();
+				return { handled: true };
+			}
+
+			// Tree list row click
+			const listRelativeY = boxY - 3;
 			if (listRelativeY >= 0 && listRelativeY < this.listHeight) {
 				const targetIndex = this.scrollTop + listRelativeY;
 				const flat = this.store.getFlattenedTree();
 				if (targetIndex < flat.length) {
+					const wasSelected = this.selectedIndex === targetIndex;
 					this.selectedIndex = targetIndex;
-					if (event.x >= this.boxLeft + 2 && event.x <= this.boxLeft + 8) {
-						if (flat[targetIndex].hasChildren) {
-							this.store.toggleCollapsed(flat[targetIndex].node.item.id);
+					const itemEntry = flat[targetIndex];
+					const { node, hasChildren } = itemEntry;
+
+					if (hasChildren) {
+						let prefixWidth = 0;
+						for (let d = 0; d < node.depth; d++) {
+							prefixWidth += 3;
+						}
+						if (node.depth > 0) {
+							prefixWidth += 3; // "├─ " or "└─ "
+						}
+
+						// Fold icon column range on screen:
+						// this.boxLeft + 1 (border │) + 2 (pointerPrefix) + prefixWidth
+						const foldColStart = this.boxLeft + 1 + 2 + prefixWidth;
+						const foldColEnd = foldColStart + 2;
+
+						// Clicking on or near the fold icon ▶/▼ (or clicking an already selected row) toggles fold!
+						if (
+							(event.x >= this.boxLeft + 1 && event.x <= foldColEnd + 2) ||
+							wasSelected
+						) {
+							this.store.toggleCollapsed(node.item.id);
 						}
 					}
+
 					this.tui?.requestRender?.();
 					return { handled: true };
 				}
+			}
+
+			// Actions row click: [Space] Fold  [n] Note  [c] Done  [x] Cancel  [Esc] Close
+			if (boxY === 3 + this.listHeight + 2) {
+				const flat = this.store.getFlattenedTree();
+				const current = flat[this.selectedIndex];
+				const relX = event.x - this.boxLeft;
+				if (relX >= 2 && relX <= 16) {
+					// [Space] Fold
+					if (current && current.hasChildren) {
+						this.store.toggleCollapsed(current.node.item.id);
+					}
+				} else if (relX >= 17 && relX <= 26) {
+					// [n] Note
+					if (current && this.onPromptUserNote) {
+						this.onPromptUserNote(current.node.item.id);
+					}
+				} else if (relX >= 27 && relX <= 36) {
+					// [c] Done
+					if (current) {
+						const nextStatus = current.node.item.status === "completed" ? "pending" : "completed";
+						this.store.updateTask(current.node.item.id, { status: nextStatus });
+						this.onPersist?.();
+					}
+				} else if (relX >= 37 && relX <= 48) {
+					// [x] Cancel
+					if (current) {
+						const nextStatus = current.node.item.status === "cancelled" ? "pending" : "cancelled";
+						this.store.updateTask(current.node.item.id, { status: nextStatus });
+						this.onPersist?.();
+					}
+				} else if (relX >= 49) {
+					// [Esc] Close
+					this.close();
+				}
+				this.tui?.requestRender?.();
+				return { handled: true };
 			}
 		}
 
