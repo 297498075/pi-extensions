@@ -43,7 +43,7 @@
 9. **快速开关命令（默认关闭）**：
    - 小任务无需将 Todo 工具暴露给 LLM，扩展**默认处于关闭状态（Disabled）**；
    - 提供快速开关命令 `/todo`（`/todo on`、`/todo off`、`/todo toggle`、`/todo status`）；
-   - 关闭状态下动态从 Provider 请求中隐藏工具并移除主窗体 Widget，实现 0 上下文污染与 0 界面占用。
+   - 关闭状态下动态通过原生 `setActiveTools` 隐藏工具并移除主窗体 Widget，实现 0 上下文污染与 0 界面占用。
 
 ---
 
@@ -99,7 +99,7 @@ export interface TodoItem {
   * **并行进行中任务行**：
     若当前有多个任务同时处于 `in_progress`，自适应输出后续进行中项（如 `  └─ ◐ [接口层] > 联调 OpenApi 路由`），完整展示所有进行中工作，不设死板截断。
 * **右侧交互按钮 `[📋 ]`**：
-  * 组件通过 `handleMouse(event: TuiMouseEvent)` 计算点击区域（`x >= width - 6`）；
+  * 组件通过 `handleMouse(event: TuiMouseEvent)` 计算点击区域（精确匹配 `x >= width - buttonWidth - 2`）；
   * 鼠标点击直接弹出详情弹窗；
   * 同时支持全局快捷键（默认 `ctrl+shift+t` 或配置值）。
 
@@ -114,10 +114,11 @@ export interface TodoItem {
   * 视口超过高度时，在右边界绘制 `│` 轨道与 `█` 滑块；
   * 完美支持鼠标滚轮（`wheel`）、键盘方向键（`Up`/`Down`）、翻页键（`PageUp`/`PageDown`）。
 * **弹窗按键操作指南**：
-  * `[↑/↓]`：移动选中的任务项；
+  * `[↑/↓/j/k]`：移动选中的任务项；
   * `[Space]`：折叠/展开当前父节点；
   * `[n]`：为当前任务添加本地批注（呼出输入框）；
-  * `[c]`：快捷切换任务状态（完成/待办）；
+  * `[c]`：快捷切换任务状态（完成/待办，并即刻触发 `onPersist` 持久化）；
+  * `[x]`：快捷切换取消状态；
   * `[Esc/q/Enter]`：退出弹窗。
 
 ---
@@ -152,7 +153,7 @@ export interface TodoItem {
 ### 2. 与 `rolling-tools` 的位置共存保证
 * **原理**：Pi 的 `InteractiveMode` 将 `aboveEditor` 的所有组件放入 `Map`，渲染时按 Map 迭代顺序由上至下排列。
 * **保序方案**：
-  1. `todos` 采用单例 Component 挂载，状态更新时仅调用组件自身 `invalidate()` + `tui.requestRender()`，**绝对不重复调用 `ctx.ui.setWidget`**；
+  1. `todos` 采用组件工厂挂载，状态更新时仅调用组件自身 `invalidate()` + `tui.requestRender()`，**绝对不重复调用 `ctx.ui.setWidget`**；
   2. `rolling-tools` 在每次工具执行后会重新调用 `setWidget("rolling-tools")`，这会自动将 `rolling-tools` 推到 Map 的末尾（紧挨输入栏）；
   3. 因此，`todos` 将**天然且恒定地保持在 `rolling-tools` 滚动块的正上方**，彻底杜绝两个 Widget 上下颠倒和跳动问题。
 
@@ -166,9 +167,9 @@ export interface TodoItem {
   * `/todo off`：禁用任务清单，隐藏主窗体 Widget；
   * `/todo` 或 `/todo toggle`：状态翻转；
   * `/todo status`：查看当前配置与任务统计。
-* **LLM 隐身机制**：
-  * 在关闭（`disabled`）状态下，通过 `before_provider_request` 钩子动态从请求 payload 的 `tools` 列表中剔除 `todo` 工具；
-  * 日常小任务中，LLM 完全感知不到该工具，保持 0 提示词干扰与极速响应。
+* **声明式 + 原生工具隐身机制**：
+  * 工具注册时声明 `defaultActive: false`，默认非激活；
+  * 通过 `pi.setActiveTools()` 彻底从 System Prompt 和 Provider 管道摘除工具，实现真正的 0 提示词干扰与 0 上下文污染。
 
 ### 2. 英文 Tool 提示词定义 (Tool Guidance)
 工具描述与参数定义全英文撰写，规范标准：
@@ -183,9 +184,9 @@ Break down work into parent goals and actionable leaf subtasks. Keep only the cu
 
 ---
 
-## 八、 关键缺陷（Bug List）与完整修复记录
+## 七、 关键缺陷（Bug List）与完整修复记录
 
-在第一阶段实现后，经端到端压力测试与源码对照，修复了以下关键缺陷：
+经过两轮严苛的自动化与手工测试审查，完成了以下核心修复：
 
 1. **🔴 弹窗键盘交互完全重构（修复 Bug 1）**：
    - 彻底废弃伪接口 `handleKey`，实现 Pi TUI 标准的 `handleInput(data: string): void`；
@@ -193,24 +194,26 @@ Break down work into parent goals and actionable leaf subtasks. Keep only the cu
 2. **🔴 纯状态双向推导与历史完成保护（修复 Bug 2）**：
    - 重构 `checkParentStatus`：子项重开（`pending`）时父项自适应回退到 `in_progress` 或 `pending`；所有子项 `cancelled` 时父项才 `cancelled`；
    - `cascadeChildrenStatus` 实施保护原则：父项取消绝不覆盖已被确认 `completed` 的子项。
-3. **🔴 会话 Custom Entry 持久化（修复 Bug 3）**：
+3. **🔴 弹窗状态变更持久化闭环（修复 Bug 3）**：
    - 引入专用类型 `SNAPSHOT_ENTRY_TYPE = "todo-tree-state"`；
-   - 在任何任务或便签修改时，触发 `pi.appendEntry()` 保存快照；在会话恢复时优先反序列化该快照，确保 Fork、Compact、Reload 后用户批注与修改零丢失。
-4. **🟠 原生 `pi.setActiveTools` 动态隔离（修复 Bug 4）**：
-   - 放弃仅在 HTTP Payload 层打补丁的做法，改用 Pi 官方原生的 `pi.setActiveTools()` 控制工具声明；
-   - `/todo off` 模式下，System Prompt 和 Provider 请求中均完全不包含 `todo` 工具，实现真正的 0 提示词与 0 上下文污染。
-5. **🟠 树防环死循环校验与深度截断（修复 Bug 5）**：
+   - `TodoTreeOverlayComponent` 增加 `onPersist` 回调，用户在弹窗中按 `c` 完成或 `x` 取消时，立即触发 `persistSnapshot()`，彻底杜绝弹窗修改状态在会话 Fork/Reload 后丢失的问题。
+4. **🟠 声明式 `defaultActive: false` 与原生 `setActiveTools` 动态隔离（修复 Bug 4）**：
+   - 注册工具时声明 `defaultActive: false`，默认非激活；
+   - 彻底移除对 `before_provider_request` payload 打补丁的冗余代码，完全由官方推荐的 `setActiveTools` 统一纳管。
+5. **🟠 真实 createTask 路径防环死循环校验与深度截断（修复 Bug 5）**：
+   - 在 `createTask` 阶段即对超过 32 层的嵌套抛出明确异常，防止调用栈溢出；
    - 面包屑遍历、节点收集和树构建中加入 `visited = new Set<string>()` 机制；
-   - 引入 `MAX_TREE_DEPTH = 32` 硬上限，杜绝畸形快照或异常调用引发调用栈溢出或无限死循环。
+   - 弹窗中针对超深截断节点醒目渲染 `⚠[depth limit 32 reached]`，杜绝静默丢失；快照修复时输出警告日志。
 6. **🟠 精准鼠标命中与防止全局误触（修复 Bug 6）**：
    - 移除 Widget 全局任意点击打开弹窗的逻辑；
    - 动态计算按钮宽度 `visibleWidth("[📋 ]")`，只有在首行右侧命中按钮区域时才触发弹窗。
-7. **🟠 弹窗宽度溢出与长文本严格截断（修复 Bug 7）**：
+7. **🟠 极端窄屏宽度数学防御与真实 TUI 通路（修复 Bug 7）**：
    - 修复仅对原始字符串截断但输出未截断变量的错位逻辑；
-   - 精确计算边框行内部可用宽度，自适应折叠狭窄视口下的统计文字，确保所有行长恒等于 `boxWidth`。
+   - 废除伪造的 `terminal` 对象，Widget 改用工厂函数 `(tui, theme) => ...` 接入官方原生重绘流水线；
+   - 对 30~120 列全部视口宽度实现自适应前缀压缩与全局 `truncateToWidth` 终审兜底，数学级保证绝对不超出 1 字符。
 8. **🟡 终端控制字符清洗（修复 Bug 8）**：
    - 引入 `sanitizeText(str)`，清洗 OSC / CSI 转义序列及不可见控制字符，换行符统一变为空格，杜绝终端标题劫持或换行破坏。
-9. **🟡 资源订阅释放与性能缓存（修复 Bug 9）**：
-   - 在 `TodoTreeWidgetComponent` 中提供 `dispose()` 并在会话关闭时注销 `store` 监听器；
-   - 引入 `isDirty` 标记对统计数据与展平树进行懒计算缓存。
-
+9. **🟡 真实性能缓存与折叠解耦（修复 Bug 9）**：
+   - 移除失效的死代码 `isDirty` 布尔变量，改用明确的 `null` 置空缓存机制（`cachedFlattenedTree`、`cachedStats`、`cachedActiveTasks`）；
+   - 数据变更时 `invalidateData()`，节点折叠/展开时仅清除 `cachedFlattenedTree`，状态统计与任务列表不受折叠影响；
+   - 增加 `buildTreeCount` 跟踪计数并在自动化测试中严密验证连续 50 次读取 0 重复构建。

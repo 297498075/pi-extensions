@@ -39,6 +39,7 @@ export interface TreeNode {
 	depth: number;
 	isLastChild: boolean;
 	ancestorHasNextSibling: boolean[];
+	isDepthCapped?: boolean;
 }
 
 export interface ProgressStats {
@@ -192,7 +193,7 @@ function saveConfig(config: TodoTreeConfig): void {
 }
 
 // ============================================================================
-// 3. State Store (Hierarchical Tree with Dual-Direction Linkage & Caches)
+// 3. State Store (Hierarchical Tree with Dual-Direction Linkage & Explicit Caches)
 // ============================================================================
 
 export class TodoTreeStore {
@@ -200,11 +201,13 @@ export class TodoTreeStore {
 	private collapsedNodes = new Set<string>();
 	private listeners: Array<() => void> = [];
 
-	// Performance Caching
-	private isDirty = true;
+	// Performance Caching: Explicit null-cleared caches (no dead isDirty boolean)
 	private cachedStats: ProgressStats | null = null;
 	private cachedFlattenedTree: Array<{ node: TreeNode; hasChildren: boolean }> | null = null;
 	private cachedActiveTasks: Array<{ task: TodoItem; breadcrumb: string }> | null = null;
+
+	// Metrics for testing cache hits
+	public buildTreeCount = 0;
 
 	subscribe(fn: () => void): () => void {
 		this.listeners.push(fn);
@@ -213,15 +216,14 @@ export class TodoTreeStore {
 		};
 	}
 
-	private markDirty(): void {
-		this.isDirty = true;
+	private invalidateData(): void {
 		this.cachedStats = null;
 		this.cachedFlattenedTree = null;
 		this.cachedActiveTasks = null;
 	}
 
 	private notify(): void {
-		this.markDirty();
+		this.invalidateData();
 		for (const listener of this.listeners) {
 			try {
 				listener();
@@ -249,6 +251,7 @@ export class TodoTreeStore {
 		} else {
 			this.collapsedNodes.add(id);
 		}
+		// Collapsing only affects tree presentation, not tasks or stats
 		this.cachedFlattenedTree = null;
 		for (const listener of this.listeners) {
 			try {
@@ -263,7 +266,6 @@ export class TodoTreeStore {
 		this.tasks.clear();
 		this.collapsedNodes.clear();
 
-		// Validation & sanitization: filter out cyclical or orphan references
 		const tempMap = new Map<string, TodoItem>();
 		for (const item of items) {
 			if (item && item.id) {
@@ -279,7 +281,7 @@ export class TodoTreeStore {
 			}
 		}
 
-		// Cycle & depth guard
+		// Cycle & depth guard with warning
 		for (const [id, item] of tempMap.entries()) {
 			if (item.parentId) {
 				let currParentId: string | null | undefined = item.parentId;
@@ -303,7 +305,9 @@ export class TodoTreeStore {
 				}
 
 				if (hasCycle || !tempMap.has(item.parentId)) {
-					// Detach invalid/cyclical parent
+					console.warn(
+						`[todo-tree] Repaired invalid/cyclical parentId for task "#${id}" (was "${item.parentId}"). Reset to root.`,
+					);
 					item.parentId = null;
 				}
 			}
@@ -358,11 +362,16 @@ export class TodoTreeStore {
 		if (parentId) {
 			let depth = 1;
 			let curr = this.tasks.get(parentId);
+			const visited = new Set<string>([parentId]);
 			while (curr?.parentId) {
 				depth++;
 				if (depth >= MAX_TREE_DEPTH) {
-					throw new Error(`Exceeded maximum tree depth (${MAX_TREE_DEPTH}).`);
+					throw new Error(
+						`Task nesting exceeded maximum supported depth (${MAX_TREE_DEPTH}). Cannot add subtask.`,
+					);
 				}
+				if (visited.has(curr.parentId)) break;
+				visited.add(curr.parentId);
 				curr = this.tasks.get(curr.parentId);
 			}
 		}
@@ -583,10 +592,8 @@ export class TodoTreeStore {
 			if (allCompleted) {
 				parent.status = "completed";
 			} else if (anyInProgress || anyCompleted) {
-				// Partial completion or running -> in_progress
 				parent.status = "in_progress";
 			} else if (allPending) {
-				// Re-opened tasks cascade back to pending!
 				parent.status = "pending";
 			}
 			parent.updatedAt = Date.now();
@@ -598,6 +605,7 @@ export class TodoTreeStore {
 	}
 
 	buildTree(): TreeNode[] {
+		this.buildTreeCount++;
 		const rootItems: TodoItem[] = [];
 		const childMap = new Map<string, TodoItem[]>();
 
@@ -628,8 +636,10 @@ export class TodoTreeStore {
 			ancestorHasNextSibling: boolean[],
 		): TreeNode => {
 			visited.add(item.id);
-			const childrenItems = (childMap.get(item.id) || []).filter((c) => !visited.has(c.id));
+			const rawChildren = childMap.get(item.id) || [];
+			const childrenItems = rawChildren.filter((c) => !visited.has(c.id));
 			const childrenNodes: TreeNode[] = [];
+			let isDepthCapped = false;
 
 			if (depth < MAX_TREE_DEPTH) {
 				for (let i = 0; i < childrenItems.length; i++) {
@@ -637,6 +647,8 @@ export class TodoTreeStore {
 					const nextAncestors = [...ancestorHasNextSibling, !isLast];
 					childrenNodes.push(buildNode(childrenItems[i], depth + 1, isLast, nextAncestors));
 				}
+			} else if (childrenItems.length > 0) {
+				isDepthCapped = true;
 			}
 
 			return {
@@ -645,6 +657,7 @@ export class TodoTreeStore {
 				depth,
 				isLastChild,
 				ancestorHasNextSibling,
+				isDepthCapped,
 			};
 		};
 
@@ -654,7 +667,7 @@ export class TodoTreeStore {
 	}
 
 	getFlattenedTree(): Array<{ node: TreeNode; hasChildren: boolean }> {
-		if (this.cachedFlattenedTree && !this.isDirty) {
+		if (this.cachedFlattenedTree !== null) {
 			return this.cachedFlattenedTree;
 		}
 
@@ -680,7 +693,7 @@ export class TodoTreeStore {
 	}
 
 	getActiveInProgressTasks(): Array<{ task: TodoItem; breadcrumb: string }> {
-		if (this.cachedActiveTasks && !this.isDirty) {
+		if (this.cachedActiveTasks !== null) {
 			return this.cachedActiveTasks;
 		}
 
@@ -692,7 +705,6 @@ export class TodoTreeStore {
 
 		for (const task of this.tasks.values()) {
 			if (task.status === "in_progress") {
-				// If parent has children that are in_progress, display leaf subtasks
 				const hasChildren = parentIds.has(task.id);
 				let hasActiveChild = false;
 				if (hasChildren) {
@@ -707,7 +719,6 @@ export class TodoTreeStore {
 					continue;
 				}
 
-				// Build breadcrumb with cycle and depth guard
 				const path: string[] = [];
 				const visited = new Set<string>([task.id]);
 				let curr: TodoItem | undefined = task;
@@ -735,7 +746,7 @@ export class TodoTreeStore {
 	}
 
 	getProgressStats(): ProgressStats {
-		if (this.cachedStats && !this.isDirty) {
+		if (this.cachedStats !== null) {
 			return this.cachedStats;
 		}
 
@@ -750,7 +761,6 @@ export class TodoTreeStore {
 			if (t.parentId) parentIds.add(t.parentId);
 		}
 
-		// Progress is driven by concrete execution items (leaves)
 		for (const t of this.tasks.values()) {
 			const isLeaf = !parentIds.has(t.id);
 			if (isLeaf) {
@@ -805,7 +815,7 @@ function getStatusGlyph(status: TodoStatus): { glyph: string; colorKey: string }
 }
 
 // ============================================================================
-// 5. Main Screen Above-Editor Widget Component
+// 5. Main Screen Above-Editor Widget Component (Strict Width Guarantee)
 // ============================================================================
 
 export class TodoTreeWidgetComponent implements Component {
@@ -829,6 +839,11 @@ export class TodoTreeWidgetComponent implements Component {
 		});
 	}
 
+	updateTuiAndTheme(tui: any, theme: any): void {
+		this.tui = tui;
+		this.theme = theme;
+	}
+
 	dispose(): void {
 		this.unsubscribeStore();
 	}
@@ -843,7 +858,7 @@ export class TodoTreeWidgetComponent implements Component {
 		}
 
 		const tasks = this.store.getAllTasks();
-		if (tasks.length === 0) {
+		if (tasks.length === 0 || width < 10) {
 			this.cachedLines = [];
 			this.cachedWidth = width;
 			return [];
@@ -856,60 +871,96 @@ export class TodoTreeWidgetComponent implements Component {
 		const buttonText = "[📋 ]";
 		const buttonWidth = visibleWidth(buttonText);
 
-		// Line 1: Header / Progress
 		const hasActive = activeItems.length > 0;
-		const dotGlyph = hasActive
-			? this.theme.fg("accent", "●")
+		const dotChar = hasActive
+			? "●"
 			: stats.completed === stats.total && stats.total > 0
-				? this.theme.fg("success", "✓")
-				: this.theme.fg("muted", "○");
+				? "✓"
+				: "○";
+		const dotColor = hasActive
+			? "accent"
+			: stats.completed === stats.total && stats.total > 0
+				? "success"
+				: "muted";
+		const dotGlyph = this.theme.fg(dotColor, dotChar);
 
-		const tagText = `Todos [${stats.completed}/${stats.total} · ${stats.percent}%]`;
-		const barText = renderProgressBar(stats.percent, 8);
-		const tagStyled = this.theme.fg("accent", tagText);
-		const barStyled = this.theme.fg("accent", barText);
+		// Dynamic adaptive prefix for narrow terminals
+		let prefixText = ` ${dotChar} Todos [${stats.completed}/${stats.total} · ${stats.percent}%] ${renderProgressBar(stats.percent, 6)} `;
+		let prefixStyled = ` ${dotGlyph} ${this.theme.fg("accent", `Todos [${stats.completed}/${stats.total} · ${stats.percent}%]`)} ${this.theme.fg("accent", renderProgressBar(stats.percent, 6))} `;
 
-		const prefix = ` ${dotGlyph} ${tagStyled} ${barStyled} `;
-		const prefixLen = visibleWidth(` ● ${tagText} ${barText} `);
+		// If viewport is too narrow, shrink prefix progressively
+		if (visibleWidth(prefixText) + buttonWidth + 8 > width) {
+			prefixText = ` ${dotChar} [${stats.completed}/${stats.total} · ${stats.percent}%] `;
+			prefixStyled = ` ${dotGlyph} ${this.theme.fg("accent", `[${stats.completed}/${stats.total} · ${stats.percent}%]`)} `;
+		}
+		if (visibleWidth(prefixText) + buttonWidth + 4 > width) {
+			prefixText = ` ${dotChar} [${stats.completed}/${stats.total}] `;
+			prefixStyled = ` ${dotGlyph} ${this.theme.fg("accent", `[${stats.completed}/${stats.total}]`)} `;
+		}
 
-		const availableForSubject = Math.max(10, width - prefixLen - buttonWidth - 2);
+		const prefixLen = visibleWidth(prefixText);
+		const availableForSubject = width - prefixLen - buttonWidth;
 
 		if (hasActive) {
 			const first = activeItems[0];
 			const firstLabel = `${first.breadcrumb}#${first.task.id} ${first.task.subject}`;
-			const truncatedSubject = truncateToWidth(firstLabel, availableForSubject);
-			const subjectStyled = this.theme.style(truncatedSubject, { bold: true });
 
-			const middleLen = visibleWidth(truncatedSubject);
-			const padLen = Math.max(1, width - prefixLen - middleLen - buttonWidth);
-			const btnStyled = this.theme.fg("accent", buttonText);
+			if (availableForSubject >= 4) {
+				const truncatedSubject = truncateToWidth(firstLabel, availableForSubject - 1);
+				const middleLen = visibleWidth(truncatedSubject);
+				const padLen = Math.max(1, width - prefixLen - middleLen - buttonWidth);
+				const btnStyled = this.theme.fg("accent", buttonText);
+				const subjectStyled = this.theme.style(truncatedSubject, { bold: true });
 
-			lines.push(`${prefix}${subjectStyled}${" ".repeat(padLen)}${btnStyled}`);
+				lines.push(`${prefixStyled}${subjectStyled}${" ".repeat(padLen)}${btnStyled}`);
+			} else {
+				// Extremely narrow: omit subject, show just progress and button
+				const padLen = Math.max(0, width - prefixLen - buttonWidth);
+				const btnStyled = this.theme.fg("accent", buttonText);
+				lines.push(`${prefixStyled}${" ".repeat(padLen)}${btnStyled}`);
+			}
 
-			// Display all parallel in-progress tasks
+			// Display all parallel in-progress tasks, strictly bounded by width
 			for (let i = 1; i < activeItems.length; i++) {
 				const item = activeItems[i];
-				const glyph = this.theme.fg("accent", "  └─ ◐ ");
-				const label = `${item.breadcrumb}#${item.task.id} ${item.task.subject}`;
-				const trunc = truncateToWidth(label, width - 8);
-				lines.push(`${glyph}${this.theme.fg("text", trunc)}`);
+				const glyph = "  └─ ◐ ";
+				const glyphStyled = this.theme.fg("accent", glyph);
+				const glyphWidth = visibleWidth(glyph);
+				const availableSub = Math.max(0, width - glyphWidth);
+
+				if (availableSub > 2) {
+					const label = `${item.breadcrumb}#${item.task.id} ${item.task.subject}`;
+					const trunc = truncateToWidth(label, availableSub);
+					lines.push(`${glyphStyled}${this.theme.fg("text", trunc)}`);
+				}
 			}
 		} else {
 			const statusMsg =
 				stats.completed === stats.total && stats.total > 0
-					? "All tasks completed"
-					: `${stats.pending} pending tasks`;
-			const msgStyled = this.theme.fg("muted", statusMsg);
-			const msgLen = visibleWidth(statusMsg);
-			const padLen = Math.max(1, width - prefixLen - msgLen - buttonWidth);
-			const btnStyled = this.theme.fg("accent", buttonText);
+					? "All completed"
+					: `${stats.pending} pending`;
 
-			lines.push(`${prefix}${msgStyled}${" ".repeat(padLen)}${btnStyled}`);
+			if (availableForSubject >= 4) {
+				const truncatedMsg = truncateToWidth(statusMsg, availableForSubject - 1);
+				const middleLen = visibleWidth(truncatedMsg);
+				const padLen = Math.max(1, width - prefixLen - middleLen - buttonWidth);
+				const btnStyled = this.theme.fg("accent", buttonText);
+				const msgStyled = this.theme.fg("muted", truncatedMsg);
+
+				lines.push(`${prefixStyled}${msgStyled}${" ".repeat(padLen)}${btnStyled}`);
+			} else {
+				const padLen = Math.max(0, width - prefixLen - buttonWidth);
+				const btnStyled = this.theme.fg("accent", buttonText);
+				lines.push(`${prefixStyled}${" ".repeat(padLen)}${btnStyled}`);
+			}
 		}
 
-		this.cachedLines = lines;
+		// Enforce absolute strict width guarantee: No line shall ever exceed width!
+		const boundedLines = lines.map((l) => truncateToWidth(l, width));
+
+		this.cachedLines = boundedLines;
 		this.cachedWidth = width;
-		return lines;
+		return boundedLines;
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
@@ -936,6 +987,7 @@ export class TodoTreeOverlayComponent implements Component {
 	private store: TodoTreeStore;
 	private onClose: () => void;
 	private onPromptUserNote?: (taskId: string) => void;
+	private onPersist?: () => void;
 
 	private selectedIndex = 0;
 	private scrollTop = 0;
@@ -953,12 +1005,14 @@ export class TodoTreeOverlayComponent implements Component {
 		store: TodoTreeStore,
 		onClose: () => void,
 		onPromptUserNote?: (taskId: string) => void,
+		onPersist?: () => void,
 	) {
 		this.tui = tui;
 		this.theme = theme;
 		this.store = store;
 		this.onClose = onClose;
 		this.onPromptUserNote = onPromptUserNote;
+		this.onPersist = onPersist;
 
 		const flat = this.store.getFlattenedTree();
 		const inProgIdx = flat.findIndex((f) => f.node.item.status === "in_progress");
@@ -1047,7 +1101,6 @@ export class TodoTreeOverlayComponent implements Component {
 			? Math.round((this.scrollTop / maxScroll) * (this.listHeight - thumbHeight))
 			: 0;
 
-		// Each row interior = innerWidth - (scrollbarActive ? 1 : 0)
 		const rowInteriorWidth = innerWidth - (scrollbarActive ? 1 : 0);
 
 		for (let row = 0; row < this.listHeight; row++) {
@@ -1080,6 +1133,11 @@ export class TodoTreeOverlayComponent implements Component {
 						: "";
 				const noteBadgeWidth = visibleWidth(noteBadge);
 
+				const depthCapWarning = node.isDepthCapped
+					? this.theme.fg("warning", " ⚠[depth limit 32 reached]")
+					: "";
+				const depthCapWidth = visibleWidth(depthCapWarning);
+
 				const idStr = `#${item.id} `;
 				const pointerPrefix = isSelected ? "> " : "  ";
 
@@ -1090,9 +1148,9 @@ export class TodoTreeOverlayComponent implements Component {
 					visibleWidth(glyph) +
 					1 +
 					visibleWidth(idStr) +
-					noteBadgeWidth;
+					noteBadgeWidth +
+					depthCapWidth;
 
-				// Strictly truncate subjectStr to prevent overflowing width
 				const availableSubjectWidth = Math.max(4, rowInteriorWidth - fixedWidth - 1);
 				const truncatedSubject = truncateToWidth(item.subject, availableSubjectWidth);
 
@@ -1117,7 +1175,8 @@ export class TodoTreeOverlayComponent implements Component {
 					" " +
 					this.theme.fg("accent", idStr) +
 					styledSubject +
-					noteBadge;
+					noteBadge +
+					depthCapWarning;
 
 				const actualVisible =
 					fixedWidth + visibleWidth(truncatedSubject);
@@ -1247,6 +1306,8 @@ export class TodoTreeOverlayComponent implements Component {
 				const nextStatus: TodoStatus =
 					current.node.item.status === "completed" ? "pending" : "completed";
 				this.store.updateTask(current.node.item.id, { status: nextStatus });
+				// Critical fix: persist snapshot immediately on modal status change!
+				this.onPersist?.();
 			}
 			return;
 		}
@@ -1257,6 +1318,8 @@ export class TodoTreeOverlayComponent implements Component {
 				const nextStatus: TodoStatus =
 					current.node.item.status === "cancelled" ? "pending" : "cancelled";
 				this.store.updateTask(current.node.item.id, { status: nextStatus });
+				// Critical fix: persist snapshot immediately on modal status change!
+				this.onPersist?.();
 			}
 			return;
 		}
@@ -1356,7 +1419,6 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 	let widgetComponent: TodoTreeWidgetComponent | null = null;
 	let isPromptingUser = false;
 
-	// Persistence: write snapshot to session branch
 	function persistSnapshot(): void {
 		try {
 			pi.appendEntry(SNAPSHOT_ENTRY_TYPE, {
@@ -1368,7 +1430,7 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	// Dynamic native tool exposure via Pi's setActiveTools
+	// Declarative + Native Tool Exposure Control
 	function syncActiveTools(enabled: boolean): void {
 		try {
 			const current = pi.getActiveTools();
@@ -1382,17 +1444,15 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 				}
 			}
 		} catch {
-			// Ignore if not supported
+			// Fallback if not supported
 		}
 	}
 
-	// Restore snapshot from branch
 	function restoreFromBranch(ctx: ExtensionContext): void {
 		try {
 			const branch = ctx.sessionManager.getBranch();
 			let restored = false;
 
-			// 1. Prioritize dedicated custom entry
 			for (let i = branch.length - 1; i >= 0; i--) {
 				const entry = branch[i];
 				if (entry.type === "custom" && entry.customType === SNAPSHOT_ENTRY_TYPE) {
@@ -1408,7 +1468,6 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 				}
 			}
 
-			// 2. Fallback to historical toolResult details
 			if (!restored) {
 				for (let i = branch.length - 1; i >= 0; i--) {
 					const entry = branch[i];
@@ -1429,7 +1488,7 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	// Mount widget (guarantees staying stably above rolling-tools)
+	// Mount widget using TUI factory (guarantees staying stably above rolling-tools)
 	function syncWidget(ctx: ExtensionContext): void {
 		if (!ctx.hasUI || !ctx.ui) return;
 
@@ -1442,17 +1501,18 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
-		if (!widgetComponent) {
-			widgetComponent = new TodoTreeWidgetComponent(
-				(ctx.ui as any).terminal ?? {},
-				ctx.ui.theme,
-				store,
-				() => openModal(ctx),
-			);
-			ctx.ui.setWidget("todos", () => widgetComponent!, { placement: "aboveEditor" });
-		} else {
-			widgetComponent.invalidate();
-		}
+		ctx.ui.setWidget(
+			"todos",
+			(tui: any, theme: any) => {
+				if (!widgetComponent) {
+					widgetComponent = new TodoTreeWidgetComponent(tui, theme, store, () => openModal(ctx));
+				} else {
+					widgetComponent.updateTuiAndTheme(tui, theme);
+				}
+				return widgetComponent;
+			},
+			{ placement: "aboveEditor" },
+		);
 	}
 
 	// Open Fullscreen / Centered Overlay Modal
@@ -1476,6 +1536,10 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 							done(undefined);
 							void promptAddUserNote(ctx, taskId);
 						},
+						() => {
+							// On modal c/x status change
+							persistSnapshot();
+						},
 					);
 					activeModal = component;
 					return component;
@@ -1496,7 +1560,6 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 			});
 	}
 
-	// Prompt user to add note to a task
 	async function promptAddUserNote(ctx: ExtensionContext, taskId: string): Promise<void> {
 		if (!ctx.ui?.input) return;
 		const task = store.getTask(taskId);
@@ -1533,11 +1596,12 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	// Register LLM Tool
+	// Register LLM Tool with defaultActive: false (Declarative Clean Isolation)
 	pi.registerTool({
 		name: "todo",
 		label: "Todo Tree",
 		description: TODO_TOOL_DESCRIPTION,
+		defaultActive: false, // Inactive by default upon registration!
 		parameters: TodoToolParamsSchema,
 		execute: async (_toolCallId, params: TodoToolParams) => {
 			const action = params.action;
@@ -1646,21 +1710,6 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// Fallback filtering in provider request payload
-	pi.on("before_provider_request", (event: any) => {
-		if (config.enabled) return;
-
-		if (event?.payload && typeof event.payload === "object") {
-			const payload = event.payload as Record<string, unknown>;
-			if (Array.isArray(payload.tools)) {
-				payload.tools = payload.tools.filter((t: any) => {
-					const name = t?.function?.name ?? t?.name;
-					return name !== "todo" && name !== "todos";
-				});
-			}
-		}
-	});
-
 	// Lifecycle Events
 	pi.on("session_start", (_event, ctx) => {
 		lastCtx = ctx;
@@ -1683,7 +1732,7 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	// Register Shortcut
+	// Register Shortcut with clean validation
 	try {
 		pi.registerShortcut(config.shortcut as KeyId, {
 			description: "Open Todo Tree modal",
@@ -1692,7 +1741,7 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 			},
 		});
 	} catch (e) {
-		console.warn(`[todo-tree] Failed to register shortcut ${config.shortcut}:`, e);
+		console.warn(`[todo-tree] Could not register shortcut "${config.shortcut}":`, e);
 	}
 
 	const commandHandler = async (args: string, ctx: ExtensionContext) => {

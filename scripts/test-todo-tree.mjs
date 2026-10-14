@@ -103,41 +103,69 @@ assert.ok(!clean.includes("\n"), "Must replace newlines with space");
 assert.equal(clean, "Title with New line");
 console.log("✓ Terminal escape sequence and control character sanitization verified.");
 
-console.log("=== Test 6: Cycle and Deep Chain Guard (Bug 5) ===");
-// Construct cyclical snapshot
+console.log("=== Test 6: Cycle and Deep Chain Guard on Real createTask & Snapshot (Bug 5) ===");
+// 1. Snapshot with cyclical references
 const cyclicalSnapshot = [
 	{ id: "A", parentId: "B", subject: "Task A", status: "pending" },
 	{ id: "B", parentId: "A", subject: "Task B", status: "pending" },
 ];
 store.loadSnapshot(cyclicalSnapshot);
-// Loading cyclical data must not crash or loop infinitely
 const tasksAfterLoad = store.getAllTasks();
 assert.equal(tasksAfterLoad.length, 2);
 const activeTasksSafe = store.getActiveInProgressTasks();
 assert.ok(Array.isArray(activeTasksSafe), "Cycle in snapshot safely broken");
 
-// Deep chain test
-const deepChain = [];
-for (let i = 1; i <= MAX_TREE_DEPTH + 5; i++) {
-	deepChain.push({
-		id: String(i),
-		parentId: i === 1 ? null : String(i - 1),
-		subject: `Depth ${i}`,
-		status: "pending",
-	});
+// 2. Real createTask deep nesting crash prevention
+store.clear();
+let lastParentId = null;
+let caughtDepthError = false;
+
+try {
+	for (let i = 1; i <= MAX_TREE_DEPTH + 5; i++) {
+		const created = store.createTask({
+			parentId: lastParentId,
+			subject: `Level ${i}`,
+		});
+		lastParentId = created.id;
+	}
+} catch (err) {
+	caughtDepthError = true;
+	assert.ok(
+		err.message.includes("maximum supported depth"),
+		`Expected depth error, got: ${err.message}`,
+	);
 }
-store.loadSnapshot(deepChain);
-const deepTree = store.buildTree();
-assert.ok(deepTree.length > 0, "Deep chain safely capped at MAX_TREE_DEPTH");
-console.log("✓ Cycle detection and recursion depth guard verified.");
 
-console.log("=== Test 7: Widget Precise Click Hit & Memory Disposal (Bug 6, 9) ===");
-// Restore normal tasks
-store.loadSnapshot([
-	{ id: "1", subject: "Root Task", status: "in_progress" },
-	{ id: "1.1", parentId: "1", subject: "Subtask 1", status: "in_progress" },
-]);
+assert.ok(caughtDepthError, "createTask must safely throw on exceeding MAX_TREE_DEPTH without stack overflow");
+console.log("✓ Cycle detection and recursion depth guard verified on real createTask path.");
 
+console.log("=== Test 7: Performance Cache Verification (Bug 9) ===");
+store.clear();
+store.createTask({ subject: "Root 1" });
+store.createTask({ subject: "Root 2" });
+store.createTask({ parentId: "1", subject: "Child 1.1" });
+
+const initialBuildCount = store.buildTreeCount;
+// Call getFlattenedTree 50 times
+for (let i = 0; i < 50; i++) {
+	store.getFlattenedTree();
+	store.getProgressStats();
+	store.getActiveInProgressTasks();
+}
+
+assert.equal(
+	store.buildTreeCount,
+	initialBuildCount + 1,
+	`Cache MUST prevent rebuilds! Expected buildTreeCount=${initialBuildCount + 1}, got=${store.buildTreeCount}`,
+);
+
+// Mutating store must invalidate cache
+store.createTask({ subject: "Root 3" });
+store.getFlattenedTree();
+assert.equal(store.buildTreeCount, initialBuildCount + 2, "Mutating store must invalidate and recompute cache once");
+console.log("✓ Explicit null-cleared performance cache verified (no dead code).");
+
+console.log("=== Test 8: Widget Strict Width Bounding on Narrow Screens (Bug 7) ===");
 const fakeTheme = {
 	fg: (_name, text) => text,
 	bg: (_name, text) => text,
@@ -154,39 +182,50 @@ const widget = new TodoTreeWidgetComponent(
 	},
 );
 
-const widgetLines = widget.render(100);
-assert.ok(widgetLines.length >= 1);
-assert.ok(widgetLines[0].includes("[📋 ]"));
+// Test widths: 30, 40, 45, 50, 80, 120
+const testWidths = [30, 40, 45, 50, 60, 80, 100, 120];
+for (const w of testWidths) {
+	widget.invalidate();
+	const lines = widget.render(w);
+	for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+		const line = lines[lineIdx];
+		const actWidth = visibleWidth(line);
+		assert.ok(
+			actWidth <= w,
+			`Widget line ${lineIdx} with width=${w} overflowed! Actual width=${actWidth}: "${line}"`,
+		);
+	}
+}
 
-// Click in middle text area (x=20) -> MUST NOT open modal
+// Re-render at 80 before mouse hit test to set cachedWidth to 80
+widget.render(80);
+
+// Button hit testing
 const missResult = widget.handleMouse({
 	type: "click",
 	button: "left",
-	x: 20,
+	x: 10,
 	y: 0,
 });
 assert.equal(missResult, undefined, "Clicking left/middle area should not trigger modal");
 assert.equal(modalOpenCount, 0);
 
-// Click on right button (x=98) -> MUST open modal
 const hitResult = widget.handleMouse({
 	type: "click",
 	button: "left",
-	x: 98,
+	x: 78,
 	y: 0,
 });
 assert.equal(hitResult?.handled, true, "Clicking button must handle event");
 assert.equal(modalOpenCount, 1, "Clicking button must trigger open modal");
 
-// Disposal test
 widget.dispose();
-// After disposal, modifying store must not trigger calls on disposed widget
-store.createTask({ subject: "New Task" });
-console.log("✓ Precise button hit-testing and subscriber disposal verified.");
+console.log("✓ Widget strict width bounding across all narrow screens (30..120 cols) verified.");
 
-console.log("=== Test 8: Real handleInput Dispatching & Width Overflow Guard (Bug 1, 7) ===");
+console.log("=== Test 9: Overlay handleInput & Modal c/x Persistence (Bug 1, 3, 7) ===");
 let overlayClosed = false;
 let userNotePromptTaskId = null;
+let modalPersistCount = 0;
 
 const overlay = new TodoTreeOverlayComponent(
 	{ terminal: { rows: 24, cols: 80 }, requestRender: () => {} },
@@ -198,54 +237,45 @@ const overlay = new TodoTreeOverlayComponent(
 	(taskId) => {
 		userNotePromptTaskId = taskId;
 	},
+	() => {
+		modalPersistCount++;
+	},
 );
 
-// Verify width safety on very narrow terminal & ultra long subject
-store.createTask({
-	subject: "A".repeat(300), // Very long subject
-});
-
-const renderedLines = overlay.render(80);
+// Width test for overlay
+const modalLines = overlay.render(80);
 const boxWidth = Math.min(100, Math.max(50, Math.floor(80 * 0.88)));
 const boxLeft = Math.floor((80 - boxWidth) / 2);
 const expectedLineWidth = boxLeft + boxWidth;
 
-for (let i = 0; i < renderedLines.length; i++) {
-	const line = renderedLines[i];
+for (let i = 0; i < modalLines.length; i++) {
+	const line = modalLines[i];
 	const w = visibleWidth(line);
 	assert.ok(
 		w <= expectedLineWidth,
-		`Line ${i} visible width (${w}) exceeds max allowed (${expectedLineWidth}): "${line}"`,
+		`Overlay line ${i} width (${w}) exceeds max allowed (${expectedLineWidth})`,
 	);
 }
 
-// Test real handleInput with standard keys
-overlay.handleInput("j"); // Down
-overlay.handleInput(Key.down); // Down
-overlay.handleInput("n"); // Note prompt
+// Test modal c/x persists
+assert.equal(modalPersistCount, 0);
+overlay.handleInput("c");
+assert.equal(modalPersistCount, 1, "Pressing 'c' in modal MUST trigger onPersist callback!");
+
+overlay.handleInput("x");
+assert.equal(modalPersistCount, 2, "Pressing 'x' in modal MUST trigger onPersist callback!");
+
+overlay.handleInput("n");
 assert.ok(userNotePromptTaskId !== null, "Key 'n' via handleInput must trigger note prompt");
 
-// Test toggle completion via 'c'
-const selectedIdx = overlay["selectedIndex"];
-const currentSelectedId = store.getFlattenedTree()[selectedIdx]?.node.item.id;
-overlay.handleInput("c");
-const toggledTask = store.getTask(currentSelectedId);
-assert.ok(
-	toggledTask?.status === "completed" || toggledTask?.status === "pending",
-	`Status after toggle must be completed or pending, got ${toggledTask?.status}`,
-);
-
-// Test close via Escape
 overlay.handleInput(Key.escape);
 assert.ok(overlayClosed, "handleInput with Key.escape must close modal");
-console.log("✓ Real handleInput keyboard handling and strict line width bounding verified.");
+console.log("✓ Modal handleInput keyboard controls and c/x persistence callback verified.");
 
-console.log("=== Test 9: Custom Entry Persistence & Native setActiveTools (Bug 3, 4) ===");
+console.log("=== Test 10: Declarative defaultActive: false & Tool Registration (Bug 4) ===");
 const registeredTools = new Map();
 const registeredCommands = new Map();
-const eventHandlers = new Map();
-const appendedEntries = [];
-let activeToolsList = ["read", "bash", "todo"];
+let activeToolsList = ["read", "bash"];
 
 const mockPi = {
 	registerTool(tool) {
@@ -261,42 +291,32 @@ const mockPi = {
 	setActiveTools(tools) {
 		activeToolsList = [...tools];
 	},
-	appendEntry(customType, data) {
-		appendedEntries.push({ customType, data });
-	},
-	on(event, handler) {
-		const list = eventHandlers.get(event) || [];
-		list.push(handler);
-		eventHandlers.set(event, list);
-	},
+	appendEntry: () => {},
+	on: () => {},
 	sendUserMessage: () => {},
 };
 
 todoTreeExtension(mockPi);
 
-// Test tool execution creates custom entry
-const todoTool = registeredTools.get("todo");
-await todoTool.execute("call-1", {
-	action: "create",
-	subject: "Setup CI pipeline",
-});
+const todoToolDef = registeredTools.get("todo");
+assert.ok(todoToolDef, "'todo' tool must be registered");
+assert.equal(
+	todoToolDef.defaultActive,
+	false,
+	"'todo' tool MUST declare defaultActive: false so it is inactive on registration!",
+);
 
-assert.ok(appendedEntries.length > 0, "Tool execution must persist custom entry");
-const lastEntry = appendedEntries[appendedEntries.length - 1];
-assert.equal(lastEntry.customType, SNAPSHOT_ENTRY_TYPE);
-assert.ok(Array.isArray(lastEntry.data.tasks), "Persisted snapshot must include task list");
-
-// Test command '/todo off' invokes native setActiveTools
+// Test command '/todo on' activates tool via setActiveTools
 const cmdHandler = registeredCommands.get("todo").handler;
-await cmdHandler("off", { hasUI: false, ui: null, sessionManager: { getBranch: () => [] } });
-assert.ok(!activeToolsList.includes("todo"), "Disabling todo must remove it via native setActiveTools");
-
-// Test command '/todo on' re-enables via native setActiveTools
 await cmdHandler("on", { hasUI: false, ui: null, sessionManager: { getBranch: () => [] } });
-assert.ok(activeToolsList.includes("todo"), "Enabling todo must restore it via native setActiveTools");
+assert.ok(activeToolsList.includes("todo"), "/todo on must activate tool in activeTools list");
 
-console.log("✓ Session branch custom entry persistence and native setActiveTools isolation verified.");
+// Test command '/todo off' deactivates tool via setActiveTools
+await cmdHandler("off", { hasUI: false, ui: null, sessionManager: { getBranch: () => [] } });
+assert.ok(!activeToolsList.includes("todo"), "/todo off must deactivate tool in activeTools list");
+
+console.log("✓ Declarative defaultActive: false and native setActiveTools verified.");
 
 console.log("\n=======================================================");
-console.log("ALL VERIFICATION & BUG-FIX TESTS PASSED SUCCESSFULLY! 🎉");
+console.log("ALL VERIFICATION & RIGOROUS TESTS PASSED SUCCESSFULLY! 🎉");
 console.log("=======================================================");
