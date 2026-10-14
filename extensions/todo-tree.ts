@@ -1721,6 +1721,7 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 	pi.on("session_tree", (_event, ctx) => {
 		lastCtx = ctx;
 		restoreFromBranch(ctx);
+		syncActiveTools(config.enabled);
 		widgetComponent?.invalidate();
 	});
 

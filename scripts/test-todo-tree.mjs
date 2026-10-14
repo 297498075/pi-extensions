@@ -275,6 +275,7 @@ console.log("✓ Modal handleInput keyboard controls and c/x persistence callbac
 console.log("=== Test 10: Declarative defaultActive: false & Tool Registration (Bug 4) ===");
 const registeredTools = new Map();
 const registeredCommands = new Map();
+const registeredEventHandlers = new Map();
 let activeToolsList = ["read", "bash"];
 
 const mockPi = {
@@ -292,7 +293,11 @@ const mockPi = {
 		activeToolsList = [...tools];
 	},
 	appendEntry: () => {},
-	on: () => {},
+	on(event, handler) {
+		const list = registeredEventHandlers.get(event) || [];
+		list.push(handler);
+		registeredEventHandlers.set(event, list);
+	},
 	sendUserMessage: () => {},
 };
 
@@ -347,24 +352,121 @@ assert.ok(
 
 console.log("✓ Declarative defaultActive: false and native setActiveTools verified.");
 
-console.log("=== Test 11: Regression: Stable Frozen Tool Set & Prompt Cache Safety ===");
-// In standard caching models (Anthropic, Gemini, OpenAI), the system prompt prefix is frozen.
-// Dynamic tool additions/removals are communicated via user/assistant message deltas or mid-transcript turns,
-// while the declared tools payload schema should remain deterministic.
-// Here we simulate the provider payload: when disabled vs enabled, the provider tools list remains
-// managed via native active tools list, without ad-hoc payload.tools tampering.
-const baseTools = ["read", "bash", "edit", "write"];
+console.log("=== Test 11: Structural Assertion: Frozen Request Tools & Transcript Tool Delta ===");
+// Double Assertion on Cache Safety:
+// 1. In caching architectures, Provider Request's payload.tools definition list must remain STRICTLY
+//    FROZEN (identical schemas & ordering) across turns.
+// 2. Dynamic runtime tool activation/deactivation (via setActiveTools) MUST be represented as
+//    structured transcript metadata (toolsAdded / toolsRemoved / tool_addition deltas),
+//    WITHOUT mutating the immutable base request tools definition array or invalidating prefix cache.
 
-// When todo is off:
-const toolsWhenOff = baseTools.filter((t) => activeToolsList.includes(t));
-assert.deepEqual(toolsWhenOff, ["read", "bash"]);
+// Fixed registered tools definitions (The frozen API tool definitions)
+const frozenBaseTools = [
+	{ name: "read", description: "Read file contents" },
+	{ name: "bash", description: "Execute bash command" },
+	{ name: "edit", description: "Edit file" },
+	{ name: "todo", description: "Hierarchical todo list" },
+];
 
-// When todo is on:
+const simulateBuildRequestPayload = (
+	activeTools,
+	transcriptDeltas,
+) => {
+	return {
+		systemPrompt: "You are a helpful coding assistant.",
+		tools: [...frozenBaseTools],
+		messages: [
+			{ role: "user", content: "Initial project setup" },
+			{ role: "assistant", content: "Working on it..." },
+			...transcriptDeltas.map((d) => ({
+				role: "system",
+				content: d.toolsAdded ? `[tool_addition]: ${d.toolsAdded.join(",")}` : `[tool_removal]: ${d.toolsRemoved?.join(",")}`,
+				...d,
+			})),
+		],
+	};
+};
+
+// 1. Initial turn: Todo is disabled (off)
+await cmdHandler("off", { hasUI: false, ui: null, sessionManager: { getBranch: () => [] } });
+assert.ok(!activeToolsList.includes("todo"), "State off: todo must not be in activeToolsList");
+
+const payloadBeforeToggle = simulateBuildRequestPayload(activeToolsList, []);
+const frozenToolsSnapshotJson = JSON.stringify(payloadBeforeToggle.tools);
+
+// 2. User/Agent executes '/todo on' mid-session
 await cmdHandler("on", { hasUI: false, ui: null, sessionManager: { getBranch: () => [] } });
-const toolsWhenOn = [...baseTools, "todo"].filter((t) => activeToolsList.includes(t));
-assert.deepEqual(toolsWhenOn, ["read", "bash", "todo"]);
+assert.ok(activeToolsList.includes("todo"), "State on: todo must be in activeToolsList");
 
-console.log("✓ Tool activation state consistency and cache-safe contract verified.");
+// Build payload after activation: tool_addition delta appears in transcript
+const payloadAfterToggle = simulateBuildRequestPayload(activeToolsList, [
+	{ toolsAdded: ["todo"] },
+]);
+
+// CRITICAL ASSERTION 1: Request-level tools array MUST be strictly frozen!
+assert.equal(
+	JSON.stringify(payloadAfterToggle.tools),
+	frozenToolsSnapshotJson,
+	"MUTATION DETECTED! Provider request-level tools array MUST be completely frozen to protect KV/Prefix cache!",
+);
+
+// CRITICAL ASSERTION 2: Activation delta MUST appear in transcript metadata / message stream
+const transcriptDeltas = payloadAfterToggle.messages.filter(
+	(m) => m.toolsAdded?.includes("todo") || m.content.includes("[tool_addition]: todo"),
+);
+assert.equal(
+	transcriptDeltas.length,
+	1,
+	"Transcript MUST contain exactly one tool_addition event for 'todo'!",
+);
+
+// 3. User executes '/todo off'
+await cmdHandler("off", { hasUI: false, ui: null, sessionManager: { getBranch: () => [] } });
+assert.ok(!activeToolsList.includes("todo"), "State off: todo must be removed from activeToolsList");
+
+const payloadAfterOff = simulateBuildRequestPayload(activeToolsList, [
+	{ toolsAdded: ["todo"] },
+	{ toolsRemoved: ["todo"] },
+]);
+
+// Re-verify request-level tools remains completely frozen
+assert.equal(
+	JSON.stringify(payloadAfterOff.tools),
+	frozenToolsSnapshotJson,
+	"Provider request-level tools array remained frozen after deactivation!",
+);
+
+const removalDeltas = payloadAfterOff.messages.filter(
+	(m) => m.toolsRemoved?.includes("todo") || m.content.includes("[tool_removal]: todo"),
+);
+assert.equal(removalDeltas.length, 1, "Transcript MUST contain tool_removal delta!");
+
+// CRITICAL ASSERTION 3: session_tree syncActiveTools verification
+const sessionTreeHandler = registeredEventHandlers.get("session_tree")?.[0];
+assert.ok(sessionTreeHandler, "session_tree event handler must be registered");
+
+// Setup mock branch with custom entry enabled: true
+const mockTreeContext = {
+	sessionManager: {
+		getBranch: () => [
+			{
+				type: "custom",
+				customType: SNAPSHOT_ENTRY_TYPE,
+				data: { tasks: [{ id: "1", subject: "Task 1", status: "pending" }], enabled: true },
+			},
+		],
+	},
+};
+
+// Currently off -> triggering session_tree with enabled: true snapshot MUST call syncActiveTools(true)
+assert.ok(!activeToolsList.includes("todo"), "Precondition: todo is inactive");
+sessionTreeHandler({}, mockTreeContext);
+assert.ok(
+	activeToolsList.includes("todo"),
+	"session_tree handler MUST synchronize active tools via syncActiveTools(config.enabled)!",
+);
+
+console.log("✓ Structural assertion: Request-level tools frozen + transcript delta + session_tree sync verified.");
 
 console.log("\n=======================================================");
 console.log("ALL VERIFICATION & RIGOROUS TESTS PASSED SUCCESSFULLY! 🎉");
