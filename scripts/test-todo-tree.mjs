@@ -437,6 +437,59 @@ await cmdHandler("status", {
 assert.ok(statusCustomOpened, "/todo status in interactive mode must open lightweight custom modal");
 console.log("✓ Lightweight status modal component rendering and close interaction verified.");
 
+console.log("=== Test 13: Auto-clear previous finished tasks on new batch_create (Strategy A) ===");
+// Reset store and mark all as completed
+const testStore = new TodoTreeStore();
+testStore.batchCreate([
+	{ id: "1", subject: "Old finished parent", status: "completed" },
+	{ id: "1.1", parentId: "1", subject: "Old finished child", status: "completed" },
+]);
+assert.equal(testStore.getProgressStats().percent, 100);
+
+// Invoke batch_create on todoToolDef via execute
+const mockCtxWithFullFinished = {
+	sessionManager: { getBranch: () => [] },
+};
+
+// We test tool execute logic with mock environment
+const registeredExecute = todoToolDef.execute;
+// Clear store first
+await registeredExecute("call-clear", { action: "clear" });
+
+// First, populate the extension's internal store by creating tasks
+await registeredExecute("call-1", {
+	action: "batch_create",
+	tasks: [
+		{ id: "1", subject: "Phase 1 Root", status: "completed" },
+		{ id: "1.1", parentId: "1", subject: "Phase 1 Sub", status: "completed" },
+	],
+});
+
+// Verify 100% done
+const listBefore = await registeredExecute("call-2", { action: "list" });
+assert.ok(listBefore.content[0].text.includes("100%"), "Must be 100% completed");
+
+// Initiate new batch_create with a new root task -> MUST automatically clear old tasks!
+const resultNewBatch = await registeredExecute("call-3", {
+	action: "batch_create",
+	tasks: [
+		{ id: "1", subject: "Phase 2 New Root", status: "pending" },
+		{ id: "1.1", parentId: "1", subject: "Phase 2 New Sub", status: "in_progress" },
+	],
+});
+
+assert.ok(
+	resultNewBatch.content[0].text.includes("Cleared previous finished tasks"),
+	"Summary must report that previous finished tasks were cleared",
+);
+
+// Check tasks snapshot
+const newTasks = resultNewBatch.details.tasks;
+assert.equal(newTasks.length, 2, "Only new tasks should exist in the tree now");
+assert.equal(newTasks[0].subject, "Phase 2 New Root");
+assert.equal(newTasks[1].subject, "Phase 2 New Sub");
+console.log("✓ Strategy A (Auto-clearing finished tasks on new root batch_create) verified.");
+
 console.log("\n=======================================================");
 console.log("ALL VERIFICATION & RIGOROUS TESTS PASSED SUCCESSFULLY! 🎉");
 console.log("=======================================================");

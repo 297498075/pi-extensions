@@ -1535,7 +1535,8 @@ GUIDELINES:
 2. Mark leaf subtasks as 'in_progress' when you start working on them. Multiple subtasks can be in progress simultaneously if working on them in parallel.
 3. Update subtasks to 'completed' as soon as they are implemented and verified.
 4. If scope changes or a task is no longer needed, mark it as 'cancelled' rather than leaving it stalled. Cancelled tasks do not block overall progress.
-5. You can create subtasks under any existing parent task at any time using parentId.
+5. When all previous tasks are 100% completed, initiating a new batch_create with top-level tasks will automatically archive/clear finished tasks and start a fresh tree.
+6. You can create subtasks under any existing parent task at any time using parentId.
 `.trim();
 
 // ============================================================================
@@ -1835,8 +1836,32 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 						if (!params.tasks || !Array.isArray(params.tasks) || params.tasks.length === 0) {
 							throw new Error("Array 'tasks' is required and cannot be empty for 'batch_create'.");
 						}
+
+						// Strategy A: If all existing tasks are completed/cancelled (100% done)
+						// and a new batch_create is initiated, automatically clear the old finished tasks
+						// to keep the view clean, avoid endless scrolling, and prevent snapshot bloating.
+						const existingTasks = store.getAllTasks();
+						let autoCleared = false;
+						if (existingTasks.length > 0) {
+							const stats = store.getProgressStats();
+							const allFinished =
+								stats.total > 0 &&
+								stats.completed === stats.total &&
+								stats.inProgress === 0 &&
+								stats.pending === 0;
+
+							// Also ensure new batch has at least one top-level task (initiating a new plan)
+							const hasNewRoot = params.tasks.some((t) => !t.parentId);
+							if (allFinished && hasNewRoot) {
+								store.clear();
+								autoCleared = true;
+							}
+						}
+
 						const created = store.batchCreate(params.tasks);
-						summary = `✓ Batch created ${created.length} tasks`;
+						summary = autoCleared
+							? `✓ Cleared previous finished tasks & started new tree with ${created.length} tasks`
+							: `✓ Batch created ${created.length} tasks`;
 						break;
 					}
 
