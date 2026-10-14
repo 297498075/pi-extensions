@@ -1,14 +1,17 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Component, KeyId, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 
 // ============================================================================
-// 1. Data Models & Schemas
+// 1. Data Models & Constants
 // ============================================================================
+
+export const SNAPSHOT_ENTRY_TYPE = "todo-tree-state";
+export const MAX_TREE_DEPTH = 32;
 
 export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
 
@@ -45,6 +48,23 @@ export interface ProgressStats {
 	pending: number;
 	cancelled: number;
 	percent: number;
+}
+
+export function sanitizeText(text: string): string {
+	if (!text) return "";
+	return text
+		// Strip OSC escape sequences (e.g. \x1b]0;title\x07)
+		.replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, "")
+		// Strip CSI escape sequences (e.g. \x1b[2J, color codes)
+		.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+		// Replace linebreaks and tabs with space
+		.replace(/[\r\n\t]/g, " ")
+		// Strip unprintable ASCII control characters
+		// eslint-disable-next-line no-control-regex
+		.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "")
+		// Collapse multiple spaces
+		.replace(/\s+/g, " ")
+		.trim();
 }
 
 // TypeBox Schema for LLM Tool
@@ -137,7 +157,7 @@ export interface TodoTreeConfig {
 }
 
 const DEFAULT_CONFIG: TodoTreeConfig = {
-	enabled: false, // Default off: small tasks don't need todo list
+	enabled: false,
 	shortcut: "ctrl+shift+t",
 };
 
@@ -172,13 +192,19 @@ function saveConfig(config: TodoTreeConfig): void {
 }
 
 // ============================================================================
-// 3. State Store (Hierarchical Tree)
+// 3. State Store (Hierarchical Tree with Dual-Direction Linkage & Caches)
 // ============================================================================
 
 export class TodoTreeStore {
 	private tasks = new Map<string, TodoItem>();
 	private collapsedNodes = new Set<string>();
 	private listeners: Array<() => void> = [];
+
+	// Performance Caching
+	private isDirty = true;
+	private cachedStats: ProgressStats | null = null;
+	private cachedFlattenedTree: Array<{ node: TreeNode; hasChildren: boolean }> | null = null;
+	private cachedActiveTasks: Array<{ task: TodoItem; breadcrumb: string }> | null = null;
 
 	subscribe(fn: () => void): () => void {
 		this.listeners.push(fn);
@@ -187,7 +213,15 @@ export class TodoTreeStore {
 		};
 	}
 
+	private markDirty(): void {
+		this.isDirty = true;
+		this.cachedStats = null;
+		this.cachedFlattenedTree = null;
+		this.cachedActiveTasks = null;
+	}
+
 	private notify(): void {
+		this.markDirty();
 		for (const listener of this.listeners) {
 			try {
 				listener();
@@ -215,26 +249,72 @@ export class TodoTreeStore {
 		} else {
 			this.collapsedNodes.add(id);
 		}
-		this.notify();
+		this.cachedFlattenedTree = null;
+		for (const listener of this.listeners) {
+			try {
+				listener();
+			} catch (e) {
+				console.error("[todo-tree] listener error:", e);
+			}
+		}
 	}
 
 	loadSnapshot(items: TodoItem[]): void {
 		this.tasks.clear();
+		this.collapsedNodes.clear();
+
+		// Validation & sanitization: filter out cyclical or orphan references
+		const tempMap = new Map<string, TodoItem>();
 		for (const item of items) {
 			if (item && item.id) {
-				this.tasks.set(item.id, {
+				tempMap.set(item.id, {
 					...item,
+					subject: sanitizeText(item.subject),
+					description: item.description ? sanitizeText(item.description) : undefined,
 					status: item.status ?? "pending",
-					notes: Array.isArray(item.notes) ? item.notes : [],
+					notes: Array.isArray(item.notes)
+						? item.notes.map((n) => ({ ...n, text: sanitizeText(n.text) }))
+						: [],
 				});
 			}
 		}
+
+		// Cycle & depth guard
+		for (const [id, item] of tempMap.entries()) {
+			if (item.parentId) {
+				let currParentId: string | null | undefined = item.parentId;
+				let depth = 0;
+				const seen = new Set<string>([id]);
+				let hasCycle = false;
+
+				while (currParentId) {
+					if (seen.has(currParentId)) {
+						hasCycle = true;
+						break;
+					}
+					seen.add(currParentId);
+					const p = tempMap.get(currParentId);
+					currParentId = p?.parentId;
+					depth++;
+					if (depth > MAX_TREE_DEPTH) {
+						hasCycle = true;
+						break;
+					}
+				}
+
+				if (hasCycle || !tempMap.has(item.parentId)) {
+					// Detach invalid/cyclical parent
+					item.parentId = null;
+				}
+			}
+			this.tasks.set(id, item);
+		}
+
 		this.notify();
 	}
 
 	generateNextId(parentId?: string | null): string {
 		if (!parentId) {
-			// Find max root integer
 			let maxRoot = 0;
 			for (const task of this.tasks.values()) {
 				if (!task.parentId) {
@@ -247,7 +327,6 @@ export class TodoTreeStore {
 			return String(maxRoot + 1);
 		}
 
-		// Find children of parentId
 		let maxChild = 0;
 		for (const task of this.tasks.values()) {
 			if (task.parentId === parentId) {
@@ -275,17 +354,35 @@ export class TodoTreeStore {
 			throw new Error(`Parent task "#${parentId}" not found.`);
 		}
 
+		// Depth check
+		if (parentId) {
+			let depth = 1;
+			let curr = this.tasks.get(parentId);
+			while (curr?.parentId) {
+				depth++;
+				if (depth >= MAX_TREE_DEPTH) {
+					throw new Error(`Exceeded maximum tree depth (${MAX_TREE_DEPTH}).`);
+				}
+				curr = this.tasks.get(curr.parentId);
+			}
+		}
+
 		const id = params.id?.trim() || this.generateNextId(parentId);
 		if (this.tasks.has(id)) {
 			throw new Error(`Task with ID "#${id}" already exists.`);
+		}
+
+		const cleanSubject = sanitizeText(params.subject);
+		if (!cleanSubject) {
+			throw new Error("Task subject cannot be empty.");
 		}
 
 		const now = Date.now();
 		const item: TodoItem = {
 			id,
 			parentId,
-			subject: params.subject.trim(),
-			description: params.description?.trim(),
+			subject: cleanSubject,
+			description: params.description ? sanitizeText(params.description) : undefined,
 			status: params.status ?? "pending",
 			notes: [],
 			createdAt: now,
@@ -327,18 +424,33 @@ export class TodoTreeStore {
 			throw new Error(`Task "#${id}" not found.`);
 		}
 
-		if (patch.subject !== undefined) task.subject = patch.subject.trim();
-		if (patch.description !== undefined) task.description = patch.description.trim();
+		if (
+			patch.subject === undefined &&
+			patch.description === undefined &&
+			patch.status === undefined &&
+			patch.note === undefined
+		) {
+			throw new Error("Update requires at least one mutable field (subject, description, status, or note).");
+		}
+
+		if (patch.subject !== undefined) {
+			const cleanSub = sanitizeText(patch.subject);
+			if (!cleanSub) throw new Error("Task subject cannot be empty.");
+			task.subject = cleanSub;
+		}
+		if (patch.description !== undefined) {
+			task.description = sanitizeText(patch.description);
+		}
+
 		if (patch.status !== undefined) {
-			const prevStatus = task.status;
 			task.status = patch.status;
 
-			// Cascade if parent is cancelled or completed
+			// Cascade to children if cancelled or completed, BUT protect already completed subtasks!
 			if (patch.status === "cancelled" || patch.status === "completed") {
 				this.cascadeChildrenStatus(id, patch.status);
 			}
 
-			// Parent status linkage
+			// Parent status linkage (dual direction)
 			if (task.parentId) {
 				this.checkParentStatus(task.parentId);
 			}
@@ -349,7 +461,7 @@ export class TodoTreeStore {
 			task.notes.push({
 				id: `note-${Date.now()}`,
 				author: "agent",
-				text: patch.note.trim(),
+				text: sanitizeText(patch.note),
 				createdAt: Date.now(),
 			});
 		}
@@ -362,11 +474,14 @@ export class TodoTreeStore {
 	addUserNote(id: string, text: string): void {
 		const task = this.tasks.get(id);
 		if (!task) return;
+		const clean = sanitizeText(text);
+		if (!clean) return;
+
 		task.notes = task.notes || [];
 		task.notes.push({
 			id: `note-${Date.now()}`,
 			author: "user",
-			text: text.trim(),
+			text: clean,
 			createdAt: Date.now(),
 		});
 		task.updatedAt = Date.now();
@@ -377,11 +492,13 @@ export class TodoTreeStore {
 		const task = this.tasks.get(id);
 		if (!task) return;
 
-		// Recursively delete children
 		const toDelete: string[] = [id];
+		const visited = new Set<string>([id]);
+
 		const collectChildren = (parentId: string) => {
 			for (const t of this.tasks.values()) {
-				if (t.parentId === parentId) {
+				if (t.parentId === parentId && !visited.has(t.id)) {
+					visited.add(t.id);
 					toDelete.push(t.id);
 					collectChildren(t.id);
 				}
@@ -406,20 +523,37 @@ export class TodoTreeStore {
 		this.notify();
 	}
 
-	private cascadeChildrenStatus(parentId: string, newStatus: TodoStatus): void {
+	private cascadeChildrenStatus(
+		parentId: string,
+		newStatus: TodoStatus,
+		visited = new Set<string>(),
+	): void {
+		if (visited.has(parentId)) return;
+		visited.add(parentId);
+
 		for (const t of this.tasks.values()) {
 			if (t.parentId === parentId) {
-				if (t.status !== "completed" && t.status !== "cancelled") {
+				// Safety rule: Never overwrite an already completed task with cancelled!
+				if (newStatus === "cancelled" && t.status === "completed") {
+					continue;
+				}
+				if (t.status !== newStatus) {
 					t.status = newStatus;
 					t.updatedAt = Date.now();
-					this.cascadeChildrenStatus(t.id, newStatus);
+					this.cascadeChildrenStatus(t.id, newStatus, visited);
 				}
 			}
 		}
 	}
 
-	private checkParentStatus(parentId: string | null | undefined): void {
+	private checkParentStatus(
+		parentId: string | null | undefined,
+		visited = new Set<string>(),
+	): void {
 		if (!parentId) return;
+		if (visited.has(parentId)) return;
+		visited.add(parentId);
+
 		const parent = this.tasks.get(parentId);
 		if (!parent) return;
 
@@ -432,21 +566,34 @@ export class TodoTreeStore {
 
 		if (children.length === 0) return;
 
-		const allDone = children.every(
-			(c) => c.status === "completed" || c.status === "cancelled",
-		);
-		const anyInProgress = children.some((c) => c.status === "in_progress");
-
-		if (allDone && children.some((c) => c.status === "completed")) {
-			parent.status = "completed";
+		// Pure state deduction
+		const allCancelled = children.every((c) => c.status === "cancelled");
+		if (allCancelled) {
+			parent.status = "cancelled";
 			parent.updatedAt = Date.now();
-		} else if (anyInProgress && parent.status === "pending") {
-			parent.status = "in_progress";
+		} else {
+			const activeChildren = children.filter((c) => c.status !== "cancelled");
+			const allCompleted =
+				activeChildren.length > 0 &&
+				activeChildren.every((c) => c.status === "completed");
+			const anyInProgress = activeChildren.some((c) => c.status === "in_progress");
+			const anyCompleted = activeChildren.some((c) => c.status === "completed");
+			const allPending = activeChildren.every((c) => c.status === "pending");
+
+			if (allCompleted) {
+				parent.status = "completed";
+			} else if (anyInProgress || anyCompleted) {
+				// Partial completion or running -> in_progress
+				parent.status = "in_progress";
+			} else if (allPending) {
+				// Re-opened tasks cascade back to pending!
+				parent.status = "pending";
+			}
 			parent.updatedAt = Date.now();
 		}
 
 		if (parent.parentId) {
-			this.checkParentStatus(parent.parentId);
+			this.checkParentStatus(parent.parentId, visited);
 		}
 	}
 
@@ -464,7 +611,6 @@ export class TodoTreeStore {
 			}
 		}
 
-		// Sort naturally by ID
 		const sortFn = (a: TodoItem, b: TodoItem) =>
 			a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: "base" });
 
@@ -473,19 +619,24 @@ export class TodoTreeStore {
 			list.sort(sortFn);
 		}
 
+		const visited = new Set<string>();
+
 		const buildNode = (
 			item: TodoItem,
 			depth: number,
 			isLastChild: boolean,
 			ancestorHasNextSibling: boolean[],
 		): TreeNode => {
-			const childrenItems = childMap.get(item.id) || [];
+			visited.add(item.id);
+			const childrenItems = (childMap.get(item.id) || []).filter((c) => !visited.has(c.id));
 			const childrenNodes: TreeNode[] = [];
 
-			for (let i = 0; i < childrenItems.length; i++) {
-				const isLast = i === childrenItems.length - 1;
-				const nextAncestors = [...ancestorHasNextSibling, !isLast];
-				childrenNodes.push(buildNode(childrenItems[i], depth + 1, isLast, nextAncestors));
+			if (depth < MAX_TREE_DEPTH) {
+				for (let i = 0; i < childrenItems.length; i++) {
+					const isLast = i === childrenItems.length - 1;
+					const nextAncestors = [...ancestorHasNextSibling, !isLast];
+					childrenNodes.push(buildNode(childrenItems[i], depth + 1, isLast, nextAncestors));
+				}
 			}
 
 			return {
@@ -503,6 +654,10 @@ export class TodoTreeStore {
 	}
 
 	getFlattenedTree(): Array<{ node: TreeNode; hasChildren: boolean }> {
+		if (this.cachedFlattenedTree && !this.isDirty) {
+			return this.cachedFlattenedTree;
+		}
+
 		const result: Array<{ node: TreeNode; hasChildren: boolean }> = [];
 		const tree = this.buildTree();
 
@@ -519,13 +674,17 @@ export class TodoTreeStore {
 		for (const root of tree) {
 			traverse(root);
 		}
+
+		this.cachedFlattenedTree = result;
 		return result;
 	}
 
 	getActiveInProgressTasks(): Array<{ task: TodoItem; breadcrumb: string }> {
-		const result: Array<{ task: TodoItem; breadcrumb: string }> = [];
+		if (this.cachedActiveTasks && !this.isDirty) {
+			return this.cachedActiveTasks;
+		}
 
-		// Collect all IDs that are parents
+		const result: Array<{ task: TodoItem; breadcrumb: string }> = [];
 		const parentIds = new Set<string>();
 		for (const t of this.tasks.values()) {
 			if (t.parentId) parentIds.add(t.parentId);
@@ -533,8 +692,7 @@ export class TodoTreeStore {
 
 		for (const task of this.tasks.values()) {
 			if (task.status === "in_progress") {
-				// If this task has children and any child is in_progress, skip the parent
-				// so we only show the concrete active subtasks
+				// If parent has children that are in_progress, display leaf subtasks
 				const hasChildren = parentIds.has(task.id);
 				let hasActiveChild = false;
 				if (hasChildren) {
@@ -549,12 +707,18 @@ export class TodoTreeStore {
 					continue;
 				}
 
-				// Build breadcrumb
+				// Build breadcrumb with cycle and depth guard
 				const path: string[] = [];
+				const visited = new Set<string>([task.id]);
 				let curr: TodoItem | undefined = task;
-				while (curr?.parentId) {
+				let depth = 0;
+
+				while (curr?.parentId && depth < MAX_TREE_DEPTH) {
+					if (visited.has(curr.parentId)) break;
+					visited.add(curr.parentId);
 					curr = this.tasks.get(curr.parentId);
 					if (curr) path.unshift(curr.subject);
+					depth++;
 				}
 
 				const breadcrumb = path.length > 0 ? `[${path.join(" > ")}] ` : "";
@@ -565,22 +729,28 @@ export class TodoTreeStore {
 		result.sort((a, b) =>
 			a.task.id.localeCompare(b.task.id, undefined, { numeric: true }),
 		);
+
+		this.cachedActiveTasks = result;
 		return result;
 	}
 
 	getProgressStats(): ProgressStats {
+		if (this.cachedStats && !this.isDirty) {
+			return this.cachedStats;
+		}
+
 		let total = 0;
 		let completed = 0;
 		let inProgress = 0;
 		let pending = 0;
 		let cancelled = 0;
 
-		// Calculate progress over leaf nodes (or all nodes if no hierarchy)
 		const parentIds = new Set<string>();
 		for (const t of this.tasks.values()) {
 			if (t.parentId) parentIds.add(t.parentId);
 		}
 
+		// Progress is driven by concrete execution items (leaves)
 		for (const t of this.tasks.values()) {
 			const isLeaf = !parentIds.has(t.id);
 			if (isLeaf) {
@@ -595,7 +765,7 @@ export class TodoTreeStore {
 		const activeTotal = total - cancelled;
 		const percent = activeTotal > 0 ? Math.round((completed / activeTotal) * 100) : 0;
 
-		return {
+		const stats: ProgressStats = {
 			total: activeTotal,
 			completed,
 			inProgress,
@@ -603,6 +773,9 @@ export class TodoTreeStore {
 			cancelled,
 			percent,
 		};
+
+		this.cachedStats = stats;
+		return stats;
 	}
 }
 
@@ -640,6 +813,7 @@ export class TodoTreeWidgetComponent implements Component {
 	private theme: any;
 	private store: TodoTreeStore;
 	private onOpenModal: () => void;
+	private unsubscribeStore: () => void;
 	private cachedLines: string[] | null = null;
 	private cachedWidth = 0;
 
@@ -649,10 +823,14 @@ export class TodoTreeWidgetComponent implements Component {
 		this.store = store;
 		this.onOpenModal = onOpenModal;
 
-		this.store.subscribe(() => {
+		this.unsubscribeStore = this.store.subscribe(() => {
 			this.invalidate();
 			this.tui?.requestRender?.();
 		});
+	}
+
+	dispose(): void {
+		this.unsubscribeStore();
 	}
 
 	invalidate(): void {
@@ -691,7 +869,7 @@ export class TodoTreeWidgetComponent implements Component {
 		const tagStyled = this.theme.fg("accent", tagText);
 		const barStyled = this.theme.fg("accent", barText);
 
-		let prefix = ` ${dotGlyph} ${tagStyled} ${barStyled} `;
+		const prefix = ` ${dotGlyph} ${tagStyled} ${barStyled} `;
 		const prefixLen = visibleWidth(` ● ${tagText} ${barText} `);
 
 		const availableForSubject = Math.max(10, width - prefixLen - buttonWidth - 2);
@@ -708,7 +886,7 @@ export class TodoTreeWidgetComponent implements Component {
 
 			lines.push(`${prefix}${subjectStyled}${" ".repeat(padLen)}${btnStyled}`);
 
-			// Requirements: All in_progress tasks must be displayed without limit!
+			// Display all parallel in-progress tasks
 			for (let i = 1; i < activeItems.length; i++) {
 				const item = activeItems[i];
 				const glyph = this.theme.fg("accent", "  └─ ◐ ");
@@ -717,7 +895,6 @@ export class TodoTreeWidgetComponent implements Component {
 				lines.push(`${glyph}${this.theme.fg("text", trunc)}`);
 			}
 		} else {
-			// No active task currently in progress
 			const statusMsg =
 				stats.completed === stats.total && stats.total > 0
 					? "All tasks completed"
@@ -736,15 +913,11 @@ export class TodoTreeWidgetComponent implements Component {
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-		if (event.type === "click") {
-			// Click on line 0 rightmost area or anywhere on the widget can trigger the modal
+		if (event.type === "click" && event.button === "left") {
 			const width = this.cachedWidth || 80;
-			if (event.y === 0 && event.x >= width - 8) {
-				this.onOpenModal();
-				return { handled: true };
-			}
-			// If double click anywhere on the widget, also open modal
-			if (event.button === "left" && event.x >= 0 && event.x <= width) {
+			const buttonWidth = visibleWidth("[📋 ]");
+			// Accurate hit test: Only click on the right button area triggers modal!
+			if (event.y === 0 && event.x >= width - buttonWidth - 2 && event.x <= width) {
 				this.onOpenModal();
 				return { handled: true };
 			}
@@ -773,7 +946,6 @@ export class TodoTreeOverlayComponent implements Component {
 	private boxWidth = 0;
 	private boxHeight = 0;
 	private listHeight = 10;
-	private lastWidth = 80;
 
 	constructor(
 		tui: any,
@@ -788,7 +960,6 @@ export class TodoTreeOverlayComponent implements Component {
 		this.onClose = onClose;
 		this.onPromptUserNote = onPromptUserNote;
 
-		// Select first in-progress task if available
 		const flat = this.store.getFlattenedTree();
 		const inProgIdx = flat.findIndex((f) => f.node.item.status === "in_progress");
 		if (inProgIdx >= 0) {
@@ -797,14 +968,12 @@ export class TodoTreeOverlayComponent implements Component {
 	}
 
 	invalidate(): void {
-		// Stateless render calculation
+		// Stateless render pass
 	}
 
 	render(width: number): string[] {
-		this.lastWidth = width;
 		const totalLines = this.tui?.terminal?.rows || 24;
 
-		// Calculate modal dimensions (centered)
 		this.boxWidth = Math.min(100, Math.max(50, Math.floor(width * 0.88)));
 		this.boxHeight = Math.min(32, Math.max(14, Math.floor(totalLines * 0.82)));
 		this.boxLeft = Math.max(0, Math.floor((width - this.boxWidth) / 2));
@@ -813,10 +982,8 @@ export class TodoTreeOverlayComponent implements Component {
 		const flat = this.store.getFlattenedTree();
 		const stats = this.store.getProgressStats();
 
-		// Header lines: 3, Footer lines: 4. Available for tree list:
 		this.listHeight = Math.max(4, this.boxHeight - 7);
 
-		// Clamp selectedIndex & scrollTop
 		if (this.selectedIndex >= flat.length) this.selectedIndex = Math.max(0, flat.length - 1);
 		if (this.selectedIndex < 0) this.selectedIndex = 0;
 
@@ -832,7 +999,7 @@ export class TodoTreeOverlayComponent implements Component {
 		const lines: string[] = [];
 		const innerWidth = this.boxWidth - 2;
 
-		// Top border
+		// 1. Top border
 		const titleStr = " 📋 Todo Tree ";
 		const hintStr = " [Esc/q: Close · ↑/↓: Move] ";
 		const topBorderDash = Math.max(
@@ -848,32 +1015,40 @@ export class TodoTreeOverlayComponent implements Component {
 
 		lines.push(`${" ".repeat(this.boxLeft)}${topBorder}`);
 
-		// Stats line
-		const statsText = ` Progress: ${stats.completed}/${stats.total} done (${stats.percent}%) · ${stats.inProgress} in progress · ${stats.pending} pending · ${stats.cancelled} cancelled`;
-		const statsBar = ` ${renderProgressBar(stats.percent, 12)} `;
-		const statPad = Math.max(0, innerWidth - visibleWidth(statsText) - visibleWidth(statsBar));
+		// 2. Stats line with responsive fallback
+		const statsBar = `${renderProgressBar(stats.percent, 10)} `;
+		let statsText = `Progress: ${stats.completed}/${stats.total} (${stats.percent}%) · ${stats.inProgress} active · ${stats.pending} pending`;
+		if (stats.cancelled > 0) {
+			statsText += ` · ${stats.cancelled} cancelled`;
+		}
+
+		const statContentAvailable = Math.max(4, innerWidth - visibleWidth(statsBar) - 2);
+		const truncStatsText = truncateToWidth(statsText, statContentAvailable);
+		const statPad = Math.max(0, innerWidth - 2 - visibleWidth(truncStatsText) - visibleWidth(statsBar));
 		const statLine =
-			this.theme.fg("accent", "│") +
-			this.theme.fg("text", statsText) +
+			this.theme.fg("accent", "│ ") +
+			this.theme.fg("text", truncStatsText) +
 			" ".repeat(statPad) +
 			this.theme.fg("accent", statsBar) +
 			this.theme.fg("accent", "│");
 		lines.push(`${" ".repeat(this.boxLeft)}${statLine}`);
 
-		// Divider
+		// 3. Divider
 		lines.push(`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "├" + "─".repeat(innerWidth) + "┤")}`);
 
-		// Tree list with scrollbar
+		// 4. Tree list rows
 		const visibleRows = flat.slice(this.scrollTop, this.scrollTop + this.listHeight);
 		const scrollbarActive = flat.length > this.listHeight;
 
-		// Scrollbar thumb calculation
 		const thumbHeight = scrollbarActive
 			? Math.max(1, Math.round((this.listHeight / flat.length) * this.listHeight))
 			: 0;
 		const thumbTop = scrollbarActive && maxScroll > 0
 			? Math.round((this.scrollTop / maxScroll) * (this.listHeight - thumbHeight))
 			: 0;
+
+		// Each row interior = innerWidth - (scrollbarActive ? 1 : 0)
+		const rowInteriorWidth = innerWidth - (scrollbarActive ? 1 : 0);
 
 		for (let row = 0; row < this.listHeight; row++) {
 			let lineContent = "";
@@ -884,73 +1059,75 @@ export class TodoTreeOverlayComponent implements Component {
 				const { node, hasChildren } = visibleRows[row];
 				const item = node.item;
 
-				// Tree prefix formatting
 				let treePrefix = "";
 				for (let d = 0; d < node.depth; d++) {
 					treePrefix += node.ancestorHasNextSibling[d] ? "│  " : "   ";
 				}
 				treePrefix += node.depth === 0 ? "" : node.isLastChild ? "└─ " : "├─ ";
 
-				// Fold indicator
 				const foldIcon = hasChildren
 					? this.store.isCollapsed(item.id)
 						? "▶ "
 						: "▼ "
 					: "  ";
 
-				// Status glyph
 				const { glyph, colorKey } = getStatusGlyph(item.status);
 				const glyphStyled = this.theme.fg(colorKey, glyph);
 
-				// Notes badge
 				const noteBadge =
 					item.notes && item.notes.length > 0
 						? this.theme.fg("warning", ` 💬(${item.notes.length})`)
 						: "";
+				const noteBadgeWidth = visibleWidth(noteBadge);
 
-				// Task Subject
 				const idStr = `#${item.id} `;
-				const subjectStr = item.subject;
+				const pointerPrefix = isSelected ? "> " : "  ";
 
-				const rawRowText = ` ${treePrefix}${foldIcon}${glyph} ${idStr}${subjectStr}`;
-				const maxTextWidth = innerWidth - (scrollbarActive ? 2 : 1);
-				const truncated = truncateToWidth(rawRowText, maxTextWidth);
+				const fixedWidth =
+					visibleWidth(pointerPrefix) +
+					visibleWidth(treePrefix) +
+					visibleWidth(foldIcon) +
+					visibleWidth(glyph) +
+					1 +
+					visibleWidth(idStr) +
+					noteBadgeWidth;
 
-				// Apply styles
-				let styledText =
-					` ${this.theme.fg("muted", treePrefix)}` +
-					`${this.theme.fg("accent", foldIcon)}` +
-					`${glyphStyled} ` +
-					`${this.theme.fg("accent", idStr)}`;
+				// Strictly truncate subjectStr to prevent overflowing width
+				const availableSubjectWidth = Math.max(4, rowInteriorWidth - fixedWidth - 1);
+				const truncatedSubject = truncateToWidth(item.subject, availableSubjectWidth);
 
+				let styledSubject = "";
 				if (item.status === "completed" || item.status === "cancelled") {
-					styledText += this.theme.fg("muted", subjectStr);
+					styledSubject = this.theme.fg("muted", truncatedSubject);
 				} else if (item.status === "in_progress") {
-					styledText += this.theme.style(subjectStr, { bold: true, fg: "text" });
+					styledSubject = this.theme.style(truncatedSubject, { bold: true, fg: "text" });
 				} else {
-					styledText += this.theme.fg("text", subjectStr);
+					styledSubject = this.theme.fg("text", truncatedSubject);
 				}
 
-				styledText += noteBadge;
+				const pointerStyled = isSelected
+					? this.theme.style(pointerPrefix, { bold: true, fg: "accent" })
+					: pointerPrefix;
 
-				if (isSelected) {
-					// Highlight selected row with background or pointer
-					styledText = this.theme.style(`> ${truncateToWidth(styledText, maxTextWidth - 2)}`, {
-						bold: true,
-					});
-				} else {
-					styledText = `  ${styledText}`;
-				}
+				const styledLine =
+					pointerStyled +
+					this.theme.fg("muted", treePrefix) +
+					this.theme.fg("accent", foldIcon) +
+					glyphStyled +
+					" " +
+					this.theme.fg("accent", idStr) +
+					styledSubject +
+					noteBadge;
 
-				const currentWidth = visibleWidth(isSelected ? `> ${truncated}` : `  ${truncated}`);
-				const rowPad = Math.max(0, maxTextWidth - currentWidth);
-				lineContent = styledText + " ".repeat(rowPad);
+				const actualVisible =
+					fixedWidth + visibleWidth(truncatedSubject);
+				const rowPad = Math.max(0, rowInteriorWidth - actualVisible);
+				lineContent = styledLine + " ".repeat(rowPad);
 			} else {
-				lineContent = " ".repeat(innerWidth - (scrollbarActive ? 1 : 0));
+				lineContent = " ".repeat(rowInteriorWidth);
 			}
 
-			// Scrollbar track & thumb
-			let scrollbarChar = " ";
+			let scrollbarChar = "";
 			if (scrollbarActive) {
 				if (row >= thumbTop && row < thumbTop + thumbHeight) {
 					scrollbarChar = this.theme.fg("accent", "█");
@@ -963,11 +1140,12 @@ export class TodoTreeOverlayComponent implements Component {
 			lines.push(`${" ".repeat(this.boxLeft)}${line}`);
 		}
 
-		// Detail box for selected task
+		// 5. Divider
 		lines.push(`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "├" + "─".repeat(innerWidth) + "┤")}`);
 
+		// 6. Selected task details
 		const selectedTask = flat[this.selectedIndex]?.node.item;
-		let detailText = " No task selected";
+		let detailText = "No task selected";
 		if (selectedTask) {
 			const statusLabel = `[${selectedTask.status.toUpperCase()}]`;
 			const lastNote = selectedTask.notes && selectedTask.notes.length > 0
@@ -975,121 +1153,124 @@ export class TodoTreeOverlayComponent implements Component {
 				: selectedTask.description
 					? ` | ${selectedTask.description}`
 					: "";
-			detailText = ` #${selectedTask.id} ${selectedTask.subject} ${statusLabel}${lastNote}`;
+			detailText = `#${selectedTask.id} ${selectedTask.subject} ${statusLabel}${lastNote}`;
 		}
-		const truncDetail = truncateToWidth(detailText, innerWidth);
-		const detailPad = Math.max(0, innerWidth - visibleWidth(truncDetail));
+		const truncDetail = truncateToWidth(detailText, innerWidth - 2);
+		const detailPad = Math.max(0, innerWidth - 2 - visibleWidth(truncDetail));
 		lines.push(
-			`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "│")}${this.theme.fg("muted", truncDetail)}${" ".repeat(detailPad)}${this.theme.fg("accent", "│")}`,
+			`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "│ ")}${this.theme.fg("muted", truncDetail)}${" ".repeat(detailPad)} ${this.theme.fg("accent", "│")}`,
 		);
 
-		// Bottom action bar
-		const actions = " [Space] Fold  [n] Note  [c] Done  [x] Cancel  [Esc] Close";
-		const actTrunc = truncateToWidth(actions, innerWidth);
-		const actPad = Math.max(0, innerWidth - visibleWidth(actTrunc));
+		// 7. Actions row
+		const actions = "[Space] Fold  [n] Note  [c] Done  [x] Cancel  [Esc] Close";
+		const actTrunc = truncateToWidth(actions, innerWidth - 2);
+		const actPad = Math.max(0, innerWidth - 2 - visibleWidth(actTrunc));
 		lines.push(
-			`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "│")}${this.theme.fg("accent", actTrunc)}${" ".repeat(actPad)}${this.theme.fg("accent", "│")}`,
+			`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "│ ")}${this.theme.fg("accent", actTrunc)}${" ".repeat(actPad)} ${this.theme.fg("accent", "│")}`,
 		);
 
-		// Bottom border
+		// 8. Bottom border
 		lines.push(`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "└" + "─".repeat(innerWidth) + "┘")}`);
 
 		return lines;
 	}
 
-	handleKey(key: KeyId | string): boolean {
+	handleInput(data: string): void {
 		const flat = this.store.getFlattenedTree();
 
-		if (key === "escape" || key === "q" || key === "return") {
+		if (
+			matchesKey(data, Key.escape) ||
+			data === "\x1b" ||
+			data === "escape" ||
+			data === "q" ||
+			data === "Q" ||
+			matchesKey(data, Key.enter) ||
+			data === "\r" ||
+			data === "\n" ||
+			data === "enter"
+		) {
 			this.onClose();
-			return true;
+			return;
 		}
 
-		if (key === "up" || key === "k") {
+		if (matchesKey(data, Key.up) || data === "up" || data === "k") {
 			if (this.selectedIndex > 0) {
 				this.selectedIndex--;
 				this.tui?.requestRender?.();
 			}
-			return true;
+			return;
 		}
 
-		if (key === "down" || key === "j") {
+		if (matchesKey(data, Key.down) || data === "down" || data === "j") {
 			if (this.selectedIndex < flat.length - 1) {
 				this.selectedIndex++;
 				this.tui?.requestRender?.();
 			}
-			return true;
+			return;
 		}
 
-		if (key === "pageup") {
+		if (matchesKey(data, Key.pageUp) || data === "pageup") {
 			this.selectedIndex = Math.max(0, this.selectedIndex - this.listHeight);
 			this.tui?.requestRender?.();
-			return true;
+			return;
 		}
 
-		if (key === "pagedown") {
+		if (matchesKey(data, Key.pageDown) || data === "pagedown") {
 			this.selectedIndex = Math.min(flat.length - 1, this.selectedIndex + this.listHeight);
 			this.tui?.requestRender?.();
-			return true;
+			return;
 		}
 
-		if (key === "home") {
+		if (matchesKey(data, Key.home) || data === "home") {
 			this.selectedIndex = 0;
 			this.tui?.requestRender?.();
-			return true;
+			return;
 		}
 
-		if (key === "end") {
+		if (matchesKey(data, Key.end) || data === "end") {
 			this.selectedIndex = Math.max(0, flat.length - 1);
 			this.tui?.requestRender?.();
-			return true;
+			return;
 		}
 
-		// Space: Fold/Unfold
-		if (key === "space") {
+		if (matchesKey(data, Key.space) || data === "space" || data === " ") {
 			const current = flat[this.selectedIndex];
 			if (current && current.hasChildren) {
 				this.store.toggleCollapsed(current.node.item.id);
 			}
-			return true;
+			return;
 		}
 
-		// 'c': Toggle completed / pending
-		if (key === "c") {
+		if (data === "c" || data === "C") {
 			const current = flat[this.selectedIndex];
 			if (current) {
 				const nextStatus: TodoStatus =
 					current.node.item.status === "completed" ? "pending" : "completed";
 				this.store.updateTask(current.node.item.id, { status: nextStatus });
 			}
-			return true;
+			return;
 		}
 
-		// 'x': Cancel task
-		if (key === "x") {
+		if (data === "x" || data === "X") {
 			const current = flat[this.selectedIndex];
 			if (current) {
 				const nextStatus: TodoStatus =
 					current.node.item.status === "cancelled" ? "pending" : "cancelled";
 				this.store.updateTask(current.node.item.id, { status: nextStatus });
 			}
-			return true;
+			return;
 		}
 
-		// 'n': Add user note
-		if (key === "n") {
+		if (data === "n" || data === "N") {
 			const current = flat[this.selectedIndex];
 			if (current && this.onPromptUserNote) {
 				this.onPromptUserNote(current.node.item.id);
 			}
-			return true;
+			return;
 		}
-
-		return false;
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-		// Click outside box closes modal
 		if (event.type === "click") {
 			const isInside =
 				event.x >= this.boxLeft &&
@@ -1102,14 +1283,12 @@ export class TodoTreeOverlayComponent implements Component {
 				return { handled: true };
 			}
 
-			// Click on row inside list
 			const listRelativeY = event.y - (this.boxTop + 3);
 			if (listRelativeY >= 0 && listRelativeY < this.listHeight) {
 				const targetIndex = this.scrollTop + listRelativeY;
 				const flat = this.store.getFlattenedTree();
 				if (targetIndex < flat.length) {
 					this.selectedIndex = targetIndex;
-					// If clicking fold icon, toggle collapse
 					if (event.x >= this.boxLeft + 2 && event.x <= this.boxLeft + 8) {
 						if (flat[targetIndex].hasChildren) {
 							this.store.toggleCollapsed(flat[targetIndex].node.item.id);
@@ -1121,7 +1300,6 @@ export class TodoTreeOverlayComponent implements Component {
 			}
 		}
 
-		// Mouse wheel scrolling
 		if (event.type === "wheel") {
 			const delta = event.wheelDelta ?? (event as any).deltaY ?? 0;
 			const flat = this.store.getFlattenedTree();
@@ -1161,7 +1339,7 @@ GUIDELINES:
 1. Break down work into clear parent categories and actionable leaf subtasks.
 2. Mark leaf subtasks as 'in_progress' when you start working on them. Multiple subtasks can be in progress simultaneously if working on them in parallel.
 3. Update subtasks to 'completed' as soon as they are implemented and verified.
-4. If scope changes or a task is no longer needed, mark it as 'cancelled' rather than leaving it stalled.
+4. If scope changes or a task is no longer needed, mark it as 'cancelled' rather than leaving it stalled. Cancelled tasks do not block overall progress.
 5. You can create subtasks under any existing parent task at any time using parentId.
 `.trim();
 
@@ -1176,16 +1354,72 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 	let lastCtx: ExtensionContext | null = null;
 	let activeModal: TodoTreeOverlayComponent | null = null;
 	let widgetComponent: TodoTreeWidgetComponent | null = null;
+	let isPromptingUser = false;
 
-	// Persistence: restore from session branch
+	// Persistence: write snapshot to session branch
+	function persistSnapshot(): void {
+		try {
+			pi.appendEntry(SNAPSHOT_ENTRY_TYPE, {
+				tasks: store.getAllTasks(),
+				enabled: config.enabled,
+			});
+		} catch (e) {
+			console.error("[todo-tree] Failed to append custom snapshot entry:", e);
+		}
+	}
+
+	// Dynamic native tool exposure via Pi's setActiveTools
+	function syncActiveTools(enabled: boolean): void {
+		try {
+			const current = pi.getActiveTools();
+			if (enabled) {
+				if (!current.includes("todo")) {
+					pi.setActiveTools([...current, "todo"]);
+				}
+			} else {
+				if (current.includes("todo")) {
+					pi.setActiveTools(current.filter((t) => t !== "todo" && t !== "todos"));
+				}
+			}
+		} catch {
+			// Ignore if not supported
+		}
+	}
+
+	// Restore snapshot from branch
 	function restoreFromBranch(ctx: ExtensionContext): void {
 		try {
-			for (const entry of ctx.sessionManager.getBranch()) {
-				if (entry.type === "message" && entry.message.role === "toolResult") {
-					if (entry.message.toolName === "todo" || entry.message.toolName === "todos") {
-						const details = entry.message.details as any;
-						if (details && Array.isArray(details.tasks)) {
-							store.loadSnapshot(details.tasks);
+			const branch = ctx.sessionManager.getBranch();
+			let restored = false;
+
+			// 1. Prioritize dedicated custom entry
+			for (let i = branch.length - 1; i >= 0; i--) {
+				const entry = branch[i];
+				if (entry.type === "custom" && entry.customType === SNAPSHOT_ENTRY_TYPE) {
+					const data = entry.data as any;
+					if (data && Array.isArray(data.tasks)) {
+						store.loadSnapshot(data.tasks);
+						if (typeof data.enabled === "boolean") {
+							config.enabled = data.enabled;
+						}
+						restored = true;
+						break;
+					}
+				}
+			}
+
+			// 2. Fallback to historical toolResult details
+			if (!restored) {
+				for (let i = branch.length - 1; i >= 0; i--) {
+					const entry = branch[i];
+					if (entry.type === "message" && entry.message.role === "toolResult") {
+						if (entry.message.toolName === "todo" || entry.message.toolName === "todos") {
+							const details = entry.message.details as any;
+							if (details && Array.isArray(details.tasks)) {
+								store.loadSnapshot(details.tasks);
+								restored = true;
+								break;
+							}
 						}
 					}
 				}
@@ -1195,13 +1429,16 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	// Mount widget (Only once! Guarantees staying ABOVE rolling-tools)
+	// Mount widget (guarantees staying stably above rolling-tools)
 	function syncWidget(ctx: ExtensionContext): void {
 		if (!ctx.hasUI || !ctx.ui) return;
 
 		if (!config.enabled) {
+			if (widgetComponent) {
+				widgetComponent.dispose();
+				widgetComponent = null;
+			}
 			ctx.ui.setWidget("todos", undefined);
-			widgetComponent = null;
 			return;
 		}
 
@@ -1212,12 +1449,6 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 				store,
 				() => openModal(ctx),
 			);
-
-			// In Map iteration, setting "todos" places it at current insertion point.
-			// Because rolling-tools repeatedly calls setWidget on every tool call,
-			// rolling-tools continuously pushes itself to the END (bottom) of the Map.
-			// By keeping "todos" mounted without repeated setWidget calls, "todos"
-			// stays stably ABOVE rolling-tools!
 			ctx.ui.setWidget("todos", () => widgetComponent!, { placement: "aboveEditor" });
 		} else {
 			widgetComponent.invalidate();
@@ -1227,7 +1458,7 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 	// Open Fullscreen / Centered Overlay Modal
 	function openModal(ctx: ExtensionContext): void {
 		if (!ctx.hasUI || !ctx.ui?.custom) return;
-		if (activeModal) return;
+		if (activeModal || isPromptingUser) return;
 
 		void ctx.ui
 			.custom(
@@ -1241,12 +1472,9 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 							done(undefined);
 						},
 						(taskId: string) => {
-							// Prompt user for annotation
 							activeModal = null;
 							done(undefined);
-							setTimeout(() => {
-								promptAddUserNote(ctx, taskId);
-							}, 50);
+							void promptAddUserNote(ctx, taskId);
 						},
 					);
 					activeModal = component;
@@ -1274,37 +1502,38 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 		const task = store.getTask(taskId);
 		if (!task) return;
 
-		const noteText = await ctx.ui.input(
-			`Add Note for Task #${task.id} (${task.subject})`,
-			"Type context note (leave blank to cancel)...",
-		);
+		isPromptingUser = true;
 
-		if (noteText && noteText.trim()) {
-			store.addUserNote(taskId, noteText.trim());
-			ctx.ui.notify?.(`Added note to #${taskId}`, "info");
+		try {
+			const noteText = await ctx.ui.input(
+				`Add Note for Task #${task.id} (${task.subject})`,
+				"Type context note (leave blank to cancel)...",
+			);
 
-			// Check if user also wants to notify LLM agent
-			if (ctx.ui.confirm) {
-				const notifyAgent = await ctx.ui.confirm(
-					"Remind Agent?",
-					"Send this note to the LLM agent as a prompt message?",
-				);
-				if (notifyAgent) {
-					// Send as user message appended to conversation tail (Zero Prompt Cache invalidation!)
-					pi.sendUserMessage(`[Todo Note for Task #${task.id}]: ${noteText.trim()}`, {
-						deliverAs: "followUp",
-					});
+			if (noteText && noteText.trim()) {
+				store.addUserNote(taskId, noteText.trim());
+				persistSnapshot();
+				ctx.ui.notify?.(`Added note to #${taskId}`, "info");
+
+				if (ctx.ui.confirm) {
+					const notifyAgent = await ctx.ui.confirm(
+						"Remind Agent?",
+						"Send this note to the LLM agent as a prompt message?",
+					);
+					if (notifyAgent) {
+						pi.sendUserMessage(`[Todo Note for Task #${task.id}]: ${noteText.trim()}`, {
+							deliverAs: "followUp",
+						});
+					}
 				}
 			}
+		} finally {
+			isPromptingUser = false;
+			openModal(ctx);
 		}
-
-		// Re-open modal
-		openModal(ctx);
 	}
 
-	// --------------------------------------------------------------------------
-	// 8.1 Register LLM Tool ("todo")
-	// --------------------------------------------------------------------------
+	// Register LLM Tool
 	pi.registerTool({
 		name: "todo",
 		label: "Todo Tree",
@@ -1312,6 +1541,18 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 		parameters: TodoToolParamsSchema,
 		execute: async (_toolCallId, params: TodoToolParams) => {
 			const action = params.action;
+
+			const getTasksSnapshot = () =>
+				store.getAllTasks().map((t) => ({
+					id: t.id,
+					parentId: t.parentId,
+					subject: t.subject,
+					description: t.description,
+					status: t.status,
+					notes: t.notes,
+					completed: t.status === "completed" || t.status === "cancelled",
+					done: t.status === "completed" || t.status === "cancelled",
+				}));
 
 			try {
 				let summary = "";
@@ -1375,25 +1616,13 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 
 					case "list":
 					default: {
-						const all = store.getAllTasks();
 						const stats = store.getProgressStats();
 						summary = `Todo list: ${stats.completed}/${stats.total} completed (${stats.percent}%), ${stats.inProgress} in progress, ${stats.pending} pending.`;
 						break;
 					}
 				}
 
-				const getTasksSnapshot = () =>
-					store.getAllTasks().map((t) => ({
-						id: t.id,
-						parentId: t.parentId,
-						subject: t.subject,
-						description: t.description,
-						status: t.status,
-						notes: t.notes,
-						// todo-loop.ts compatibility: cancelled items are considered done so they don't block
-						completed: t.status === "completed" || t.status === "cancelled",
-						done: t.status === "completed" || t.status === "cancelled",
-					}));
+				persistSnapshot();
 
 				return {
 					content: [{ type: "text", text: summary }],
@@ -1404,18 +1633,6 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 					},
 				};
 			} catch (err: any) {
-				const getTasksSnapshot = () =>
-					store.getAllTasks().map((t) => ({
-						id: t.id,
-						parentId: t.parentId,
-						subject: t.subject,
-						description: t.description,
-						status: t.status,
-						notes: t.notes,
-						completed: t.status === "completed" || t.status === "cancelled",
-						done: t.status === "completed" || t.status === "cancelled",
-					}));
-
 				return {
 					content: [{ type: "text", text: `Error: ${err?.message || String(err)}` }],
 					details: {
@@ -1429,13 +1646,10 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// --------------------------------------------------------------------------
-	// 8.2 Hide tool from LLM when disabled (0 token waste on small tasks)
-	// --------------------------------------------------------------------------
+	// Fallback filtering in provider request payload
 	pi.on("before_provider_request", (event: any) => {
 		if (config.enabled) return;
 
-		// Filter out 'todo' tool from payload if disabled
 		if (event?.payload && typeof event.payload === "object") {
 			const payload = event.payload as Record<string, unknown>;
 			if (Array.isArray(payload.tools)) {
@@ -1447,12 +1661,11 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	// --------------------------------------------------------------------------
-	// 8.3 Lifecycle Events
-	// --------------------------------------------------------------------------
+	// Lifecycle Events
 	pi.on("session_start", (_event, ctx) => {
 		lastCtx = ctx;
 		restoreFromBranch(ctx);
+		syncActiveTools(config.enabled);
 		syncWidget(ctx);
 	});
 
@@ -1464,12 +1677,13 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_shutdown", () => {
 		activeModal = null;
-		widgetComponent = null;
+		if (widgetComponent) {
+			widgetComponent.dispose();
+			widgetComponent = null;
+		}
 	});
 
-	// --------------------------------------------------------------------------
-	// 8.4 Shortcuts & Commands
-	// --------------------------------------------------------------------------
+	// Register Shortcut
 	try {
 		pi.registerShortcut(config.shortcut as KeyId, {
 			description: "Open Todo Tree modal",
@@ -1477,8 +1691,8 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 				openModal(ctx);
 			},
 		});
-	} catch {
-		// Key parsing fallback
+	} catch (e) {
+		console.warn(`[todo-tree] Failed to register shortcut ${config.shortcut}:`, e);
 	}
 
 	const commandHandler = async (args: string, ctx: ExtensionContext) => {
@@ -1488,22 +1702,29 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 		if (trimmed === "on" || trimmed === "enable") {
 			config.enabled = true;
 			saveConfig(config);
+			syncActiveTools(true);
+			persistSnapshot();
 			syncWidget(ctx);
 			ctx.ui?.notify?.("✓ Todo Tree is now ENABLED (Tool active for LLM, widget visible)", "info");
 		} else if (trimmed === "off" || trimmed === "disable") {
 			config.enabled = false;
 			saveConfig(config);
+			syncActiveTools(false);
+			persistSnapshot();
 			syncWidget(ctx);
 			ctx.ui?.notify?.("✓ Todo Tree is now DISABLED (Tool hidden from LLM)", "info");
 		} else if (trimmed === "toggle") {
 			config.enabled = !config.enabled;
 			saveConfig(config);
+			syncActiveTools(config.enabled);
+			persistSnapshot();
 			syncWidget(ctx);
 			ctx.ui?.notify?.(`Todo Tree is now ${config.enabled ? "ENABLED" : "DISABLED"}`, "info");
 		} else if (trimmed === "open" || trimmed === "modal") {
 			openModal(ctx);
 		} else if (trimmed === "clear") {
 			store.clear();
+			persistSnapshot();
 			ctx.ui?.notify?.("Todo Tree list cleared.", "info");
 		} else if (trimmed === "status") {
 			const stats = store.getProgressStats();
@@ -1511,17 +1732,18 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 				`Todo Tree Status:`,
 				`• State: ${config.enabled ? "ENABLED" : "DISABLED (default)"}`,
 				`• Shortcut: ${config.shortcut}`,
-				`• Total Tasks: ${stats.total + stats.cancelled} (${stats.completed} completed, ${stats.inProgress} in progress, ${stats.pending} pending, ${stats.cancelled} cancelled)`,
+				`• Tasks: ${stats.total + stats.cancelled} (${stats.completed} completed, ${stats.inProgress} in progress, ${stats.pending} pending, ${stats.cancelled} cancelled)`,
 				`• Progress: ${stats.percent}%`,
 			].join("\n");
 			ctx.ui?.notify?.(info, "info");
 		} else {
-			// Default with no arg: toggle or open
 			if (!config.enabled) {
 				config.enabled = true;
 				saveConfig(config);
+				syncActiveTools(true);
+				persistSnapshot();
 				syncWidget(ctx);
-				ctx.ui?.notify?.("Todo Tree enabled. Use /todo open or click [📋 ] to view.", "info");
+				ctx.ui?.notify?.("Todo Tree enabled. Click [📋 ] or press shortcut to view.", "info");
 			} else {
 				openModal(ctx);
 			}

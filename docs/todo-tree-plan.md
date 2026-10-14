@@ -183,26 +183,34 @@ Break down work into parent goals and actionable leaf subtasks. Keep only the cu
 
 ---
 
-## 七、 实施代码结构与推进计划
+## 八、 关键缺陷（Bug List）与完整修复记录
 
-### 1. 文件组织规范 (在 `extensions/` 目录下)
-按照规范创建单一整洁模块 `extensions/todo-tree.ts`（或 `extensions/todo-tree/`）：
-```text
-extensions/
-  ├── todo-tree.ts        # 层次化任务清单核心扩展入口与实现
-  ├── rolling-tools.ts    # 现有滚动工具栏（无冲突共存）
-  └── todo-loop.ts        # 现有自动推进循环（自动协同）
-```
+在第一阶段实现后，经端到端压力测试与源码对照，修复了以下关键缺陷：
 
-### 2. 模块内部架构划分
-1. **Types & State Store**：定义 `TodoItem`、`TodoTreeState`，实现树构建、进度计算与 Session branch 持久化；
-2. **LLM Tool Registration**：注册 `todo` 工具，实现 `create`、`batch_create`、`update`、`list`、`delete`、`clear`，输出紧凑响应；
-3. **Widget Component**：实现输入框上方的紧凑状态条，支持多并行任务展示与右侧 `[📋 ]` 鼠标点击捕获；
-4. **Modal Overlay Component**：实现带边框的居中弹窗，实现缩进树、字符滚动条、滚轮事件与键盘交互；
-5. **Command & Toggle Controller**：注册 `/todo` 命令与快捷键，管理动态开关与 `before_provider_request` 工具过滤。
+1. **🔴 弹窗键盘交互完全重构（修复 Bug 1）**：
+   - 彻底废弃伪接口 `handleKey`，实现 Pi TUI 标准的 `handleInput(data: string): void`；
+   - 内部集成 `matchesKey` 配合 `Key.up`、`Key.down`、`Key.space`、`Key.escape`、`Key.enter` 及 Vim 键位 `j`/`k`/`q`，确保键盘移动、展开折叠、完成标记与 Esc 退出 100% 顺畅。
+2. **🔴 纯状态双向推导与历史完成保护（修复 Bug 2）**：
+   - 重构 `checkParentStatus`：子项重开（`pending`）时父项自适应回退到 `in_progress` 或 `pending`；所有子项 `cancelled` 时父项才 `cancelled`；
+   - `cascadeChildrenStatus` 实施保护原则：父项取消绝不覆盖已被确认 `completed` 的子项。
+3. **🔴 会话 Custom Entry 持久化（修复 Bug 3）**：
+   - 引入专用类型 `SNAPSHOT_ENTRY_TYPE = "todo-tree-state"`；
+   - 在任何任务或便签修改时，触发 `pi.appendEntry()` 保存快照；在会话恢复时优先反序列化该快照，确保 Fork、Compact、Reload 后用户批注与修改零丢失。
+4. **🟠 原生 `pi.setActiveTools` 动态隔离（修复 Bug 4）**：
+   - 放弃仅在 HTTP Payload 层打补丁的做法，改用 Pi 官方原生的 `pi.setActiveTools()` 控制工具声明；
+   - `/todo off` 模式下，System Prompt 和 Provider 请求中均完全不包含 `todo` 工具，实现真正的 0 提示词与 0 上下文污染。
+5. **🟠 树防环死循环校验与深度截断（修复 Bug 5）**：
+   - 面包屑遍历、节点收集和树构建中加入 `visited = new Set<string>()` 机制；
+   - 引入 `MAX_TREE_DEPTH = 32` 硬上限，杜绝畸形快照或异常调用引发调用栈溢出或无限死循环。
+6. **🟠 精准鼠标命中与防止全局误触（修复 Bug 6）**：
+   - 移除 Widget 全局任意点击打开弹窗的逻辑；
+   - 动态计算按钮宽度 `visibleWidth("[📋 ]")`，只有在首行右侧命中按钮区域时才触发弹窗。
+7. **🟠 弹窗宽度溢出与长文本严格截断（修复 Bug 7）**：
+   - 修复仅对原始字符串截断但输出未截断变量的错位逻辑；
+   - 精确计算边框行内部可用宽度，自适应折叠狭窄视口下的统计文字，确保所有行长恒等于 `boxWidth`。
+8. **🟡 终端控制字符清洗（修复 Bug 8）**：
+   - 引入 `sanitizeText(str)`，清洗 OSC / CSI 转义序列及不可见控制字符，换行符统一变为空格，杜绝终端标题劫持或换行破坏。
+9. **🟡 资源订阅释放与性能缓存（修复 Bug 9）**：
+   - 在 `TodoTreeWidgetComponent` 中提供 `dispose()` 并在会话关闭时注销 `store` 监听器；
+   - 引入 `isDirty` 标记对统计数据与展平树进行懒计算缓存。
 
-### 3. 验证步骤
-1. 执行 `npm run check`（TypeScript 编译检查）；
-2. 执行 `npm run validate`（Pi 包清单有效性验证）；
-3. 单元/集成测试：验证树节点父子联动、进度百分比计算、多并行任务提取；
-4. 交互验证：验证弹窗滚动条、鼠标点击展开、快捷键呼出、以及与 `rolling-tools` 的相对位置稳定。
