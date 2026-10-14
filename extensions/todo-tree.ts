@@ -1384,6 +1384,138 @@ export class TodoTreeOverlayComponent implements Component {
 }
 
 // ============================================================================
+// 6.5. Lightweight Status Modal Dialog Component
+// ============================================================================
+
+export interface TodoTreeStatusInfo {
+	enabled: boolean;
+	isToolActive: boolean;
+	shortcut: string;
+	stats: {
+		total: number;
+		completed: number;
+		inProgress: number;
+		pending: number;
+		cancelled: number;
+		percent: number;
+	};
+}
+
+export class TodoTreeStatusModalComponent implements Component {
+	private tui: any;
+	private theme: any;
+	private info: TodoTreeStatusInfo;
+	private onClose: () => void;
+
+	private boxLeft = 0;
+	private boxTop = 0;
+	private boxWidth = 0;
+	private boxHeight = 0;
+
+	constructor(tui: any, theme: any, info: TodoTreeStatusInfo, onClose: () => void) {
+		this.tui = tui;
+		this.theme = theme;
+		this.info = info;
+		this.onClose = onClose;
+	}
+
+	invalidate(): void {}
+
+	render(width: number): string[] {
+		const totalLines = this.tui?.terminal?.rows || 24;
+
+		this.boxWidth = Math.min(68, Math.max(46, Math.floor(width * 0.7)));
+		this.boxHeight = 12;
+		this.boxLeft = Math.max(0, Math.floor((width - this.boxWidth) / 2));
+		this.boxTop = Math.max(0, Math.floor((totalLines - this.boxHeight) / 2));
+
+		const innerWidth = this.boxWidth - 2;
+		const lines: string[] = [];
+
+		// Top padding
+		for (let i = 0; i < this.boxTop; i++) {
+			lines.push("");
+		}
+
+		// 1. Top border with title
+		const title = " Todo Tree Status ";
+		const topDashTotal = Math.max(0, innerWidth - visibleWidth(title));
+		const leftDash = Math.floor(topDashTotal / 2);
+		const rightDash = topDashTotal - leftDash;
+		lines.push(
+			`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "┌" + "─".repeat(leftDash))}${this.theme.style(title, { bold: true, fg: "accent" })}${this.theme.fg("accent", "─".repeat(rightDash) + "┐")}`,
+		);
+
+		// Helper to format an inner line with borders
+		const pushRow = (contentStr: string, rawLen: number) => {
+			const pad = Math.max(0, innerWidth - 2 - rawLen);
+			lines.push(
+				`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "│ ")}${contentStr}${" ".repeat(pad)} ${this.theme.fg("accent", "│")}`,
+			);
+		};
+
+		// 2. Status items
+		const stateText = this.info.enabled ? "ENABLED" : "DISABLED (default)";
+		const stateColored = this.info.enabled
+			? this.theme.fg("success", "ENABLED")
+			: this.theme.fg("muted", "DISABLED (default)");
+		pushRow(`• Extension State : ${stateColored}`, `• Extension State : ${stateText}`.length);
+
+		const activeText = this.info.isToolActive
+			? "YES (declared to LLM)"
+			: "NO (hidden from LLM)";
+		const activeColored = this.info.isToolActive
+			? this.theme.fg("success", "YES (declared to LLM)")
+			: this.theme.fg("muted", "NO (hidden from LLM)");
+		pushRow(`• Active in Model : ${activeColored}`, `• Active in Model : ${activeText}`.length);
+
+		const shortcutText = `• Modal Shortcut  : ${this.info.shortcut}`;
+		pushRow(this.theme.fg("text", shortcutText), shortcutText.length);
+
+		const stats = this.info.stats;
+		const tasksSummary = `• Total Tasks     : ${stats.total + stats.cancelled} (${stats.completed} done, ${stats.inProgress} active, ${stats.pending} pending, ${stats.cancelled} cancelled)`;
+		const truncTasks = truncateToWidth(tasksSummary, innerWidth - 2);
+		pushRow(this.theme.fg("text", truncTasks), visibleWidth(truncTasks));
+
+		// Progress bar
+		const barWidth = 14;
+		const filled = Math.min(barWidth, Math.round((stats.percent / 100) * barWidth));
+		const barStr = `[${"█".repeat(filled)}${"░".repeat(barWidth - filled)}]`;
+		const progText = `• Progress        : ${stats.percent}% ${barStr}`;
+		pushRow(this.theme.fg("accent", progText), progText.length);
+
+		// Blank line
+		pushRow("", 0);
+
+		// 3. Hint / actions row
+		const hint = "Press [Esc], [Enter] or any key to close";
+		const hintTrunc = truncateToWidth(hint, innerWidth - 2);
+		const hintPad = Math.max(0, innerWidth - 2 - visibleWidth(hintTrunc));
+		lines.push(
+			`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "│ ")}${this.theme.fg("muted", hintTrunc)}${" ".repeat(hintPad)} ${this.theme.fg("accent", "│")}`,
+		);
+
+		// 4. Bottom border
+		lines.push(`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "└" + "─".repeat(innerWidth) + "┘")}`);
+
+		return lines;
+	}
+
+	handleInput(_data: string): void {
+		// Any key closes the lightweight status dialog
+		this.onClose();
+	}
+
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (event.type === "click") {
+			this.onClose();
+			return { handled: true };
+		}
+		return undefined;
+	}
+}
+
+// ============================================================================
 // 7. English LLM Tool Definition & Guidance
 // ============================================================================
 
@@ -1415,7 +1547,7 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 	const store = new TodoTreeStore();
 
 	let lastCtx: ExtensionContext | null = null;
-	let activeModal: TodoTreeOverlayComponent | null = null;
+	let activeModal: Component | null = null;
 	let widgetComponent: TodoTreeWidgetComponent | null = null;
 	let isPromptingUser = false;
 
@@ -1515,13 +1647,74 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 		);
 	}
 
+	// Open Lightweight Status Modal
+	function openStatusModal(ctx: ExtensionContext): void {
+		const stats = store.getProgressStats();
+		const activeTools = pi.getActiveTools?.() ?? [];
+		const isToolActive = activeTools.includes("todo");
+
+		if (!ctx.hasUI || !ctx.ui?.custom) {
+			const info = [
+				`Todo Tree Status:`,
+				`• State: ${config.enabled ? "ENABLED" : "DISABLED (default)"}`,
+				`• Active in Model: ${isToolActive ? "YES (declared to LLM)" : "NO (hidden from LLM)"}`,
+				`• Shortcut: ${config.shortcut}`,
+				`• Tasks: ${stats.total + stats.cancelled} (${stats.completed} completed, ${stats.inProgress} in progress, ${stats.pending} pending, ${stats.cancelled} cancelled)`,
+				`• Progress: ${stats.percent}%`,
+			].join("\n");
+			ctx.ui?.notify?.(info, "info");
+			return;
+		}
+
+		if (activeModal || isPromptingUser) return;
+
+		const statusInfo: TodoTreeStatusInfo = {
+			enabled: config.enabled,
+			isToolActive,
+			shortcut: config.shortcut,
+			stats: {
+				total: stats.total,
+				completed: stats.completed,
+				inProgress: stats.inProgress,
+				pending: stats.pending,
+				cancelled: stats.cancelled,
+				percent: stats.percent,
+			},
+		};
+
+		Promise.resolve(
+			ctx.ui.custom(
+				(tui: any, theme: any, _keybindings: any, done: (result: unknown) => void) => {
+					const component = new TodoTreeStatusModalComponent(tui, theme, statusInfo, () => {
+						activeModal = null;
+						done(undefined);
+					});
+					activeModal = component;
+					return component;
+				},
+				{
+					overlay: true,
+					overlayOptions: {
+						width: "100%",
+						maxHeight: "100%",
+						anchor: "top-left",
+						margin: 0,
+					},
+				},
+			),
+		).catch((err: unknown) => {
+			activeModal = null;
+			console.error("[todo-tree] status modal error:", err);
+		});
+	}
+
 	// Open Fullscreen / Centered Overlay Modal
 	function openModal(ctx: ExtensionContext): void {
 		if (!ctx.hasUI || !ctx.ui?.custom) return;
 		if (activeModal || isPromptingUser) return;
 
-		void ctx.ui
-			.custom(
+		Promise.resolve(
+			ctx.ui.custom(
 				(tui: any, theme: any, _keybindings: any, done: (result: unknown) => void) => {
 					const component = new TodoTreeOverlayComponent(
 						tui,
@@ -1553,11 +1746,11 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 						margin: 0,
 					},
 				},
-			)
-			.catch((err: unknown) => {
-				activeModal = null;
-				console.error("[todo-tree] modal error:", err);
-			});
+			),
+		).catch((err: unknown) => {
+			activeModal = null;
+			console.error("[todo-tree] modal error:", err);
+		});
 	}
 
 	async function promptAddUserNote(ctx: ExtensionContext, taskId: string): Promise<void> {
@@ -1777,18 +1970,7 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 			persistSnapshot();
 			ctx.ui?.notify?.("Todo Tree list cleared.", "info");
 		} else if (trimmed === "status") {
-			const stats = store.getProgressStats();
-			const activeTools = pi.getActiveTools?.() ?? [];
-			const isToolActive = activeTools.includes("todo");
-			const info = [
-				`Todo Tree Status:`,
-				`• State: ${config.enabled ? "ENABLED" : "DISABLED (default)"}`,
-				`• Active in Model: ${isToolActive ? "YES (declared to LLM)" : "NO (hidden from LLM)"}`,
-				`• Shortcut: ${config.shortcut}`,
-				`• Tasks: ${stats.total + stats.cancelled} (${stats.completed} completed, ${stats.inProgress} in progress, ${stats.pending} pending, ${stats.cancelled} cancelled)`,
-				`• Progress: ${stats.percent}%`,
-			].join("\n");
-			ctx.ui?.notify?.(info, "info");
+			openStatusModal(ctx);
 		} else {
 			if (!config.enabled) {
 				config.enabled = true;

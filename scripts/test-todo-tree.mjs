@@ -5,6 +5,7 @@ import {
 	TodoTreeStore,
 	TodoTreeWidgetComponent,
 	TodoTreeOverlayComponent,
+	TodoTreeStatusModalComponent,
 	sanitizeText,
 	SNAPSHOT_ENTRY_TYPE,
 	MAX_TREE_DEPTH,
@@ -394,6 +395,47 @@ assert.ok(
 );
 
 console.log("✓ 源码级禁止 before_provider_request 钩子与 session_tree 状态同步断言验证通过。");
+
+console.log("=== Test 12: Lightweight Status Modal Component & /todo status Execution ===");
+let statusCustomOpened = false;
+let statusModalDoneCalled = false;
+
+const mockTui = { terminal: { rows: 24, cols: 80 }, requestRender: () => {} };
+
+// Mock custom UI handler
+await cmdHandler("status", {
+	hasUI: true,
+	ui: {
+		custom(factory) {
+			statusCustomOpened = true;
+			const comp = factory(mockTui, fakeTheme, {}, () => {
+				statusModalDoneCalled = true;
+			});
+			assert.ok(comp instanceof TodoTreeStatusModalComponent, "Custom overlay must be TodoTreeStatusModalComponent");
+			const rendered = comp.render(80);
+			assert.ok(rendered.length >= 10, "Status modal should render boxed layout");
+			const joined = rendered.join("\n");
+			assert.ok(joined.includes("Todo Tree Status"), "Must contain title");
+			assert.ok(joined.includes("Extension State"), "Must contain state");
+			assert.ok(joined.includes("Active in Model"), "Must contain active status");
+			assert.ok(joined.includes("Total Tasks"), "Must contain total tasks summary");
+
+			// Any key closes
+			comp.handleInput("x");
+			assert.ok(statusModalDoneCalled, "Any key should trigger close callback");
+
+			// Mouse click closes
+			statusModalDoneCalled = false;
+			const mouseRes = comp.handleMouse({ type: "click", x: 10, y: 5 });
+			assert.ok(statusModalDoneCalled, "Click should trigger close callback");
+			assert.equal(mouseRes?.handled, true);
+		},
+	},
+	sessionManager: { getBranch: () => [] },
+});
+
+assert.ok(statusCustomOpened, "/todo status in interactive mode must open lightweight custom modal");
+console.log("✓ Lightweight status modal component rendering and close interaction verified.");
 
 console.log("\n=======================================================");
 console.log("ALL VERIFICATION & RIGOROUS TESTS PASSED SUCCESSFULLY! 🎉");
