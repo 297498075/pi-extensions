@@ -543,6 +543,53 @@ assert.equal(newTasks[0].subject, "Phase 2 New Root");
 assert.equal(newTasks[1].subject, "Phase 2 New Sub");
 console.log("✓ Strategy A (Auto-clearing finished tasks on new root batch_create) verified.");
 
+console.log("=== Test 14: Clean Widget Multi-task Display & 5-Line Detail Pane with Notes ===");
+const multiStore = new TodoTreeStore();
+const pTask = multiStore.createTask({ id: "1", subject: "Main Category", status: "in_progress" });
+const sub1 = multiStore.createTask({ id: "1.1", parentId: "1", subject: "Subtask Alpha", status: "in_progress", description: "Detailed requirement for subtask alpha." });
+const sub2 = multiStore.createTask({ id: "1.2", parentId: "1", subject: "Subtask Beta", status: "in_progress" });
+
+// Add notes (user note & agent note)
+multiStore.addUserNote("1.1", "Please double check the indexes.");
+multiStore.updateTask("1.1", { note: "Index checked and applied." });
+
+const multiWidget = new TodoTreeWidgetComponent(
+	{ requestRender: () => {} },
+	fakeTheme,
+	multiStore,
+	() => {},
+);
+
+const widgetLines = multiWidget.render(80);
+assert.equal(widgetLines.length, 3, "Multi-task widget should render 1 header line + 2 task sub-lines");
+assert.ok(widgetLines[0].includes("(2 in progress)"), "Line 1 must contain summary '(2 in progress)'");
+assert.ok(widgetLines[1].includes("⏳ #1.1 Subtask Alpha"), "Subtask 1 must be clean without parent category prefix");
+assert.ok(widgetLines[2].includes("⏳ #1.2 Subtask Beta"), "Subtask 2 must be clean without parent category prefix");
+assert.ok(!widgetLines[1].includes("[Main Category]"), "Must NOT display redundant parent category prefix");
+
+// Test Overlay 5-Line Detail & Notes Pane
+const detailOverlay = new TodoTreeOverlayComponent(
+	{ terminal: { rows: 24, cols: 80 }, requestRender: () => {} },
+	fakeTheme,
+	multiStore,
+	() => {},
+);
+
+// Move down to select #1.1
+detailOverlay.handleInput(Key.down);
+const renderedOverlay = detailOverlay.render(80);
+const overlayText = renderedOverlay.join("\n");
+assert.ok(overlayText.includes("Desc : Detailed requirement for subtask alpha."), "Must display task description in detail pane");
+assert.ok(overlayText.includes("Notes (2):"), "Must show Notes header with count");
+assert.ok(overlayText.includes("[User]: Please double check the indexes."), "Must display User note with author tag");
+assert.ok(overlayText.includes("[Agent]: Index checked and applied."), "Must display Agent note with author tag");
+
+// Test detail scroll via PageDown / PageUp
+detailOverlay.handleInput(Key.pageDown);
+detailOverlay.handleInput(Key.pageUp);
+
+console.log("✓ Multi-task clean widget and 5-line scrollable detail pane with notes verified.");
+
 console.log("\n=======================================================");
 console.log("ALL VERIFICATION & RIGOROUS TESTS PASSED SUCCESSFULLY! 🎉");
 console.log("=======================================================");

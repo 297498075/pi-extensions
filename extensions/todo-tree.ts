@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Component, KeyId, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Key, matchesKey, sliceByColumn, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 
 // ============================================================================
@@ -800,6 +800,28 @@ function renderProgressBar(percent: number, width: number): string {
 	return `[${"█".repeat(filled)}${"░".repeat(empty)}]`;
 }
 
+function wrapTextToWidth(text: string, maxWidth: number): string[] {
+	if (maxWidth <= 4) return [truncateToWidth(text, Math.max(1, maxWidth))];
+	const lines: string[] = [];
+	const rawLines = text.split(/\r?\n/);
+	for (const raw of rawLines) {
+		let remaining = raw;
+		while (visibleWidth(remaining) > maxWidth) {
+			let take = maxWidth;
+			let chunk = sliceByColumn(remaining, 0, take);
+			while (visibleWidth(chunk) > maxWidth && take > 1) {
+				take--;
+				chunk = sliceByColumn(remaining, 0, take);
+			}
+			lines.push(chunk);
+			remaining = remaining.slice(chunk.length).trimStart();
+			if (!remaining) break;
+		}
+		if (remaining) lines.push(remaining);
+	}
+	return lines;
+}
+
 function getStatusGlyph(status: TodoStatus): { glyph: string; colorKey: string } {
 	switch (status) {
 		case "completed":
@@ -902,36 +924,49 @@ export class TodoTreeWidgetComponent implements Component {
 		const availableForSubject = width - prefixLen - buttonWidth;
 
 		if (hasActive) {
-			const first = activeItems[0];
-			const firstLabel = `${first.breadcrumb}#${first.task.id} ${first.task.subject}`;
+			if (activeItems.length === 1) {
+				// Single active task: clean display without breadcrumbs
+				const first = activeItems[0];
+				const firstLabel = `#${first.task.id} ${first.task.subject}`;
 
-			if (availableForSubject >= 4) {
-				const truncatedSubject = truncateToWidth(firstLabel, availableForSubject - 1);
-				const middleLen = visibleWidth(truncatedSubject);
+				if (availableForSubject >= 4) {
+					const truncatedSubject = truncateToWidth(firstLabel, availableForSubject - 1);
+					const middleLen = visibleWidth(truncatedSubject);
+					const padLen = Math.max(1, width - prefixLen - middleLen - buttonWidth);
+					const btnStyled = this.theme.fg("accent", buttonText);
+					const subjectStyled = this.theme.style(truncatedSubject, { bold: true });
+
+					lines.push(`${prefixStyled}${subjectStyled}${" ".repeat(padLen)}${btnStyled}`);
+				} else {
+					// Extremely narrow: omit subject, show just progress and button
+					const padLen = Math.max(0, width - prefixLen - buttonWidth);
+					const btnStyled = this.theme.fg("accent", buttonText);
+					lines.push(`${prefixStyled}${" ".repeat(padLen)}${btnStyled}`);
+				}
+			} else {
+				// Multi-task in progress: line 1 is clean summary header, all active tasks displayed below
+				const countLabel = `(${activeItems.length} in progress)`;
+				const showCount = availableForSubject >= visibleWidth(countLabel) + 2;
+				const middleText = showCount ? countLabel : "";
+				const middleStyled = showCount ? this.theme.fg("accent", middleText) : "";
+				const middleLen = showCount ? visibleWidth(middleText) : 0;
 				const padLen = Math.max(1, width - prefixLen - middleLen - buttonWidth);
 				const btnStyled = this.theme.fg("accent", buttonText);
-				const subjectStyled = this.theme.style(truncatedSubject, { bold: true });
 
-				lines.push(`${prefixStyled}${subjectStyled}${" ".repeat(padLen)}${btnStyled}`);
-			} else {
-				// Extremely narrow: omit subject, show just progress and button
-				const padLen = Math.max(0, width - prefixLen - buttonWidth);
-				const btnStyled = this.theme.fg("accent", buttonText);
-				lines.push(`${prefixStyled}${" ".repeat(padLen)}${btnStyled}`);
-			}
+				lines.push(`${prefixStyled}${middleStyled}${" ".repeat(padLen)}${btnStyled}`);
 
-			// Display all parallel in-progress tasks, strictly bounded by width
-			for (let i = 1; i < activeItems.length; i++) {
-				const item = activeItems[i];
-				const glyph = "  └─ ⏳ ";
-				const glyphStyled = this.theme.fg("accent", glyph);
-				const glyphWidth = visibleWidth(glyph);
-				const availableSub = Math.max(0, width - glyphWidth);
+				// Display ALL parallel in-progress tasks uniformly below line 1 without breadcrumbs
+				for (const item of activeItems) {
+					const glyph = "  ⏳ ";
+					const glyphStyled = this.theme.fg("accent", glyph);
+					const glyphWidth = visibleWidth(glyph);
+					const availableSub = Math.max(0, width - glyphWidth);
 
-				if (availableSub > 2) {
-					const label = `${item.breadcrumb}#${item.task.id} ${item.task.subject}`;
-					const trunc = truncateToWidth(label, availableSub);
-					lines.push(`${glyphStyled}${this.theme.fg("text", trunc)}`);
+					if (availableSub > 2) {
+						const label = `#${item.task.id} ${item.task.subject}`;
+						const trunc = truncateToWidth(label, availableSub);
+						lines.push(`${glyphStyled}${this.theme.fg("text", trunc)}`);
+					}
 				}
 			}
 		} else {
@@ -992,6 +1027,8 @@ export class TodoTreeOverlayComponent implements Component {
 
 	private selectedIndex = 0;
 	private scrollTop = 0;
+	private detailScrollTop = 0;
+	private lastSelectedTaskId: string | null = null;
 
 	// Bounding box geometry
 	private boxLeft = 0;
@@ -999,6 +1036,8 @@ export class TodoTreeOverlayComponent implements Component {
 	private boxWidth = 0;
 	private boxHeight = 0;
 	private listHeight = 10;
+	private detailHeight = 5;
+	private totalDetailLines = 0;
 
 	constructor(
 		tui: any,
@@ -1039,14 +1078,16 @@ export class TodoTreeOverlayComponent implements Component {
 		const totalLines = this.tui?.terminal?.rows || 24;
 
 		this.boxWidth = Math.min(100, Math.max(50, Math.floor(width * 0.88)));
-		this.boxHeight = Math.min(32, Math.max(14, Math.floor(totalLines * 0.82)));
+		this.boxHeight = Math.min(34, Math.max(16, Math.floor(totalLines * 0.85)));
 		this.boxLeft = Math.max(0, Math.floor((width - this.boxWidth) / 2));
 		this.boxTop = Math.max(0, Math.floor((totalLines - this.boxHeight) / 2));
 
 		const flat = this.store.getFlattenedTree();
 		const stats = this.store.getProgressStats();
 
-		this.listHeight = Math.max(4, this.boxHeight - 7);
+		// Bottom fixed rows: TopBorder(1) + Stats(1) + Divider(1) + [TreeList] + Divider(1) + [Detail(5)] + Actions(1) + BottomBorder(1) = 11 fixed
+		this.detailHeight = 5;
+		this.listHeight = Math.max(4, this.boxHeight - 11);
 
 		if (this.selectedIndex >= flat.length) this.selectedIndex = Math.max(0, flat.length - 1);
 		if (this.selectedIndex < 0) this.selectedIndex = 0;
@@ -1217,26 +1258,100 @@ export class TodoTreeOverlayComponent implements Component {
 		// 5. Divider
 		lines.push(`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "├" + "─".repeat(innerWidth) + "┤")}`);
 
-		// 6. Selected task details
+		// 6. Selected task details & notes pane (up to 5 lines with scrollbar support)
 		const selectedTask = flat[this.selectedIndex]?.node.item;
-		let detailText = "No task selected";
-		if (selectedTask) {
-			const statusLabel = `[${selectedTask.status.toUpperCase()}]`;
-			const lastNote = selectedTask.notes && selectedTask.notes.length > 0
-				? ` | Note: ${selectedTask.notes[selectedTask.notes.length - 1].text}`
-				: selectedTask.description
-					? ` | ${selectedTask.description}`
-					: "";
-			detailText = `#${selectedTask.id} ${selectedTask.subject} ${statusLabel}${lastNote}`;
+		if (selectedTask?.id !== this.lastSelectedTaskId) {
+			this.lastSelectedTaskId = selectedTask ? selectedTask.id : null;
+			this.detailScrollTop = 0;
 		}
-		const truncDetail = truncateToWidth(detailText, innerWidth - 2);
-		const detailPad = Math.max(0, innerWidth - 2 - visibleWidth(truncDetail));
-		lines.push(
-			`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "│ ")}${this.theme.fg("muted", truncDetail)}${" ".repeat(detailPad)} ${this.theme.fg("accent", "│")}`,
-		);
+
+		const detailContentLines: Array<{ text: string; colorKey?: string; bold?: boolean }> = [];
+		if (selectedTask) {
+			const { glyph, colorKey: statusColor } = getStatusGlyph(selectedTask.status);
+			const titleStr = `#${selectedTask.id} ${selectedTask.subject} [${selectedTask.status.toUpperCase()}] ${glyph}`;
+			detailContentLines.push({ text: `ℹ ${titleStr}`, colorKey: "accent", bold: true });
+
+			if (selectedTask.description && selectedTask.description.trim()) {
+				const descWrapped = wrapTextToWidth(selectedTask.description.trim(), innerWidth - 8);
+				for (let i = 0; i < descWrapped.length; i++) {
+					const pfx = i === 0 ? "  Desc : " : "         ";
+					detailContentLines.push({ text: `${pfx}${descWrapped[i]}`, colorKey: "text" });
+				}
+			}
+
+			const notes = selectedTask.notes || [];
+			if (notes.length > 0) {
+				detailContentLines.push({ text: `💬 Notes (${notes.length}):`, colorKey: "warning", bold: true });
+				for (const note of notes) {
+					const authorTag = note.author === "agent" ? "[Agent]" : "[User]";
+					const noteWrapped = wrapTextToWidth(note.text, innerWidth - 12);
+					for (let i = 0; i < noteWrapped.length; i++) {
+						if (i === 0) {
+							detailContentLines.push({
+								text: `  • ${authorTag}: ${noteWrapped[i]}`,
+								colorKey: note.author === "agent" ? "accent" : "text",
+							});
+						} else {
+							detailContentLines.push({
+								text: `    ${noteWrapped[i]}`,
+								colorKey: note.author === "agent" ? "accent" : "text",
+							});
+						}
+					}
+				}
+			} else {
+				detailContentLines.push({ text: "💬 Notes (0): (Press [n] to add note)", colorKey: "muted" });
+			}
+		} else {
+			detailContentLines.push({ text: "No task selected", colorKey: "muted" });
+		}
+
+		this.totalDetailLines = detailContentLines.length;
+		const maxDetailScroll = Math.max(0, this.totalDetailLines - this.detailHeight);
+		if (this.detailScrollTop > maxDetailScroll) this.detailScrollTop = maxDetailScroll;
+		if (this.detailScrollTop < 0) this.detailScrollTop = 0;
+
+		const detailScrollbarActive = this.totalDetailLines > this.detailHeight;
+		const detailThumbHeight = detailScrollbarActive
+			? Math.max(1, Math.round((this.detailHeight / this.totalDetailLines) * this.detailHeight))
+			: 0;
+		const detailThumbTop = detailScrollbarActive && maxDetailScroll > 0
+			? Math.round((this.detailScrollTop / maxDetailScroll) * (this.detailHeight - detailThumbHeight))
+			: 0;
+
+		const detailInteriorWidth = innerWidth - (detailScrollbarActive ? 1 : 0);
+
+		for (let row = 0; row < this.detailHeight; row++) {
+			const lineIdx = this.detailScrollTop + row;
+			let rowStr = "";
+			if (lineIdx < detailContentLines.length) {
+				const item = detailContentLines[lineIdx];
+				const trunc = truncateToWidth(item.text, detailInteriorWidth - 2);
+				let styled = this.theme.fg(item.colorKey || "text", trunc);
+				if (item.bold) {
+					styled = this.theme.style(trunc, { bold: true, fg: item.colorKey || "text" });
+				}
+				const pad = Math.max(0, detailInteriorWidth - 2 - visibleWidth(trunc));
+				rowStr = ` ${styled}${" ".repeat(pad)} `;
+			} else {
+				rowStr = " ".repeat(detailInteriorWidth);
+			}
+
+			let scrollChar = "";
+			if (detailScrollbarActive) {
+				if (row >= detailThumbTop && row < detailThumbTop + detailThumbHeight) {
+					scrollChar = this.theme.fg("accent", "█");
+				} else {
+					scrollChar = this.theme.fg("scrollbarTrack", "│");
+				}
+			}
+
+			lines.push(`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "│")}${rowStr}${scrollChar}${this.theme.fg("accent", "│")}`);
+		}
 
 		// 7. Actions row
-		const actions = "[Space] Fold  [n] Note  [c] Done  [x] Cancel  [Esc] Close";
+		const scrollHint = detailScrollbarActive ? "  [PgUp/PgDn] Scroll Detail" : "";
+		const actions = `[Space] Fold  [n] Note  [c] Done  [x] Cancel${scrollHint}  [Esc] Close`;
 		const actTrunc = truncateToWidth(actions, innerWidth - 2);
 		const actPad = Math.max(0, innerWidth - 2 - visibleWidth(actTrunc));
 		lines.push(
@@ -1276,6 +1391,7 @@ export class TodoTreeOverlayComponent implements Component {
 		if (matchesKey(data, Key.up) || data === "up" || data === "k") {
 			if (this.selectedIndex > 0) {
 				this.selectedIndex--;
+				this.detailScrollTop = 0;
 				this.tui?.requestRender?.();
 			}
 			return;
@@ -1284,19 +1400,29 @@ export class TodoTreeOverlayComponent implements Component {
 		if (matchesKey(data, Key.down) || data === "down" || data === "j") {
 			if (this.selectedIndex < flat.length - 1) {
 				this.selectedIndex++;
+				this.detailScrollTop = 0;
 				this.tui?.requestRender?.();
 			}
 			return;
 		}
 
 		if (matchesKey(data, Key.pageUp) || data === "pageup") {
-			this.selectedIndex = Math.max(0, this.selectedIndex - this.listHeight);
+			if (this.detailScrollTop > 0) {
+				this.detailScrollTop = Math.max(0, this.detailScrollTop - 2);
+			} else {
+				this.selectedIndex = Math.max(0, this.selectedIndex - this.listHeight);
+			}
 			this.tui?.requestRender?.();
 			return;
 		}
 
 		if (matchesKey(data, Key.pageDown) || data === "pagedown") {
-			this.selectedIndex = Math.min(flat.length - 1, this.selectedIndex + this.listHeight);
+			const maxDetail = Math.max(0, this.totalDetailLines - this.detailHeight);
+			if (this.detailScrollTop < maxDetail) {
+				this.detailScrollTop = Math.min(maxDetail, this.detailScrollTop + 2);
+			} else {
+				this.selectedIndex = Math.min(flat.length - 1, this.selectedIndex + this.listHeight);
+			}
 			this.tui?.requestRender?.();
 			return;
 		}
@@ -1383,6 +1509,7 @@ export class TodoTreeOverlayComponent implements Component {
 				if (targetIndex < flat.length) {
 					const wasSelected = this.selectedIndex === targetIndex;
 					this.selectedIndex = targetIndex;
+					this.detailScrollTop = 0;
 					const itemEntry = flat[targetIndex];
 					const { node, hasChildren } = itemEntry;
 
@@ -1396,7 +1523,6 @@ export class TodoTreeOverlayComponent implements Component {
 						}
 
 						// Fold icon column range on screen:
-						// this.boxLeft + 1 (border │) + 2 (pointerPrefix) + prefixWidth
 						const foldColStart = this.boxLeft + 1 + 2 + prefixWidth;
 						const foldColEnd = foldColStart + 2;
 
@@ -1414,8 +1540,18 @@ export class TodoTreeOverlayComponent implements Component {
 				}
 			}
 
+			// Details pane row click: clicking inside details area triggers note prompt if clicking notes header
+			const detailRelativeY = boxY - (3 + this.listHeight + 1);
+			if (detailRelativeY >= 0 && detailRelativeY < this.detailHeight) {
+				const flat = this.store.getFlattenedTree();
+				const current = flat[this.selectedIndex];
+				// If user clicks on details area
+				this.tui?.requestRender?.();
+				return { handled: true };
+			}
+
 			// Actions row click: [Space] Fold  [n] Note  [c] Done  [x] Cancel  [Esc] Close
-			if (boxY === 3 + this.listHeight + 2) {
+			if (boxY === 3 + this.listHeight + 1 + this.detailHeight) {
 				const flat = this.store.getFlattenedTree();
 				const current = flat[this.selectedIndex];
 				const relX = event.x - this.boxLeft;
@@ -1454,15 +1590,33 @@ export class TodoTreeOverlayComponent implements Component {
 
 		if (event.type === "wheel") {
 			const delta = event.wheelDelta ?? (event as any).deltaY ?? 0;
+			const boxY = event.y - this.boxTop;
+
+			// If mouse is over details pane: scroll details!
+			const detailStart = 3 + this.listHeight + 1;
+			if (boxY >= detailStart && boxY < detailStart + this.detailHeight) {
+				const maxDetail = Math.max(0, this.totalDetailLines - this.detailHeight);
+				if (delta > 0) {
+					this.detailScrollTop = Math.min(maxDetail, this.detailScrollTop + 1);
+				} else if (delta < 0) {
+					this.detailScrollTop = Math.max(0, this.detailScrollTop - 1);
+				}
+				this.tui?.requestRender?.();
+				return { handled: true };
+			}
+
+			// Otherwise: scroll tree list
 			const flat = this.store.getFlattenedTree();
 			const maxScroll = Math.max(0, flat.length - this.listHeight);
 
 			if (delta > 0) {
 				this.scrollTop = Math.min(maxScroll, this.scrollTop + 2);
 				this.selectedIndex = Math.min(flat.length - 1, this.selectedIndex + 2);
+				this.detailScrollTop = 0;
 			} else if (delta < 0) {
 				this.scrollTop = Math.max(0, this.scrollTop - 2);
 				this.selectedIndex = Math.max(0, this.selectedIndex - 2);
+				this.detailScrollTop = 0;
 			}
 			this.tui?.requestRender?.();
 			return { handled: true };
