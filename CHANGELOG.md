@@ -4,6 +4,14 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- feat(rolling-tools): replace overlay button glyph with `[⊞]` and add a dynamic view-mode toggle button on its left.
+  - Replaced the narrow mathematical character `[⤢]` with `[⊞]` for a clearer window/overlay aesthetic.
+  - Added a clickable view mode toggle button directly to the left of `[⊞]`:
+    - **Running mode (`[⚡ 运行中 (N)]`)**: Only active, running tasks are displayed; dynamically adapts height so multiple concurrent running tasks are all shown simultaneously.
+    - **Fixed mode (`[☰ 最近 N 行]`)**: Displays the most recent `maxRecentTools` items (default 3 rows); the label dynamically reads the configured `maxRecentTools` value rather than hardcoding "3".
+  - Added `defaultViewMode` configuration option (`"fixed"` | `"running"`, default `"fixed"`).
+  - Added `/rolling-tools mode [running|fixed]` CLI command.
+  - Persist active `viewMode` across session restore and `/reload`.
 - feat(rolling-tools): unify plugin tips into the footer status line (config schema v3).
   - `interceptNotifications` now defaults to `[{ "match": "*", "suppressToast": true }]`, so every plugin's `notify(..., "info")` tip is suppressed from the transcript instead of only SoL-Pi's.
   - `error` / `warning` notifications, and any `info` message containing a `notificationKeywords` word (default: `error`, `failed`, `failure`, `warning`, `错误`, `失败`, `警告`, `⚠`, `❌`, `🔴`), always pass through.

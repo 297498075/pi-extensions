@@ -36,6 +36,8 @@ interface StatusEnhancementRule {
 	persistentKeys?: string[];
 }
 
+type ViewMode = "fixed" | "running";
+
 /**
  * 滚动条与工具静音配置结构
  */
@@ -45,6 +47,8 @@ interface RollingToolsConfig {
 	managedTools: string[];
 	silencedTools?: string[];
 	widgetTools?: string[];
+	/** 默认视图模式：fixed（固定展示最近行数）或 running（仅展示正在执行的任务） */
+	defaultViewMode?: ViewMode;
 	genericPropertyFallbacks: string[];
 	interceptNotifications: InterceptNotificationRule[];
 	statusEnhancements?: StatusEnhancementRule[];
@@ -83,6 +87,7 @@ const DEFAULT_NOTIFICATION_KEYWORDS = [
 const DEFAULT_CONFIG: RollingToolsConfig = {
 	enabled: true,
 	maxRecentTools: 3,
+	defaultViewMode: "fixed",
 	// 默认托管全部工具（含 edit / write / codemode 及任意三方工具）。
 	// 具体静音与收录范围由 silencedTools / widgetTools 决定。
 	managedTools: ["*"],
@@ -166,16 +171,25 @@ interface WidgetState {
 	expandedItemId: string | null;
 	copyFeedbackMessage: string | null;
 	completedMessage: string | null;
+	viewMode: ViewMode;
 }
 
 type LineKind = "header" | "detail_copyable" | "detail_info" | "other";
+
+interface ButtonBounds {
+	modeBtnStart?: number;
+	modeBtnEnd?: number;
+	overlayBtnStart?: number;
+	overlayBtnEnd?: number;
+}
 
 interface RenderedLineInfo {
 	item: ToolItem | null;
 	width: number;
 	kind: LineKind;
 	textToCopy?: string;
-	/** 该行最右侧是否存在 [⤢] 展开按钮 */
+	buttonBounds?: ButtonBounds;
+	/** 该行最右侧是否存在 [⊞] 展开按钮 */
 	hasOverlayButton?: boolean;
 }
 
@@ -307,6 +321,10 @@ function mergeConfig(base: RollingToolsConfig, override: Partial<RollingToolsCon
 			typeof override.maxRecentTools === "number" && override.maxRecentTools > 0
 				? override.maxRecentTools
 				: base.maxRecentTools,
+		defaultViewMode:
+			override.defaultViewMode === "running" || override.defaultViewMode === "fixed"
+				? override.defaultViewMode
+				: base.defaultViewMode ?? "fixed",
 		managedTools: mergedManagedTools,
 		silencedTools: hasExplicitSilenced
 			? [...override.silencedTools!]
@@ -808,7 +826,11 @@ const HISTORY_ENTRY_TYPE = "rolling-tools-history";
 const PERSIST_MAX_ITEMS = 200;
 const PERSIST_MAX_FIELD = 20000;
 
-function serializeHistory(items: ToolItem[], total: number): { total: number; items: any[] } {
+function serializeHistory(
+	items: ToolItem[],
+	total: number,
+	viewMode?: ViewMode,
+): { total: number; items: any[]; viewMode?: ViewMode } {
 	const trimmed = items.slice(-PERSIST_MAX_ITEMS).map((t) => ({
 		id: t.id,
 		index: t.index,
@@ -824,10 +846,10 @@ function serializeHistory(items: ToolItem[], total: number): { total: number; it
 		durationMs: t.durationMs,
 		startTime: t.startTime,
 	}));
-	return { total, items: trimmed };
+	return { total, items: trimmed, viewMode };
 }
 
-function deserializeHistory(data: any): { items: ToolItem[]; total: number } | null {
+function deserializeHistory(data: any): { items: ToolItem[]; total: number; viewMode?: ViewMode } | null {
 	if (!data || !Array.isArray(data.items)) return null;
 	const items: ToolItem[] = data.items.map((raw: any) => ({
 		id: String(raw.id ?? ""),
@@ -844,7 +866,9 @@ function deserializeHistory(data: any): { items: ToolItem[]; total: number } | n
 		durationMs: typeof raw.durationMs === "number" ? raw.durationMs : undefined,
 		startTime: Number(raw.startTime ?? Date.now()),
 	}));
-	return { items, total: Number(data.total ?? items.length) };
+	const viewMode: ViewMode | undefined =
+		data.viewMode === "running" || data.viewMode === "fixed" ? data.viewMode : undefined;
+	return { items, total: Number(data.total ?? items.length), viewMode };
 }
 
 /**
@@ -894,8 +918,10 @@ class RollingToolsWidgetComponent implements Component {
 	private state: WidgetState;
 	private lineMap: RenderedLineInfo[] = [];
 	private copyFeedbackTimer: any = null;
-	/** 点击 [⤢] 按钮时的回调，由外部注入以打开 overlay 大窗体 */
+	/** 点击 [⊞] 按钮时的回调，由外部注入以打开 overlay 大窗体 */
 	private onOpenOverlay: ((item?: ToolItem) => void) | null = null;
+	/** 切换视图模式时的回调 */
+	private onToggleMode: ((newMode: ViewMode) => void) | null = null;
 	/** widget 中最多展示的条目数（overlay 仍可浏览全部历史） */
 	private displayLimit: number;
 
@@ -905,12 +931,14 @@ class RollingToolsWidgetComponent implements Component {
 		state: WidgetState,
 		onOpenOverlay?: (item?: ToolItem) => void,
 		displayLimit = 3,
+		onToggleMode?: (newMode: ViewMode) => void,
 	) {
 		this.tui = tui;
 		this.theme = theme;
 		this.state = state;
 		this.onOpenOverlay = onOpenOverlay ?? null;
 		this.displayLimit = Math.max(1, displayLimit);
+		this.onToggleMode = onToggleMode ?? null;
 	}
 
 	render(width: number): string[] {
@@ -924,7 +952,7 @@ class RollingToolsWidgetComponent implements Component {
 			item: ToolItem | null = null,
 			kind: LineKind = "other",
 			textToCopy?: string,
-			hasOverlayButton = false,
+			buttonBounds?: ButtonBounds,
 		) => {
 			lines.push(text);
 			this.lineMap.push({
@@ -932,14 +960,27 @@ class RollingToolsWidgetComponent implements Component {
 				width: visibleWidth(text),
 				kind,
 				textToCopy,
-				hasOverlayButton,
+				buttonBounds,
+				hasOverlayButton: Boolean(buttonBounds?.overlayBtnStart !== undefined),
 			});
 		};
 
 		// 1. 常驻状态行（等待服务器响应 ➔ 思考中 ➔ 思考完成，共用一行平滑过渡）
-		// 该行始终存在，作为滚动块的固定头部；[⤢] 大窗体按钮固定显示在本行最右侧。
+		// 该行始终存在，作为滚动块的固定头部；[⊞] 大窗体按钮与模式切换按钮固定显示在本行最右侧。
 		{
-			const button = theme.fg("accent", "[⤢]");
+			const runningCount = this.state.recentTools.filter((t) => t.status === "running").length;
+			const modeBtnRaw =
+				this.state.viewMode === "running"
+					? `[⚡ 运行中 (${runningCount})]`
+					: `[☰ 最近 ${this.displayLimit} 行]`;
+			const modeBtnColored =
+				this.state.viewMode === "running"
+					? theme.fg("accent", modeBtnRaw)
+					: theme.fg("dim", modeBtnRaw);
+
+			const overlayBtnRaw = "[⊞]";
+			const overlayBtnColored = theme.fg("accent", overlayBtnRaw);
+
 			let statusText: string;
 			if (this.state.headerStatus.type === "waiting_server") {
 				const elapsedSec = ((Date.now() - this.state.headerStatus.startTime) / 1000).toFixed(1);
@@ -955,12 +996,34 @@ class RollingToolsWidgetComponent implements Component {
 			} else {
 				statusText = ` ${theme.fg("accent", "•")} ${theme.fg("muted", "就绪")}`;
 			}
-			const pad = Math.max(1, renderWidth - visibleWidth(statusText) - visibleWidth(button) - 1);
-			pushLine(`${statusText}${' '.repeat(pad)}${button}`, null, "header", undefined, true);
+
+			const buttonsRawWidth = visibleWidth(modeBtnRaw) + 1 + visibleWidth(overlayBtnRaw);
+			const pad = Math.max(1, renderWidth - visibleWidth(statusText) - buttonsRawWidth - 1);
+			const headerLine = `${statusText}${' '.repeat(pad)}${modeBtnColored} ${overlayBtnColored}`;
+			const lineW = visibleWidth(headerLine);
+
+			const overlayBtnStart = lineW - visibleWidth(overlayBtnRaw);
+			const overlayBtnEnd = lineW;
+			const modeBtnEnd = overlayBtnStart - 1;
+			const modeBtnStart = modeBtnEnd - visibleWidth(modeBtnRaw);
+
+			pushLine(headerLine, null, "header", undefined, {
+				modeBtnStart,
+				modeBtnEnd,
+				overlayBtnStart,
+				overlayBtnEnd,
+			});
 		}
 
-		// 2. 滚动工具列表（widget 只展示最近 displayLimit 条，完整历史在 overlay 中查看）
-		const visibleTools = this.state.recentTools.slice(-this.displayLimit);
+		// 2. 滚动工具列表（根据当前 viewMode 过滤展示）
+		let visibleTools: ToolItem[];
+		if (this.state.viewMode === "running") {
+			// 模式 1：只显示正在执行的任务（支持多个并发执行任务自适应全部展示）
+			visibleTools = this.state.recentTools.filter((t) => t.status === "running");
+		} else {
+			// 模式 2：固定显示一段高度（由 displayLimit 决定，默认 3 行或由配置读取）
+			visibleTools = this.state.recentTools.slice(-this.displayLimit);
+		}
 		for (const t of visibleTools) {
 			const isExpanded = this.state.expandedItemId === t.id;
 			let icon = theme.fg("accent", "⏳");
@@ -1066,8 +1129,30 @@ class RollingToolsWidgetComponent implements Component {
 		}
 
 		if (event.type === "click" && isWithinText) {
-			// 0. 点击最右侧 [⤢] 按钮：打开 overlay 大窗体
-			if (lineEntry?.hasOverlayButton && event.button !== "right") {
+			// 0. 头部按钮点击处理（模式切换按钮与 [⊞] 大窗体按钮）
+			if (lineEntry?.buttonBounds && event.button !== "right") {
+				const { modeBtnStart, overlayBtnStart } = lineEntry.buttonBounds;
+				// 点击最右侧 [⊞] 按钮：打开 overlay 大窗体
+				if (overlayBtnStart !== undefined && event.x >= overlayBtnStart) {
+					this.onOpenOverlay?.(targetItem ?? undefined);
+					return { handled: true };
+				}
+				// 点击层级/模式切换按钮：在“固定最近行数”与“仅显示正在执行”之间切换
+				if (
+					modeBtnStart !== undefined &&
+					overlayBtnStart !== undefined &&
+					event.x >= modeBtnStart &&
+					event.x < overlayBtnStart
+				) {
+					this.state.viewMode = this.state.viewMode === "fixed" ? "running" : "fixed";
+					this.onToggleMode?.(this.state.viewMode);
+					this.tui?.requestRender?.();
+					return { handled: true };
+				}
+			}
+
+			// 兼容旧版仅标记 hasOverlayButton 的情况
+			if (lineEntry?.hasOverlayButton && !lineEntry.buttonBounds && event.button !== "right") {
 				const buttonStart = Math.max(0, lineEntry.width - 4);
 				if (event.x >= buttonStart) {
 					this.onOpenOverlay?.(targetItem ?? undefined);
@@ -1759,6 +1844,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		expandedItemId: null,
 		copyFeedbackMessage: null,
 		completedMessage: null,
+		viewMode: currentConfig.defaultViewMode ?? "fixed",
 	};
 
 	/** 当前打开的历史大窗体（用于实时刷新与去重） */
@@ -1879,7 +1965,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	/**
 	 * 从当前 session 的 entries 中恢复最近一次滚动历史快照。
 	 */
-	function restoreHistoryFromSession(ctx: any): { items: ToolItem[]; total: number } | null {
+	function restoreHistoryFromSession(
+		ctx: any,
+	): { items: ToolItem[]; total: number; viewMode?: ViewMode } | null {
 		try {
 			const entries = ctx?.sessionManager?.getEntries?.();
 			if (!Array.isArray(entries)) return null;
@@ -1901,7 +1989,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	function persistHistory(): void {
 		if (!currentConfig.persistAcrossSessions) return;
 		try {
-			pi.appendEntry(HISTORY_ENTRY_TYPE, serializeHistory(state.recentTools, totalToolCount));
+			pi.appendEntry(HISTORY_ENTRY_TYPE, serializeHistory(state.recentTools, totalToolCount, state.viewMode));
 		} catch (e) {
 			console.error("[rolling-tools] Failed to persist history:", e);
 		}
@@ -1929,6 +2017,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 						openHistoryOverlay(ctx, item);
 					},
 					currentConfig.maxRecentTools,
+					() => {
+						persistHistory();
+					},
 				),
 			{ placement: "aboveEditor" },
 		);
@@ -2053,6 +2144,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			if (restored && restored.items.length > 0) {
 				state.recentTools = restored.items;
 				totalToolCount = restored.total;
+				if (restored.viewMode) {
+					state.viewMode = restored.viewMode;
+				}
 			}
 		}
 
@@ -2295,7 +2389,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				const info = [
 					`rolling-tools 状态:`,
 					`• 运行状态: ${currentConfig.enabled ? "已开启" : "已关闭"}`,
+					`• 当前视图模式: ${state.viewMode === "running" ? "仅显示正在执行的任务" : `固定最近 ${currentConfig.maxRecentTools} 行`}`,
 					`• widget 展示条数: ${currentConfig.maxRecentTools}（历史共 ${state.recentTools.length} 条）`,
+					`• 默认视图模式: ${currentConfig.defaultViewMode ?? "fixed"}`,
 					`• 静音工具规则: ${(currentConfig.silencedTools ?? currentConfig.managedTools).join(", ")}`,
 					`• 收录工具规则: ${(currentConfig.widgetTools ?? currentConfig.managedTools).join(", ")}`,
 					`• 懒加载步长: ${currentConfig.lazyLoadStep ?? 10} 条/次`,
@@ -2306,6 +2402,21 @@ export default function rollingTools(pi: ExtensionAPI): void {
 					`• 剥离工具行提示头: ${currentConfig.stripToolNotificationHeaders !== false ? "已开启" : "已关闭"}`,
 				].join("\n");
 				ctx.ui?.notify?.(info, "info");
+			} else if (action === "mode" || action.startsWith("mode ")) {
+				const target = action.slice(4).trim().toLowerCase();
+				if (target === "running") {
+					state.viewMode = "running";
+				} else if (target === "fixed") {
+					state.viewMode = "fixed";
+				} else {
+					state.viewMode = state.viewMode === "fixed" ? "running" : "fixed";
+				}
+				syncWidget(ctx);
+				persistHistory();
+				ctx.ui?.notify?.(
+					`rolling-tools: 视图模式已切换为「${state.viewMode === "running" ? "仅显示正在执行的任务" : `固定最近 ${currentConfig.maxRecentTools} 行`}」`,
+					"info",
+				);
 			} else if (action === "history" || action === "open") {
 				openHistoryOverlay(ctx);
 			} else {

@@ -350,7 +350,7 @@ await registeredCommand.handler("reload", fakeCtx);
 assert.ok(lastCmdNotification?.includes("配置已重载"), "reload command works");
 console.log("  ✓ All commands (status, off, on, reload) work as expected.");
 
-console.log("\n=== Test 6: [⤢] Button & Overlay Dialog ===");
+console.log("\n=== Test 6: [⊞] Button & Overlay Dialog ===");
 // 先制造足够多的历史（> 懒加载步长 10），以便验证懒加载
 for (let i = 0; i < 15; i++) {
 	for (const h of toolCallHandlers) {
@@ -375,18 +375,22 @@ for (let i = 0; i < 15; i++) {
 		);
 	}
 }
-// 重新渲染 widget，确认头部行常驻且 [⤢] 按钮位于头部行
+// 重新渲染 widget，确认头部行常驻且 [⊞] 按钮与层级切换按钮位于头部行
 let wLines = widgetContent(dummyTui, dummyTheme).render(100);
 assert.ok(
-	wLines.length > 0 && wLines[0].includes("[⤢]"),
-	"the persistent header row must render the [⤢] button on the right",
+	wLines.length > 0 && wLines[0].includes("[⊞]"),
+	"the persistent header row must render the [⊞] button on the right",
+);
+assert.ok(
+	wLines.length > 0 && wLines[0].includes("[☰ 最近 3 行]"),
+	"the persistent header row must render the mode toggle button [☰ 最近 3 行]",
 );
 assert.equal(
-	wLines.filter((l) => l.includes("[⤢]")).length,
+	wLines.filter((l) => l.includes("[⊞]")).length,
 	1,
-	"only the header row should carry the [⤢] button (not each tool row)",
+	"only the header row should carry the [⊞] button (not each tool row)",
 );
-console.log("  ✓ persistent header row renders a single [⤢] button.");
+console.log("  ✓ persistent header row renders mode button and [⊞] button.");
 
 // 模拟点击头部最右侧按钮，应触发 ui.custom(overlay)
 let overlayFactory = null;
@@ -402,8 +406,8 @@ fakeUi.custom = (factory, options) => {
 
 const widgetComp = widgetContent(dummyTui, dummyTheme);
 wLines = widgetComp.render(100);
-const buttonRow = wLines.findIndex((l) => l.includes("[⤢]"));
-assert.equal(buttonRow, 0, "the [⤢] button must be on the header row (row 0)");
+const buttonRow = wLines.findIndex((l) => l.includes("[⊞]"));
+assert.equal(buttonRow, 0, "the [⊞] button must be on the header row (row 0)");
 // 鼠标 x 坐标是终端列（可见宽度），不是 UTF-16 长度
 const rowWidth = visibleWidth(wLines[buttonRow]);
 widgetComp.handleMouse({
@@ -419,10 +423,10 @@ widgetComp.handleMouse({
 	alt: false,
 	ctrl: false,
 });
-assert.ok(overlayFactory, "clicking [⤢] must invoke ui.custom to open the overlay");
+assert.ok(overlayFactory, "clicking [⊞] must invoke ui.custom to open the overlay");
 assert.equal(overlayOptions?.overlay, true, "overlay dialog must be opened as an overlay");
 assert.ok(overlayOptions?.overlayOptions?.width, "overlay must specify a width");
-console.log("  ✓ clicking [⤢] opens an overlay dialog via ui.custom.");
+console.log("  ✓ clicking [⊞] opens an overlay dialog via ui.custom.");
 
 // 构建 overlay 组件并验证边框 + 懒加载 + 滚轮
 const overlayComp = overlayFactory(dummyTui, dummyTheme, {}, () => {});
@@ -613,8 +617,8 @@ for (const h of toolResultHandlers) {
 overlayFactory = null;
 const widgetComp2 = widgetContent(dummyTui, dummyTheme);
 const wl2 = widgetComp2.render(100);
-// 头部行（row 0）带 [⤢] 按钮
-const btnRow2 = wl2.findIndex((l) => l.includes("[⤢]"));
+// 头部行（row 0）带 [⊞] 按钮
+const btnRow2 = wl2.findIndex((l) => l.includes("[⊞]"));
 widgetComp2.handleMouse({
 	type: "click",
 	button: "left",
@@ -821,14 +825,14 @@ assert.ok(
 );
 console.log("  ✓ history restored after /reload (fresh module instance).");
 
-// [⤢] 在恢复后应能打开大窗体
+// [⊞] 在恢复后应能打开大窗体
 let reloadOverlayFactory = null;
 newEnv.ctx.ui.custom = (f) => {
 	reloadOverlayFactory = f;
 	return Promise.resolve();
 };
 const rl = restoredWidget.render(100);
-const rBtnRow = rl.findIndex((l) => l.includes("[⤢]"));
+const rBtnRow = rl.findIndex((l) => l.includes("[⊞]"));
 restoredWidget.handleMouse({
 	type: "click",
 	button: "left",
@@ -842,8 +846,8 @@ restoredWidget.handleMouse({
 	alt: false,
 	ctrl: false,
 });
-assert.ok(reloadOverlayFactory, "[⤢] must open the overlay after /reload restore");
-console.log("  ✓ [⤢] works after /reload restore.");
+assert.ok(reloadOverlayFactory, "[⊞] must open the overlay after /reload restore");
+console.log("  ✓ [⊞] works after /reload restore.");
 
 console.log("\n=== Test 10: Tool-Header Stripping (channel C) & v2→v3 Notice ===");
 // (a) NotificationHeaderStripper: 通过 registerToolRenderer 注册的 resolver 应能剥掉提示头
@@ -947,6 +951,145 @@ assert.ok(v2Notice.msg.includes("durationMs"), "the notice must document the new
 assert.ok(v2Notice.msg.includes("stripToolNotificationHeaders"), "the notice must document stripToolNotificationHeaders");
 assert.ok(v2Notice.msg.includes("notificationKeywords"), "the notice must document notificationKeywords");
 console.log("  ✓ v2 config triggers a v2→v3 notice documenting new defaults.");
+
+console.log("\n=== Test 11: View Mode Toggle (Fixed N-Rows vs. Running Tasks Only) ===");
+const handlers11 = new Map();
+let widgetFactory11 = null;
+let currentCmd11 = null;
+const appendedEntries11 = [];
+const fakeUi11 = {
+	setWidget(k, c) {
+		if (typeof c === "function") widgetFactory11 = c;
+	},
+	notify() {},
+	setStatus() {},
+	setToolsExpanded() {},
+	requestRender() {},
+	custom() {
+		return Promise.resolve();
+	},
+};
+const fakePi11 = {
+	on(e, h) {
+		const l = handlers11.get(e) || [];
+		l.push(h);
+		handlers11.set(e, l);
+	},
+	registerCommand(n, c) {
+		currentCmd11 = { name: n, ...c };
+	},
+	appendEntry(customType, data) {
+		appendedEntries11.push({ type: "custom", customType, data });
+	},
+};
+const ctx11 = {
+	hasUI: true,
+	ui: fakeUi11,
+	cwd: process.cwd(),
+	sessionManager: { getEntries: () => appendedEntries11 },
+};
+
+rollingTools(fakePi11);
+for (const h of handlers11.get("session_start") || []) await h({ reason: "startup" }, ctx11);
+
+// 先插入 5 个已完成任务
+for (let i = 0; i < 5; i++) {
+	for (const h of handlers11.get("tool_call") || []) {
+		await h({ toolCallId: `call_done_${i}`, toolName: "read", input: { path: `f${i}.ts` } }, ctx11);
+	}
+	for (const h of handlers11.get("tool_result") || []) {
+		await h(
+			{
+				toolCallId: `call_done_${i}`,
+				toolName: "read",
+				isError: false,
+				content: [{ type: "text", text: `ok ${i}` }],
+			},
+			ctx11,
+		);
+	}
+}
+
+// 插入 2 个正在执行的任务（running）
+for (const id of ["call_run_A", "call_run_B"]) {
+	for (const h of handlers11.get("tool_call") || []) {
+		await h({ toolCallId: id, toolName: "bash", input: { command: `sleep 10 (${id})` } }, ctx11);
+	}
+}
+
+// 1. 验证默认 fixed 模式：渲染最近 3 行（读取配置的 maxRecentTools）
+let w11 = widgetFactory11(dummyTui, dummyTheme);
+let lines11 = w11.render(100);
+assert.ok(lines11[0].includes("[☰ 最近 3 行]"), "header must show [☰ 最近 3 行] in fixed mode");
+assert.ok(lines11[0].includes("[⊞]"), "header must show [⊞] button");
+// 列表中应包含最近 3 个（call_done_4, call_run_A, call_run_B）
+const toolLinesFixed = lines11.slice(1).filter((l) => l.includes("[") && l.includes("]"));
+assert.equal(toolLinesFixed.length, 3, "in fixed mode, exactly maxRecentTools (3) items should be displayed");
+console.log("  ✓ fixed mode renders [☰ 最近 3 行] and exactly maxRecentTools items.");
+
+// 2. 点击模式切换按钮 -> 切换到 running 模式
+const rowWidth11 = visibleWidth(lines11[0]);
+// 点击模式切换按钮（位于 [⊞] 左侧）
+w11.handleMouse({
+	type: "click",
+	button: "left",
+	x: rowWidth11 - 8,
+	y: 0,
+	screenX: rowWidth11 - 8,
+	screenY: 0,
+	width: 100,
+	height: lines11.length,
+	shift: false,
+	alt: false,
+	ctrl: false,
+});
+
+lines11 = w11.render(100);
+assert.ok(lines11[0].includes("[⚡ 运行中 (2)]"), "after click, header must show [⚡ 运行中 (2)]");
+// 在 running 模式下，仅展示当前正在执行的 2 个任务（自适应高度）
+const toolLinesRunning = lines11.slice(1).filter((l) => l.includes("[") && l.includes("]"));
+assert.equal(toolLinesRunning.length, 2, "in running mode, only running tasks (2) are displayed");
+assert.ok(toolLinesRunning.some((l) => l.includes("call_run_A")), "running task A must be visible");
+assert.ok(toolLinesRunning.some((l) => l.includes("call_run_B")), "running task B must be visible");
+console.log("  ✓ running mode shows [⚡ 运行中 (2)] and only running tasks (adaptive height).");
+
+// 3. 其中一个任务完成 -> 动态变为 1 个
+for (const h of handlers11.get("tool_result") || []) {
+	await h({ toolCallId: "call_run_A", toolName: "bash", isError: false, content: [] }, ctx11);
+}
+lines11 = w11.render(100);
+assert.ok(lines11[0].includes("[⚡ 运行中 (1)]"), "after 1 task finishes, header updates to [⚡ 运行中 (1)]");
+const toolLinesRunningAfter = lines11.slice(1).filter((l) => l.includes("[") && l.includes("]"));
+assert.equal(toolLinesRunningAfter.length, 1, "in running mode, now only 1 task is displayed");
+console.log("  ✓ running mode dynamically updates count and item list as tasks finish.");
+
+// 4. 再次点击模式按钮 -> 切回 fixed 模式
+const rowWidthAfter = visibleWidth(lines11[0]);
+w11.handleMouse({
+	type: "click",
+	button: "left",
+	x: rowWidthAfter - 8,
+	y: 0,
+	screenX: rowWidthAfter - 8,
+	screenY: 0,
+	width: 100,
+	height: lines11.length,
+	shift: false,
+	alt: false,
+	ctrl: false,
+});
+lines11 = w11.render(100);
+assert.ok(lines11[0].includes("[☰ 最近 3 行]"), "header returns to [☰ 最近 3 行] after toggle back");
+console.log("  ✓ clicking toggle button returns to fixed mode.");
+
+// 5. 使用 /rolling-tools mode 命令切换
+await currentCmd11.handler("mode running", ctx11);
+lines11 = w11.render(100);
+assert.ok(lines11[0].includes("[⚡ 运行中 (1)]"), "/rolling-tools mode running switches to running mode");
+await currentCmd11.handler("mode fixed", ctx11);
+lines11 = w11.render(100);
+assert.ok(lines11[0].includes("[☰ 最近 3 行]"), "/rolling-tools mode fixed switches to fixed mode");
+console.log("  ✓ /rolling-tools mode command switches viewMode correctly.");
 
 // 清理临时目录
 rmSync(TEST_AGENT_DIR, { recursive: true, force: true });

@@ -93,9 +93,12 @@ The extension has no network, file, command, or external state side effects. The
 
 - **All tools silenced by default**: Every tool (built-ins, `edit`, `write`, `codemode`, MCP proxies, SoL-Pi `recall`, Trellis `subagent`, and arbitrary third-party tools) is hidden from the transcript by default and rolled into the widget. Tune with `silencedTools` / `widgetTools` (supports `*` wildcards).
 - **Non-intrusive transcript**: Managed tools occupy 0 lines when collapsed, preventing terminal scroll floods. Press `Ctrl+O` to expand if full outputs are needed.
-- **History overlay dialog (`[⤢]`)**: A persistent header row sits above the tool list and carries a `[⤢]` button on its right edge. Clicking it opens a large bordered two-pane overlay dialog showing the full history on the left and the selected tool's complete content on the right — including `edit` diffs, `write` file bodies, full commands, and outputs. The overlay updates live while the agent is still running.
+- **History overlay dialog (`[⊞]`)**: A persistent header row sits above the tool list and carries a `[⊞]` button on its right edge. Clicking it opens a large bordered two-pane overlay dialog showing the full history on the left and the selected tool's complete content on the right — including `edit` diffs, `write` file bodies, full commands, and outputs. The overlay updates live while the agent is still running.
+- **View mode toggle button (`[☰ 最近 N 行]` ⇄ `[⚡ 运行中 (N)]`)**: Positioned directly to the left of `[⊞]`, this button dynamically toggles the rolling list between two display modes:
+  1. **Running tasks only (`running`)**: Only tools currently running are displayed (e.g. concurrent background executions), adapting height dynamically to show all running tasks.
+  2. **Fixed recent rows (`fixed`)**: Displays the most recent `maxRecentTools` executions (default 3 rows, customizable via config). The button label dynamically reflects your configured row count.
 - **Persistent header status line**: The status row (waiting for server → thinking → thinking done) is always visible as the fixed header of the rolling block, and keeps showing `思考完成` after a turn completes.
-- **Sticky history across `/reload`**: The widget and its `[⤢]` dialog keep working after `/reload`; history is re-read from the current session's persisted entries because a reload constructs a fresh extension instance.
+- **Sticky history across `/reload`**: The widget, view mode, and its `[⊞]` dialog keep working after `/reload`; history and view state are re-read from the current session's persisted entries because a reload constructs a fresh extension instance.
 - **Lazy loading with wheel scroll**: The overlay supports native mouse-wheel scrolling. Scrolling up past the top of the list lazily loads the next `lazyLoadStep` (default 10) older entries, so long histories stay responsive without loading everything at once.
 - **Persistent across turns and sessions**: The rolling block no longer resets on each new task. History is kept in memory across turns and persisted to the session via `pi.appendEntry()` (custom type `rolling-tools-history`), so it is restored on `reload`, `resume`, and `fork` when `persistAcrossSessions` is enabled.
 - **Universal tool & MCP support**: Uses dynamic in-place decoration on `ToolExecutionComponent`, supporting built-ins, MCP proxies (`mcp`, `mcp__*`), Rider MCP tools (`rider_execute_tool`), SoL-Pi tools, and arbitrary third-party tools with generic parameter heuristics.
@@ -106,8 +109,9 @@ The extension has no network, file, command, or external state side effects. The
 - **Commands**:
   - `/rolling-tools`: Toggle widget and transcript silencing on/off.
   - `/rolling-tools on` / `/rolling-tools off`: Explicitly enable or disable.
+  - `/rolling-tools mode [running|fixed]`: Switch display mode between running tasks only and fixed recent rows.
   - `/rolling-tools reload`: Hot-reload configuration from disk without restarting Pi.
-  - `/rolling-tools status`: Display current active configuration, tool rules, lazy-load step, and persistence state.
+  - `/rolling-tools status`: Display current active configuration, view mode, tool rules, lazy-load step, and persistence state.
   - `/rolling-tools history` (alias `/rolling-tools open`): Open the history overlay dialog directly.
   - `/rolling-tools migrate`: Upgrade a legacy config (schema v1) to the new all-tools semantics (`["*"]`), writing `configVersion: 2`.
   - Hotkeys: Press `Ctrl+O` in interactive mode to expand the entire transcript and inspect raw tool executions. Inside the overlay: `↑`/`↓` or `j`/`k` select, `PgUp`/`PgDn` scroll details, `Esc`/`q` close.
@@ -132,6 +136,7 @@ Example configuration (`~/.pi/agent/extensions/rolling-tools/config.json`):
 {
   "enabled": true,
   "maxRecentTools": 3,
+  "defaultViewMode": "fixed",
   "lazyLoadStep": 10,
   "persistAcrossSessions": true,
   "configVersion": 3,
