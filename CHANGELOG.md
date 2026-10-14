@@ -4,12 +4,12 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
-- feat(rolling-tools): simplify icons to minimal glyphs `☰` and `⊞` without brackets.
-  - Replaced `[⊞]` with a clean `⊞` glyph for opening the history overlay.
-  - Replaced the verbose mode button with a single `☰` icon:
-    - In running mode: only actively executing tools are shown (adaptive height), without extra status badges cluttering the header.
-    - In fixed mode: shows the most recent `maxRecentTools` executions.
-  - Click `☰` to seamlessly toggle between fixed rows and running tasks.
+- feat(rolling-tools): refine view modes, live task duration ticker, and icons (`🔽`/`⏏️`, `➕`).
+  - Switched overlay dialog button to `➕`.
+  - Switched view mode toggle button to `🔽` (fixed recent rows) and `⏏️` (single-line running mode).
+  - In `running` mode, active tasks are merged directly into the header row (zero vertical height jump/flicker).
+  - Active running tasks now display a live elapsed timer (`(19ms)`, `(2.5s)`) both in the header row and in the multi-row list.
+  - Simplified error rendering: tool failure displays the red cross `✗` on its row; removed redundant multiline `[Error in #N ...]` alert block from the rolling widget.
 - feat(rolling-tools): unify plugin tips into the footer status line (config schema v3).
   - `interceptNotifications` now defaults to `[{ "match": "*", "suppressToast": true }]`, so every plugin's `notify(..., "info")` tip is suppressed from the transcript instead of only SoL-Pi's.
   - `error` / `warning` notifications, and any `info` message containing a `notificationKeywords` word (default: `error`, `failed`, `failure`, `warning`, `错误`, `失败`, `警告`, `⚠`, `❌`, `🔴`), always pass through.

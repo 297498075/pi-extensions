@@ -910,6 +910,80 @@ function isImportantNotification(
 }
 
 /**
+ * 格式化任务耗时：小于 1s 显示 (Xms)，大于等于 1s 显示 (X.Xs)
+ */
+function formatDuration(durationMs: number): string {
+	if (durationMs < 1000) {
+		return ` (${Math.floor(durationMs)}ms)`;
+	}
+	return ` (${(durationMs / 1000).toFixed(1)}s)`;
+}
+
+/**
+ * 格式化正在运行的任务行（用于 running 模式直接合并到状态行，避免高度上下闪动）
+ */
+function formatRunningTasksLine(runningTools: ToolItem[], availableWidth: number, theme: any): string {
+	const spinner = SPINNER_FRAMES[Math.floor(Date.now() / 150) % SPINNER_FRAMES.length];
+	if (runningTools.length === 1) {
+		const t = runningTools[0];
+		const elapsed = Math.max(0, Date.now() - t.startTime);
+		const timeStr = formatDuration(elapsed);
+		const icon = theme.fg("accent", spinner);
+		const badge = theme.fg("dim", `[${t.index}]`);
+		const labelName = t.displayName || t.name;
+		const name = theme.bold(theme.fg("toolTitle", labelName));
+		const time = theme.fg("muted", timeStr);
+
+		const prefixWidth = 1 + 1 + 1 + visibleWidth(`[${t.index}]`) + 1 + visibleWidth(labelName) + 1;
+		const timeWidth = 1 + visibleWidth(timeStr);
+		const maxSummaryWidth = Math.max(0, availableWidth - prefixWidth - timeWidth);
+		const summary =
+			maxSummaryWidth > 0 && t.summaryDisplay
+				? " " + theme.fg("dim", truncate(t.summaryDisplay, maxSummaryWidth))
+				: "";
+		return ` ${icon} ${badge} ${name}${summary}${time}`;
+	}
+
+	// 多个任务并发执行：优先并排展示
+	const parts = runningTools.map((t) => {
+		const elapsed = Math.max(0, Date.now() - t.startTime);
+		const timeStr = formatDuration(elapsed);
+		const icon = theme.fg("accent", spinner);
+		const badge = theme.fg("dim", `[${t.index}]`);
+		const labelName = t.displayName || t.name;
+		const name = theme.bold(theme.fg("toolTitle", labelName));
+		const summary = t.summaryDisplay ? " " + theme.fg("dim", truncate(t.summaryDisplay, 15)) : "";
+		const time = theme.fg("muted", timeStr);
+		return `${icon} ${badge} ${name}${summary}${time}`;
+	});
+
+	const fullJoined = ` ` + parts.join(theme.fg("dim", " │ "));
+	if (visibleWidth(fullJoined) <= availableWidth) {
+		return fullJoined;
+	}
+
+	// 若宽度不够并排，显示最新的一个任务 + (+N) 并发徽标
+	const latest = runningTools[runningTools.length - 1];
+	const elapsed = Math.max(0, Date.now() - latest.startTime);
+	const timeStr = formatDuration(elapsed);
+	const icon = theme.fg("accent", spinner);
+	const badge = theme.fg("dim", `[${latest.index}]`);
+	const labelName = latest.displayName || latest.name;
+	const name = theme.bold(theme.fg("toolTitle", labelName));
+	const moreBadge = theme.fg("accent", `(+${runningTools.length - 1})`);
+	const time = theme.fg("muted", timeStr);
+
+	const prefixWidth = 1 + 1 + 1 + visibleWidth(`[${latest.index}]`) + 1 + visibleWidth(labelName) + 1;
+	const suffixWidth = 1 + visibleWidth(`(+${runningTools.length - 1})`) + 1 + visibleWidth(timeStr);
+	const maxSummaryWidth = Math.max(0, availableWidth - prefixWidth - suffixWidth);
+	const summary =
+		maxSummaryWidth > 0 && latest.summaryDisplay
+			? " " + theme.fg("dim", truncate(latest.summaryDisplay, maxSummaryWidth))
+			: "";
+	return ` ${icon} ${badge} ${name}${summary} ${moreBadge}${time}`;
+}
+
+/**
  * 原生动态组件：支持点击展开详情、滚动展示与剪贴板复制
  */
 class RollingToolsWidgetComponent implements Component {
@@ -918,7 +992,7 @@ class RollingToolsWidgetComponent implements Component {
 	private state: WidgetState;
 	private lineMap: RenderedLineInfo[] = [];
 	private copyFeedbackTimer: any = null;
-	/** 点击 ⊞ 按钮时的回调，由外部注入以打开 overlay 大窗体 */
+	/** 点击 ➕ 按钮时的回调，由外部注入以打开 overlay 大窗体 */
 	private onOpenOverlay: ((item?: ToolItem) => void) | null = null;
 	/** 切换视图模式时的回调 */
 	private onToggleMode: ((newMode: ViewMode) => void) | null = null;
@@ -966,19 +1040,30 @@ class RollingToolsWidgetComponent implements Component {
 		};
 
 		// 1. 常驻状态行（等待服务器响应 ➔ 思考中 ➔ 思考完成，共用一行平滑过渡）
-		// 该行始终存在，作为滚动块的固定头部；⊞ 大窗体按钮与 ☰ 模式切换按钮固定显示在本行最右侧。
+		// 该行始终存在，作为滚动块的固定头部；➕ 大窗体按钮与 🔽/⏏️ 模式切换按钮固定显示在本行最右侧。
 		{
-			const modeBtnRaw = "☰";
+			const modeBtnRaw = this.state.viewMode === "fixed" ? "🔽" : "⏏️";
 			const modeBtnColored =
 				this.state.viewMode === "running"
 					? theme.fg("accent", modeBtnRaw)
 					: theme.fg("dim", modeBtnRaw);
 
-			const overlayBtnRaw = "⊞";
+			const overlayBtnRaw = "➕";
 			const overlayBtnColored = theme.fg("accent", overlayBtnRaw);
 
+			const buttonsRawWidth = visibleWidth(modeBtnRaw) + 1 + visibleWidth(overlayBtnRaw);
+			const availableWidth = Math.max(10, renderWidth - buttonsRawWidth - 2);
+
+			const runningTools = this.state.recentTools.filter((t) => t.status === "running");
+
 			let statusText: string;
-			if (this.state.headerStatus.type === "waiting_server") {
+			let headerItem: ToolItem | null = null;
+
+			if (this.state.viewMode === "running" && runningTools.length > 0) {
+				// 仅显示正在运行任务模式：直接显示到状态行，避免高度在 1 行与 2 行之间频繁跳动
+				statusText = formatRunningTasksLine(runningTools, availableWidth, theme);
+				headerItem = runningTools[runningTools.length - 1];
+			} else if (this.state.headerStatus.type === "waiting_server") {
 				const elapsedSec = ((Date.now() - this.state.headerStatus.startTime) / 1000).toFixed(1);
 				const spinner = SPINNER_FRAMES[Math.floor(Date.now() / 150) % SPINNER_FRAMES.length];
 				statusText = ` ${theme.fg("accent", "🌐")} ${theme.bold(theme.fg("toolTitle", `${spinner} 等待服务器响应...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`;
@@ -993,7 +1078,6 @@ class RollingToolsWidgetComponent implements Component {
 				statusText = ` ${theme.fg("accent", "•")} ${theme.fg("muted", "就绪")}`;
 			}
 
-			const buttonsRawWidth = visibleWidth(modeBtnRaw) + 1 + visibleWidth(overlayBtnRaw);
 			const pad = Math.max(1, renderWidth - visibleWidth(statusText) - buttonsRawWidth - 1);
 			const headerLine = `${statusText}${' '.repeat(pad)}${modeBtnColored} ${overlayBtnColored}`;
 			const lineW = visibleWidth(headerLine);
@@ -1003,7 +1087,7 @@ class RollingToolsWidgetComponent implements Component {
 			const modeBtnEnd = overlayBtnStart - 1;
 			const modeBtnStart = modeBtnEnd - visibleWidth(modeBtnRaw);
 
-			pushLine(headerLine, null, "header", undefined, {
+			pushLine(headerLine, headerItem, "header", undefined, {
 				modeBtnStart,
 				modeBtnEnd,
 				overlayBtnStart,
@@ -1011,70 +1095,72 @@ class RollingToolsWidgetComponent implements Component {
 			});
 		}
 
-		// 2. 滚动工具列表（根据当前 viewMode 过滤展示）
-		let visibleTools: ToolItem[];
-		if (this.state.viewMode === "running") {
-			// 模式 1：只显示正在执行的任务（支持多个并发执行任务自适应全部展示）
-			visibleTools = this.state.recentTools.filter((t) => t.status === "running");
-		} else {
-			// 模式 2：固定显示一段高度（由 displayLimit 决定，默认 3 行或由配置读取）
-			visibleTools = this.state.recentTools.slice(-this.displayLimit);
-		}
-		for (const t of visibleTools) {
-			const isExpanded = this.state.expandedItemId === t.id;
-			let icon = theme.fg("accent", "⏳");
-			if (t.status === "done") icon = theme.fg("success", "✓");
-			if (t.status === "error") icon = theme.fg("error", "✗");
+		// 2. 滚动工具列表（仅在 fixed 模式下在下方展示固定行数；running 模式下已合并至状态行，避免频繁上下闪烁）
+		if (this.state.viewMode === "fixed") {
+			const visibleTools = this.state.recentTools.slice(-this.displayLimit);
+			for (const t of visibleTools) {
+				const isExpanded = this.state.expandedItemId === t.id;
+				let icon = theme.fg("accent", "⏳");
+				if (t.status === "done") icon = theme.fg("success", "✓");
+				if (t.status === "error") icon = theme.fg("error", "✗");
 
-			const arrow = isExpanded ? theme.fg("accent", "▾") : theme.fg("dim", "▸");
-			const badge = theme.fg("dim", `[${t.index}]`);
-			const labelName = t.displayName || t.name;
-			const name = theme.bold(theme.fg("toolTitle", labelName));
-			const summary = theme.fg("dim", t.summaryDisplay);
-			const time = t.durationMs !== undefined ? theme.fg("muted", ` (${t.durationMs}ms)`) : "";
+				const arrow = isExpanded ? theme.fg("accent", "▾") : theme.fg("dim", "▸");
+				const badge = theme.fg("dim", `[${t.index}]`);
+				const labelName = t.displayName || t.name;
+				const name = theme.bold(theme.fg("toolTitle", labelName));
+				const summary = theme.fg("dim", t.summaryDisplay);
 
-			pushLine(` ${icon} ${arrow} ${badge} ${name} ${summary}${time}`, t, "header");
-
-			// 点击展开详情：展示完整路径/完整命令以及输出结果
-			if (isExpanded) {
-				if (t.fullPath) {
-					pushLine(`   ${theme.fg("accent", `↳ ${t.fullPath}`)}`, t, "detail_copyable", t.fullPath);
-				} else if (t.fullCommand) {
-					const cmdLines = t.fullCommand.split("\n").slice(0, 8);
-					for (const cmdLine of cmdLines) {
-						pushLine(`   ${theme.fg("accent", `↳ $ ${cmdLine}`)}`, t, "detail_copyable", t.fullCommand);
-					}
-					if (t.fullCommand.split("\n").length > 8) {
-						pushLine(
-							`   ${theme.fg("dim", `  ... (${t.fullCommand.split("\n").length - 8} more command lines)`)}`,
-							t,
-							"detail_info",
-						);
-					}
+				let time = "";
+				if (t.status === "running") {
+					const elapsed = Math.max(0, Date.now() - t.startTime);
+					time = theme.fg("muted", formatDuration(elapsed));
+				} else if (t.durationMs !== undefined) {
+					time = theme.fg("muted", formatDuration(t.durationMs));
 				}
 
-				if (t.output !== undefined && t.output !== null) {
-					const cleanOutput = t.output.trim();
-					if (cleanOutput.length === 0) {
-						pushLine(`   ${theme.fg("muted", "↳ (no output)")}`, t, "detail_info");
-					} else {
-						const outLines = cleanOutput.split("\n");
-						const maxShow = 6;
-						const shown = outLines.slice(0, maxShow);
-						for (const outLine of shown) {
-							pushLine(
-								`   ${theme.fg("muted", `↳ ${truncate(outLine, 80)}`)}`,
-								t,
-								"detail_copyable",
-								cleanOutput,
-							);
+				pushLine(` ${icon} ${arrow} ${badge} ${name} ${summary}${time}`, t, "header");
+
+				// 点击展开详情：展示完整路径/完整命令以及输出结果
+				if (isExpanded) {
+					if (t.fullPath) {
+						pushLine(`   ${theme.fg("accent", `↳ ${t.fullPath}`)}`, t, "detail_copyable", t.fullPath);
+					} else if (t.fullCommand) {
+						const cmdLines = t.fullCommand.split("\n").slice(0, 8);
+						for (const cmdLine of cmdLines) {
+							pushLine(`   ${theme.fg("accent", `↳ $ ${cmdLine}`)}`, t, "detail_copyable", t.fullCommand);
 						}
-						if (outLines.length > maxShow) {
+						if (t.fullCommand.split("\n").length > 8) {
 							pushLine(
-								`   ${theme.fg("dim", `  ... (${outLines.length - maxShow} more output lines)`)}`,
+								`   ${theme.fg("dim", `  ... (${t.fullCommand.split("\n").length - 8} more command lines)`)}`,
 								t,
 								"detail_info",
 							);
+						}
+					}
+
+					if (t.output !== undefined && t.output !== null) {
+						const cleanOutput = t.output.trim();
+						if (cleanOutput.length === 0) {
+							pushLine(`   ${theme.fg("muted", "↳ (no output)")}`, t, "detail_info");
+						} else {
+							const outLines = cleanOutput.split("\n");
+							const maxShow = 6;
+							const shown = outLines.slice(0, maxShow);
+							for (const outLine of shown) {
+								pushLine(
+									`   ${theme.fg("muted", `↳ ${truncate(outLine, 80)}`)}`,
+									t,
+									"detail_copyable",
+									cleanOutput,
+								);
+							}
+							if (outLines.length > maxShow) {
+								pushLine(
+									`   ${theme.fg("dim", `  ... (${outLines.length - maxShow} more output lines)`)}`,
+									t,
+									"detail_info",
+								);
+							}
 						}
 					}
 				}
@@ -1086,15 +1172,7 @@ class RollingToolsWidgetComponent implements Component {
 			pushLine(`   ${theme.fg("success", `↳ ${this.state.copyFeedbackMessage}`)}`);
 		}
 
-		// 4. 独立临时报错 Alert 块
-		if (this.state.activeError) {
-			const errHeader = ` ${theme.fg("error", "🔴")} ${theme.bold(theme.fg("error", `[Error in #${this.state.activeError.index} ${this.state.activeError.toolName}]`))} ${theme.fg("dim", this.state.activeError.summary)}`;
-			const errBody = `    ${theme.fg("error", truncate(this.state.activeError.message.replace(/\r?\n/g, " "), 100))}`;
-			pushLine(errHeader);
-			pushLine(errBody);
-		}
-
-		// 5. 主回复完成标识（仅在整个 Agent 回复完全生成完毕后才附带显示）
+		// 4. 主回复完成标识（仅在整个 Agent 回复完全生成完毕后才附带显示）
 		if (this.state.completedMessage) {
 			pushLine(` ${theme.fg("success", `✓ ${this.state.completedMessage}`)}`);
 		}
@@ -1125,15 +1203,15 @@ class RollingToolsWidgetComponent implements Component {
 		}
 
 		if (event.type === "click" && isWithinText) {
-			// 0. 头部按钮点击处理（模式切换按钮 ☰ 与 ⊞ 大窗体按钮）
+			// 0. 头部按钮点击处理（模式切换按钮 🔽/⏏️ 与 ➕ 大窗体按钮）
 			if (lineEntry?.buttonBounds && event.button !== "right") {
 				const { modeBtnStart, overlayBtnStart } = lineEntry.buttonBounds;
-				// 点击最右侧 ⊞ 按钮：打开 overlay 大窗体
+				// 点击最右侧 ➕ 按钮：打开 overlay 大窗体
 				if (overlayBtnStart !== undefined && event.x >= overlayBtnStart) {
 					this.onOpenOverlay?.(targetItem ?? undefined);
 					return { handled: true };
 				}
-				// 点击层级/模式切换按钮 ☰：在“固定最近行数”与“仅显示正在执行”之间切换
+				// 点击层级/模式切换按钮 🔽/⏏️：在“固定最近行数”与“仅显示正在执行”之间切换
 				if (
 					modeBtnStart !== undefined &&
 					overlayBtnStart !== undefined &&
@@ -2261,8 +2339,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	pi.on("tool_call", async (event, ctx) => {
 		if (state.headerStatus.type === "waiting_server") {
 			state.headerStatus = { type: "idle" };
-			stopStatusTimer();
 		}
+		// 任务执行期间保持/开启动态计时器，使秒数与 spinner 平滑刷新
+		startStatusTimer(ctx);
 
 		if (!shouldIncludeInWidget(event.toolName, currentConfig)) {
 			return;
@@ -2330,6 +2409,15 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			};
 		} else {
 			state.activeError = null;
+		}
+
+		const hasRunning = state.recentTools.some((t) => t.status === "running");
+		if (
+			!hasRunning &&
+			state.headerStatus.type !== "thinking" &&
+			state.headerStatus.type !== "waiting_server"
+		) {
+			stopStatusTimer();
 		}
 
 		// 不在此处持久化：逐个工具写快照会使 session 体积呈 O(N²) 增长，
