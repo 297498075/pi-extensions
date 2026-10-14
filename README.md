@@ -331,6 +331,31 @@ pi --extension ./extensions/image-pager.ts
 - **最小化与折叠**：支持 `Ctrl+]` 或 `Alt+H` 极速最小化为单行提示条，按任意键展开；`Esc` 可取消提问。
 - **全环境降级兼容**：在 RPC 模式（VSCode 插件端 / Zed）下自动降级为顺序 Dialog 提问，保证无交互环境不中断。
 
+### Todo Tree (层次化任务清单与弹窗交互)
+
+`extensions/todo-tree.ts` 为复杂开发任务提供层次化任务拆解（Hierarchy / Parent-Child Subtasks）、主窗体极简状态条与全功能居中弹出窗口（Modal Overlay with Scrollbar）：
+
+- **分层级任务模型与动态演进**：支持多层级树状结构（如 `#1` $\rightarrow$ `#1.1` $\rightarrow$ `#1.1.1`），支持任务随进度中途追加小项或放弃取消（`cancelled`），取消项自动从进度有效项剔除，绝不阻塞整体推进。
+- **主窗体聚焦（仅展示进行中小项）**：输入栏上方仅展示总体进度、字符进度条（`[████░░░░░]`）以及当前所有正在执行的叶子小项（带父级面包屑，如 `[数据层] > 编写测试`）；多并行任务全行展开，不限死组件高度。
+- **右侧固定交互按钮 `[📋 ]`**：主行右端常驻 `[📋 ]` 按钮，支持鼠标直接点击以及键盘快捷键（默认 `Ctrl+Shift+T`）呼出任务树弹窗。
+- **全功能居中弹窗（内置字符滚动条）**：采用 `ctx.ui.custom({ overlay: true })` 居中悬浮绘制，清晰呈现树形分支图；支持键盘上下移动/翻页、`Space` 折叠展开父节点、鼠标滚轮平滑滚动、边框外部点击自动关闭。
+- **零破坏 Prompt Cache 的批注体系**：
+  - **本地便签 (Local Note)**：弹窗按 `n` 键就地添加备注，数据仅在扩展内部与分支快照保存，**0 Token 消耗，0 缓存破坏**；
+  - **主动提醒 (Steer Hint)**：按需将提示作为标准 User 消息追加在**对话最末尾**，100% 保持此前所有对话的前缀缓存命中！
+- **最小化主 Agent 上下文污染**：LLM 工具调用成功后仅返回单行操作摘要（绝不在 `content` dump 全量树）；全量数据写入 `details`，天然与仓库现有 `todo-loop.ts` 形成自动推进闭环。
+- **与 `rolling-tools` 优雅共存**：采用单例状态驱动渲染（避免重复 `setWidget` 引发 Map 键序跳动），确保界面层次稳定位于 `rolling-tools` 滚动块的正上方。
+- **快速开关（默认关闭）**：一般小任务无需开启，默认处于关闭状态（Disabled）。通过 `/todo on`、`/todo off`、`/todo toggle` 随时切换。关闭状态下自动从 Provider Payload 中剥离 `todo` 工具，主窗体完全隐蔽，0 提示词干扰。
+
+```bash
+# 常用命令与快捷键
+/todo on          # 开启任务清单工具与主窗体 Widget
+/todo off         # 关闭任务清单（向 LLM 隐身）
+/todo toggle      # 快速翻转状态
+/todo open        # 展开完整任务树大弹窗
+/todo status      # 查看当前统计与开关状态
+Ctrl+Shift+T      # 快速呼出/关闭任务树弹窗
+```
+
 ## IDM Download (Skill)
 
 `skills/idm-download` 提供将大文件、模型权重（`.safetensors`, `.pth` 等）和数据集自动化推送到 Windows 本地 **Internet Download Manager (IDM / `IDMan.exe`)** 进行多线程后台下载的能力：
