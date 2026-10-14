@@ -4,6 +4,12 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- fix(rolling-tools): capture streaming tool calls in real time (fixes command not showing after thinking completed / flickering on execution end).
+  - Previously, `rolling-tools` only tracked tools when the formal `tool_call` event fired after the entire LLM response stream had ended and local execution was about to begin. Because LLMs take seconds to generate tool call arguments (especially when generating multiple concurrent tool calls like multiple `read` / `bash` commands), the UI would stay stuck on `💡 思考完成` during streaming, followed by tool execution that completed in milliseconds (e.g. 1ms~50ms), causing the commands to appear as a brief "flash" when execution finished.
+  - Now, `message_update` captures `toolCall` blocks as soon as the model begins streaming them, displaying them immediately with live spinner and elapsed timer (`⠋ [1] bash ... (0.5s)`).
+  - Streaming argument updates (`toolcall_delta`) stream directly into the widget in real time as JSON fragments are parsed.
+  - Concurrent multi-tool calls are immediately surfaced both in `running` mode (with multi-task separators or `(+N)` concurrency badge) and in `fixed` mode.
+  - `tool_call` execution transitions idempotently without duplicate sequence indexing or double-insertion.
 - feat(rolling-tools): refine view modes, live task duration ticker, and icons (`🔽`/`⏏️`, `➕`).
   - Switched overlay dialog button to `➕`.
   - Switched view mode toggle button to `🔽` (fixed recent rows) and `⏏️` (single-line running mode).

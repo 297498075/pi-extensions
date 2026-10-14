@@ -953,7 +953,7 @@ function formatRunningTasksLine(runningTools: ToolItem[], availableWidth: number
 		const labelName = t.displayName || t.name;
 		const name = theme.bold(theme.fg("toolTitle", labelName));
 		const summary = t.summaryDisplay ? " " + theme.fg("dim", truncate(t.summaryDisplay, 15)) : "";
-		const time = theme.fg("muted", timeStr);
+		const time = " " + theme.fg("muted", timeStr);
 		return `${icon} ${badge} ${name}${summary}${time}`;
 	});
 
@@ -2312,6 +2312,71 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			state.activeError = null;
 			syncWidget(ctx);
 		}
+
+		// 工具调用流式输出时：提前捕获并实时更新正在准备执行的命令，
+		// 避免思考完成后界面停滞数秒、直到工具执行完才“闪一下”
+		if (event.message?.role === "assistant" && Array.isArray(event.message.content)) {
+			const cwd = ctx?.cwd || process.cwd();
+			let hasToolChanges = false;
+			let hasStreamingTools = false;
+
+			for (const c of event.message.content) {
+				if (c && c.type === "toolCall" && c.id && c.name) {
+					if (!shouldIncludeInWidget(c.name, currentConfig)) {
+						continue;
+					}
+					hasStreamingTools = true;
+					const existing = state.recentTools.find((t) => t.id === c.id);
+					const { summaryDisplay, fullPath, fullCommand, displayName, detailContent, detailKind } =
+						extractSummaryAndMetadata(c.name, c.arguments, cwd, currentConfig);
+
+					if (existing) {
+						if (
+							existing.summaryDisplay !== summaryDisplay ||
+							existing.fullPath !== fullPath ||
+							existing.fullCommand !== fullCommand ||
+							existing.detailContent !== detailContent
+						) {
+							existing.summaryDisplay = summaryDisplay || existing.summaryDisplay;
+							if (fullPath) existing.fullPath = fullPath;
+							if (fullCommand) existing.fullCommand = fullCommand;
+							if (displayName) existing.displayName = displayName;
+							if (detailContent) existing.detailContent = detailContent;
+							if (detailKind) existing.detailKind = detailKind;
+							hasToolChanges = true;
+						}
+					} else {
+						totalToolCount++;
+						state.recentTools.push({
+							id: c.id,
+							index: totalToolCount,
+							name: c.name,
+							displayName,
+							summaryDisplay,
+							fullPath,
+							fullCommand,
+							detailContent,
+							detailKind,
+							status: "running",
+							startTime: Date.now(),
+						});
+
+						if (state.recentTools.length > HISTORY_MEMORY_LIMIT) {
+							state.recentTools.splice(0, state.recentTools.length - HISTORY_MEMORY_LIMIT);
+						}
+						hasToolChanges = true;
+					}
+				}
+			}
+
+			if (hasStreamingTools) {
+				startStatusTimer(ctx);
+				state.activeError = null;
+			}
+			if (hasToolChanges) {
+				syncWidget(ctx);
+			}
+		}
 	});
 
 	pi.on("message_end", async (event) => {
@@ -2359,28 +2424,40 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		// 仅对纳入 widget 的工具启动，避免被静音工具留下无人停止的 100ms 重渲染定时器。
 		startStatusTimer(ctx);
 
-		totalToolCount++;
 		const cwd = ctx?.cwd || process.cwd();
 		const { summaryDisplay, fullPath, fullCommand, displayName, detailContent, detailKind } =
 			extractSummaryAndMetadata(event.toolName, event.input, cwd, currentConfig);
 
-		state.recentTools.push({
-			id: event.toolCallId,
-			index: totalToolCount,
-			name: event.toolName,
-			displayName,
-			summaryDisplay,
-			fullPath,
-			fullCommand,
-			detailContent,
-			detailKind,
-			status: "running",
-			startTime: Date.now(),
-		});
+		const existing = state.recentTools.find((t) => t.id === event.toolCallId);
+		if (existing) {
+			// 在流式阶段已提前捕获：更新最终确认的完整入参与元数据，保持 running 状态
+			existing.summaryDisplay = summaryDisplay || existing.summaryDisplay;
+			if (fullPath) existing.fullPath = fullPath;
+			if (fullCommand) existing.fullCommand = fullCommand;
+			if (displayName) existing.displayName = displayName;
+			if (detailContent) existing.detailContent = detailContent;
+			if (detailKind) existing.detailKind = detailKind;
+			existing.status = "running";
+		} else {
+			// 若未在流式阶段中捕获（如非 assistant 流式下直接触发的调用）：分配新序号入队
+			totalToolCount++;
+			state.recentTools.push({
+				id: event.toolCallId,
+				index: totalToolCount,
+				name: event.toolName,
+				displayName,
+				summaryDisplay,
+				fullPath,
+				fullCommand,
+				detailContent,
+				detailKind,
+				status: "running",
+				startTime: Date.now(),
+			});
 
-		// 内存中的完整历史保留一个上限，避免无限增长；widget 只展示最近 maxRecentTools 条
-		if (state.recentTools.length > HISTORY_MEMORY_LIMIT) {
-			state.recentTools.splice(0, state.recentTools.length - HISTORY_MEMORY_LIMIT);
+			if (state.recentTools.length > HISTORY_MEMORY_LIMIT) {
+				state.recentTools.splice(0, state.recentTools.length - HISTORY_MEMORY_LIMIT);
+			}
 		}
 
 		if (state.expandedItemId && !state.recentTools.some((t) => t.id === state.expandedItemId)) {

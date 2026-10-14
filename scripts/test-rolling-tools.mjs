@@ -1198,6 +1198,188 @@ assert.equal(
 );
 console.log("  ✓ successful tool result clears the error line.");
 
+console.log("\n=== Test 13: Streaming Tool Call Capture & Multi-tool Execution Transition ===");
+const handlers13 = new Map();
+let widgetFactory13 = null;
+const fakeUi13 = {
+	setWidget(k, c) {
+		if (typeof c === "function") widgetFactory13 = c;
+	},
+	notify() {},
+	setStatus() {},
+	setToolsExpanded() {},
+	requestRender() {},
+	custom() {
+		return Promise.resolve();
+	},
+};
+const fakePi13 = {
+	on(e, h) {
+		const l = handlers13.get(e) || [];
+		l.push(h);
+		handlers13.set(e, l);
+	},
+	registerCommand() {},
+	appendEntry() {},
+};
+const ctx13 = {
+	hasUI: true,
+	ui: fakeUi13,
+	cwd: process.cwd(),
+	sessionManager: { getEntries: () => [] },
+};
+
+rollingTools(fakePi13);
+for (const h of handlers13.get("session_start") || []) await h({ reason: "startup" }, ctx13);
+
+// 1. 用户提问启动
+for (const h of handlers13.get("agent_start") || []) await h({}, ctx13);
+// 发起网络请求
+for (const h of handlers13.get("before_provider_request") || []) await h({}, ctx13);
+
+// 2. 模拟模型思考：thinking_start -> thinking_delta -> thinking_end
+const msg13 = {
+	role: "assistant",
+	content: [{ type: "thinking", thinking: "I should run a command" }],
+};
+for (const h of handlers13.get("message_update") || []) {
+	await h({ assistantMessageEvent: { type: "thinking_start" }, message: msg13 }, ctx13);
+}
+for (const h of handlers13.get("message_update") || []) {
+	await h({ assistantMessageEvent: { type: "thinking_end" }, message: msg13 }, ctx13);
+}
+
+let w13 = widgetFactory13(dummyTui, dummyTheme);
+let lines13 = w13.render(100);
+assert.ok(lines13[0].includes("思考完成"), "header shows 思考完成 right after thinking_end");
+
+// 3. 模拟模型开始流式输出 toolCall（此时本地尚未真正 execute，tool_call 事件尚未触发）：
+// 先吐出 toolCall 骨架（arguments 还是空的）
+const tcStream = {
+	type: "toolCall",
+	id: "call_stream_1",
+	name: "bash",
+	arguments: {},
+};
+const msgWithTool = {
+	role: "assistant",
+	content: [tcStream],
+};
+for (const h of handlers13.get("message_update") || []) {
+	await h(
+		{ assistantMessageEvent: { type: "toolcall_start", id: "call_stream_1", toolName: "bash" }, message: msgWithTool },
+		ctx13,
+	);
+}
+
+// 验证：在本地执行前，widget 已经在列表中提前捕获到该命令（避免思考完成后死死停滞）
+lines13 = w13.render(100);
+const fixedToolLines = lines13.slice(1).filter((l) => l.includes("[") && l.includes("]"));
+assert.equal(fixedToolLines.length, 1, "tool is visible in fixed list immediately during streaming before tool_call");
+assert.ok(fixedToolLines[0].includes("bash"), "streaming tool name is visible in widget");
+console.log("  ✓ streaming tool call captured immediately after thinking completed (before execution).");
+
+// 4. 模拟参数流式注入（toolcall_delta），验证参数在 widget 中实时更新
+tcStream.arguments = { command: "rg -n 'Hello' src/" };
+for (const h of handlers13.get("message_update") || []) {
+	await h(
+		{ assistantMessageEvent: { type: "toolcall_delta", delta: "..." }, message: msgWithTool },
+		ctx13,
+	);
+}
+lines13 = w13.render(100);
+const updatedLine = lines13.slice(1).find((l) => l.includes("rg -n 'Hello'"));
+assert.ok(updatedLine, "command arguments are updated in real-time as toolcall_delta streams");
+console.log("  ✓ command arguments stream and update in real-time on the widget.");
+
+// 5. 模拟并发多 tools 流式生成（用户的痛点场景：一下子完成多个 tools 调用）
+// 模型紧接着流式输出了另外 2 个 read 工具调用
+const tcRead1 = {
+	type: "toolCall",
+	id: "call_stream_2",
+	name: "read",
+	arguments: { path: "src/a.ts" },
+};
+const tcRead2 = {
+	type: "toolCall",
+	id: "call_stream_3",
+	name: "read",
+	arguments: { path: "src/b.ts" },
+};
+msgWithTool.content.push(tcRead1, tcRead2);
+for (const h of handlers13.get("message_update") || []) {
+	await h(
+		{ assistantMessageEvent: { type: "toolcall_start", id: "call_stream_3", toolName: "read" }, message: msgWithTool },
+		ctx13,
+	);
+}
+lines13 = w13.render(100);
+const multiToolLines = lines13.slice(1).filter((l) => l.includes("[") && l.includes("]"));
+assert.equal(multiToolLines.length, 3, "all 3 concurrent tools captured during streaming in fixed mode");
+
+// 验证在 running 模式下（折叠单行模式），并发多任务直接显示在状态行上
+const rowWidth13 = visibleWidth(lines13[0]);
+w13.handleMouse({
+	type: "click",
+	button: "left",
+	x: rowWidth13 - 3,
+	y: 0,
+	screenX: rowWidth13 - 3,
+	screenY: 0,
+	width: 100,
+	height: lines13.length,
+	shift: false,
+	alt: false,
+	ctrl: false,
+});
+lines13 = w13.render(100);
+assert.equal(lines13.length, 1, "in running mode, multi-tasks merge into single status row");
+assert.ok(lines13[0].includes("⏏️"), "running mode icon visible");
+assert.ok(lines13[0].includes("read") || lines13[0].includes("bash"), "running tools visible directly in status line during stream");
+console.log("  ✓ concurrent multi-tool streaming calls correctly displayed in both fixed and running modes.");
+
+// 6. 模拟流式结束，Pi 正式进入本地 execution（触发 tool_call 事件）
+// 验证幂等性：已在流式中捕获的工具不会重复递增 totalToolCount 或重复入队
+for (const h of handlers13.get("tool_call") || []) {
+	await h({ toolCallId: "call_stream_1", toolName: "bash", input: { command: "rg -n 'Hello' src/" } }, ctx13);
+	await h({ toolCallId: "call_stream_2", toolName: "read", input: { path: "src/a.ts" } }, ctx13);
+	await h({ toolCallId: "call_stream_3", toolName: "read", input: { path: "src/b.ts" } }, ctx13);
+}
+
+// 切换回 fixed 模式核对条目数
+const rowWAfter13 = visibleWidth(lines13[0]);
+w13.handleMouse({
+	type: "click",
+	button: "left",
+	x: rowWAfter13 - 3,
+	y: 0,
+	screenX: rowWAfter13 - 3,
+	screenY: 0,
+	width: 100,
+	height: lines13.length,
+	shift: false,
+	alt: false,
+	ctrl: false,
+});
+lines13 = w13.render(100);
+const toolLinesAfterCall = lines13.slice(1).filter((l) => l.includes("[") && l.includes("]"));
+assert.equal(toolLinesAfterCall.length, 3, "tool_call does not duplicate items already captured in streaming");
+assert.ok(toolLinesAfterCall.some((l) => l.includes("[1]") && l.includes("bash")), "tool 1 index is stable");
+assert.ok(toolLinesAfterCall.some((l) => l.includes("[2]") && l.includes("read")), "tool 2 index is stable");
+assert.ok(toolLinesAfterCall.some((l) => l.includes("[3]") && l.includes("read")), "tool 3 index is stable");
+console.log("  ✓ tool_call event transition is idempotent without duplicating item indices or entries.");
+
+// 7. 模拟工具执行完毕（tool_result 触发），验证状态平滑过渡为 done
+for (const id of ["call_stream_1", "call_stream_2", "call_stream_3"]) {
+	for (const h of handlers13.get("tool_result") || []) {
+		await h({ toolCallId: id, toolName: id === "call_stream_1" ? "bash" : "read", isError: false, content: [] }, ctx13);
+	}
+}
+lines13 = w13.render(100);
+const finishedLines = lines13.slice(1).filter((l) => l.includes("✓"));
+assert.equal(finishedLines.length, 3, "all 3 tools transition smoothly from running to done (✓)");
+console.log("  ✓ multi-tool batch execution finishes smoothly with ✓ status and no flickering.");
+
 // 清理临时目录
 rmSync(TEST_AGENT_DIR, { recursive: true, force: true });
 
