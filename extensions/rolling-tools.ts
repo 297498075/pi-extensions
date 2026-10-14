@@ -189,7 +189,7 @@ interface RenderedLineInfo {
 	kind: LineKind;
 	textToCopy?: string;
 	buttonBounds?: ButtonBounds;
-	/** 该行最右侧是否存在 [⊞] 展开按钮 */
+	/** 该行最右侧是否存在 ⊞ 展开按钮 */
 	hasOverlayButton?: boolean;
 }
 
@@ -918,7 +918,7 @@ class RollingToolsWidgetComponent implements Component {
 	private state: WidgetState;
 	private lineMap: RenderedLineInfo[] = [];
 	private copyFeedbackTimer: any = null;
-	/** 点击 [⊞] 按钮时的回调，由外部注入以打开 overlay 大窗体 */
+	/** 点击 ⊞ 按钮时的回调，由外部注入以打开 overlay 大窗体 */
 	private onOpenOverlay: ((item?: ToolItem) => void) | null = null;
 	/** 切换视图模式时的回调 */
 	private onToggleMode: ((newMode: ViewMode) => void) | null = null;
@@ -966,19 +966,15 @@ class RollingToolsWidgetComponent implements Component {
 		};
 
 		// 1. 常驻状态行（等待服务器响应 ➔ 思考中 ➔ 思考完成，共用一行平滑过渡）
-		// 该行始终存在，作为滚动块的固定头部；[⊞] 大窗体按钮与模式切换按钮固定显示在本行最右侧。
+		// 该行始终存在，作为滚动块的固定头部；⊞ 大窗体按钮与 ☰ 模式切换按钮固定显示在本行最右侧。
 		{
-			const runningCount = this.state.recentTools.filter((t) => t.status === "running").length;
-			const modeBtnRaw =
-				this.state.viewMode === "running"
-					? `[⚡ 运行中 (${runningCount})]`
-					: `[☰ 最近 ${this.displayLimit} 行]`;
+			const modeBtnRaw = "☰";
 			const modeBtnColored =
 				this.state.viewMode === "running"
 					? theme.fg("accent", modeBtnRaw)
 					: theme.fg("dim", modeBtnRaw);
 
-			const overlayBtnRaw = "[⊞]";
+			const overlayBtnRaw = "⊞";
 			const overlayBtnColored = theme.fg("accent", overlayBtnRaw);
 
 			let statusText: string;
@@ -1129,19 +1125,19 @@ class RollingToolsWidgetComponent implements Component {
 		}
 
 		if (event.type === "click" && isWithinText) {
-			// 0. 头部按钮点击处理（模式切换按钮与 [⊞] 大窗体按钮）
+			// 0. 头部按钮点击处理（模式切换按钮 ☰ 与 ⊞ 大窗体按钮）
 			if (lineEntry?.buttonBounds && event.button !== "right") {
 				const { modeBtnStart, overlayBtnStart } = lineEntry.buttonBounds;
-				// 点击最右侧 [⊞] 按钮：打开 overlay 大窗体
+				// 点击最右侧 ⊞ 按钮：打开 overlay 大窗体
 				if (overlayBtnStart !== undefined && event.x >= overlayBtnStart) {
 					this.onOpenOverlay?.(targetItem ?? undefined);
 					return { handled: true };
 				}
-				// 点击层级/模式切换按钮：在“固定最近行数”与“仅显示正在执行”之间切换
+				// 点击层级/模式切换按钮 ☰：在“固定最近行数”与“仅显示正在执行”之间切换
 				if (
 					modeBtnStart !== undefined &&
 					overlayBtnStart !== undefined &&
-					event.x >= modeBtnStart &&
+					event.x >= modeBtnStart - 1 &&
 					event.x < overlayBtnStart
 				) {
 					this.state.viewMode = this.state.viewMode === "fixed" ? "running" : "fixed";
