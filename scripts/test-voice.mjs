@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import voiceExtension, {
-	DEFAULT_CONFIG, VoiceConfigManager, VoiceRuntime, TtsGatewayAdapter, UNSUPPORTED_SPEAKER,
+	DEFAULT_CONFIG, VoiceConfigManager, VoiceRuntime, TtsGatewayAdapter, UNSUPPORTED_SPEAKER, VoiceStatusModalComponent,
 } from "../extensions/voice.ts";
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -336,3 +336,60 @@ await test("registration and lifecycle reset tools", async () => {
 		assert.deepEqual(active, ["read"]);
 	} finally { h.close(); }
 });
+
+await test("status modal component renders nicely and handles key/click close", async () => {
+	const h = harness();
+	let closed = false;
+	const mockTui = { terminal: { rows: 30 } };
+	const mockTheme = {
+		fg: (_color, text) => text,
+		style: (text, _opts) => text,
+	};
+	const comp = new VoiceStatusModalComponent(mockTui, mockTheme, {
+		enabled: true,
+		live: false,
+		activeTool: null,
+		gatewayUrl: "http://127.0.0.1:5234",
+		deliveryMode: "editor",
+		defaultVoiceId: "default",
+		speed: 1.0,
+		speakerSupported: false,
+	}, () => { closed = true; });
+
+	comp.invalidate();
+	const lines = comp.render(80);
+	assert(lines.length >= 15, "Should render full status dialog box");
+	assert(lines.some(l => l.includes("Pi Voice Extension Status")));
+	assert(lines.some(l => l.includes("扩展总开关")));
+	assert(lines.some(l => l.includes("ENABLED (ON)")));
+	assert(lines.some(l => l.includes("扬声发音协议")));
+	assert(lines.some(l => l.includes("INCOMPATIBLE")));
+
+	// Keyboard input triggers close
+	comp.handleInput("q");
+	assert.equal(closed, true, "Keyboard input closes modal");
+
+	// Mouse click triggers close
+	closed = false;
+	const mouseRes = comp.handleMouse({ type: "click" });
+	assert.equal(closed, true, "Mouse click closes modal");
+	assert.deepEqual(mouseRes, { handled: true });
+
+	// Invoking /voice status triggers modal via custom() when UI is available
+	let customCalled = false;
+	const modalCtx = {
+		hasUI: true,
+		ui: {
+			custom: (factory) => {
+				customCalled = true;
+				const c = factory(mockTui, mockTheme, {}, () => {});
+				assert(c instanceof VoiceStatusModalComponent);
+				return Promise.resolve();
+			},
+			notify: () => {},
+		},
+	};
+	await h.runtime.command("status", modalCtx);
+	assert.equal(customCalled, true, "/voice status must invoke ctx.ui.custom modal");
+});
+

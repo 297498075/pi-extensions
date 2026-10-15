@@ -4,6 +4,8 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 
 export interface VoiceItem {
@@ -263,6 +265,133 @@ interface LiveRun {
 	epoch: number;
 	controller: AbortController;
 }
+export interface VoiceStatusModalInfo {
+	enabled: boolean;
+	live: boolean;
+	activeTool: string | null;
+	gatewayUrl: string;
+	deliveryMode: DeliveryMode;
+	defaultVoiceId: string;
+	speed: number;
+	speakerSupported: boolean;
+}
+
+export class VoiceStatusModalComponent implements Component {
+	private boxLeft = 0;
+	private boxTop = 0;
+	private boxWidth = 0;
+	private boxHeight = 0;
+	private readonly tui: any;
+	private readonly theme: any;
+	private readonly info: VoiceStatusModalInfo;
+	private readonly onClose: () => void;
+
+	constructor(
+		tui: any,
+		theme: any,
+		info: VoiceStatusModalInfo,
+		onClose: () => void,
+	) {
+		this.tui = tui;
+		this.theme = theme;
+		this.info = info;
+		this.onClose = onClose;
+	}
+
+	invalidate(): void {}
+
+	render(width: number): string[] {
+		const totalLines = this.tui?.terminal?.rows || 24;
+		this.boxWidth = Math.min(74, Math.max(50, Math.floor(width * 0.75)));
+		this.boxHeight = 15;
+		this.boxLeft = Math.max(0, Math.floor((width - this.boxWidth) / 2));
+		this.boxTop = Math.max(0, Math.floor((totalLines - this.boxHeight) / 2));
+
+		const innerWidth = this.boxWidth - 2;
+		const lines: string[] = [];
+
+		for (let i = 0; i < this.boxTop; i++) lines.push("");
+
+		const title = " Pi Voice Extension Status ";
+		const topDashTotal = Math.max(0, innerWidth - visibleWidth(title));
+		const leftDash = Math.floor(topDashTotal / 2);
+		const rightDash = topDashTotal - leftDash;
+		lines.push(
+			`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "┌" + "─".repeat(leftDash))}${this.theme.style(title, { bold: true, fg: "accent" })}${this.theme.fg("accent", "─".repeat(rightDash) + "┐")}`,
+		);
+
+		const pushRow = (contentStr: string, rawLen: number) => {
+			const pad = Math.max(0, innerWidth - 2 - rawLen);
+			lines.push(
+				`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "│ ")}${contentStr}${" ".repeat(pad)} ${this.theme.fg("accent", "│")}`,
+			);
+		};
+
+		// 1. Extension State
+		const stateText = this.info.enabled ? "ENABLED (ON)" : "DISABLED (OFF)";
+		const stateColored = this.info.enabled ? this.theme.fg("success", "ENABLED (ON)") : this.theme.fg("muted", "DISABLED (OFF)");
+		pushRow(`• 扩展总开关   : ${stateColored}`, `• 扩展总开关   : ${stateText}`.length);
+
+		// 2. Live Input State
+		const liveText = this.info.live ? "RUNNING (🔴 LIVE ON)" : "STOPPED (⏸ OFF)";
+		const liveColored = this.info.live ? this.theme.fg("error", "RUNNING (🔴 LIVE ON)") : this.theme.fg("muted", "STOPPED (⏸ OFF)");
+		pushRow(`• 持续语音输入 : ${liveColored}`, `• 持续语音输入 : ${liveText}`.length);
+
+		// 3. Active Tool
+		const toolText = this.info.activeTool ? `BUSY (${this.info.activeTool})` : "IDLE";
+		const toolColored = this.info.activeTool ? this.theme.fg("warning", `BUSY (${this.info.activeTool})`) : this.theme.fg("text", "IDLE");
+		pushRow(`• 当前主动活动 : ${toolColored}`, `• 当前主动活动 : ${toolText}`.length);
+
+		// 4. Delivery Mode
+		const modeDesc = this.info.deliveryMode === "editor" ? "editor (追加至草稿待确认)" : "submit (直接提交/排队)";
+		pushRow(`• 识别投递模式 : ${this.theme.fg("accent", modeDesc)}`, `• 识别投递模式 : ${modeDesc}`.length);
+
+		// 5. Gateway URL
+		const gwText = this.info.gatewayUrl;
+		const gwTrunc = truncateToWidth(gwText, innerWidth - 18);
+		pushRow(`• 后台网关地址 : ${this.theme.fg("text", gwTrunc)}`, `• 后台网关地址 : ${visibleWidth(gwTrunc)}`.length);
+
+		// 6. Voice & Speed
+		const voiceText = `${this.info.defaultVoiceId} (${this.info.speed}x 语速)`;
+		pushRow(`• 默认发音音色 : ${this.theme.fg("text", voiceText)}`, `• 默认发音音色 : ${voiceText}`.length);
+
+		// 7. Speaker Protocol Status
+		const spkText = this.info.speakerSupported ? "SUPPORTED" : "INCOMPATIBLE (已保护阻断)";
+		const spkColored = this.info.speakerSupported ? this.theme.fg("success", "SUPPORTED") : this.theme.fg("warning", "INCOMPATIBLE (已保护阻断)");
+		pushRow(`• 扬声发音协议 : ${spkColored}`, `• 扬声发音协议 : ${spkText}`.length);
+
+		// 8. Shortcuts
+		const scText = "F2 (持续输入切换) | Alt+X (紧急停播/停录)";
+		pushRow(`• 全局快捷键   : ${this.theme.fg("muted", scText)}`, `• 全局快捷键   : ${scText}`.length);
+
+		pushRow("", 0);
+
+		// Hint row
+		const hint = "按 [Esc]、[Enter] 或任意键 / 点击关闭窗口";
+		const hintTrunc = truncateToWidth(hint, innerWidth - 2);
+		const hintPad = Math.max(0, innerWidth - 2 - visibleWidth(hintTrunc));
+		lines.push(
+			`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "│ ")}${this.theme.fg("muted", hintTrunc)}${" ".repeat(hintPad)} ${this.theme.fg("accent", "│")}`,
+		);
+
+		lines.push(`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "└" + "─".repeat(innerWidth) + "┘")}`);
+
+		return lines;
+	}
+
+	handleInput(_data: string): void {
+		this.onClose();
+	}
+
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (event.type === "click") {
+			this.onClose();
+			return { handled: true };
+		}
+		return undefined;
+	}
+}
+
 export interface VoiceRuntimeOptions {
 	config?: VoiceConfigStore;
 	gateway?: (url: string) => VoiceGateway;
@@ -524,6 +653,46 @@ export class VoiceRuntime {
 				{ success: true, default_voice_id: cfg.defaultVoiceId, voices: cached, warning: `刷新失败，展示历史缓存: ${errorText(error)}` };
 		} finally { clearTimeout(timer); controller.abort(); deadline.abort(); this.auxiliary.delete(controller); }
 	}
+	public openStatusModal(ctx: ExtensionContext): void {
+		this.attach(ctx);
+		const cfg = this.config.get();
+		const info: VoiceStatusModalInfo = {
+			enabled: this.enabled,
+			live: this.live,
+			activeTool: this.active?.kind ?? null,
+			gatewayUrl: cfg.gatewayUrl,
+			deliveryMode: cfg.deliveryMode,
+			defaultVoiceId: cfg.defaultVoiceId,
+			speed: cfg.speed,
+			speakerSupported: false, // Incompatible with current gateway
+		};
+
+		if (!ctx.hasUI || !ctx.ui?.custom) {
+			this.notify(
+				`Voice: ${info.enabled ? "ON" : "OFF"}\nLive: ${info.live ? "ON" : "OFF"}\nGateway: ${info.gatewayUrl}\nMode: ${info.deliveryMode}\nVoice: ${info.defaultVoiceId}\n发音: ${UNSUPPORTED_SPEAKER}\n快捷键: F2 / Alt+X`,
+				"info",
+			);
+			return;
+		}
+
+		ctx.ui.custom(
+			(tui: any, theme: any, _keybindings: any, done: (result: unknown) => void) => {
+				return new VoiceStatusModalComponent(tui, theme, info, () => done(undefined));
+			},
+			{
+				overlay: true,
+				overlayOptions: {
+					width: "100%",
+					maxHeight: "100%",
+					anchor: "top-left",
+					margin: 0,
+				},
+			},
+		).catch((err: unknown) => {
+			console.error("[voice] status modal error:", err);
+		});
+	}
+
 	public async command(args: string, ctx: ExtensionContext): Promise<void> {
 		this.attach(ctx);
 		const [rawAction = "status", param] = args.trim().split(/\s+/);
@@ -552,8 +721,7 @@ export class VoiceRuntime {
 					break;
 				}
 				case "status": {
-					const cfg = this.config.get();
-					this.notify(`Voice: ${this.enabled ? "ON" : "OFF"}\nLive: ${this.live ? "ON" : "OFF"}\nGateway: ${cfg.gatewayUrl}\nMode: ${cfg.deliveryMode}\nVoice: ${cfg.defaultVoiceId}\n发音: ${UNSUPPORTED_SPEAKER}\n快捷键: F2 / Alt+X`);
+					this.openStatusModal(ctx);
 					break;
 				}
 				default: throw new Error("用法: /voice on|off|stop|live|mode|set-voice|voices|status");

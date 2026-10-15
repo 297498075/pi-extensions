@@ -29,6 +29,7 @@
 - Extension 必须默认导出接收 `ExtensionAPI` 的 factory function。
 - 只在 `session_start` 或实际需要时启动 watcher、timer、socket、child process 等长生命周期资源，并在 `session_shutdown` 中释放。
 - 注册 custom tool 时为参数提供完整 schema；tool 的可持久状态放在结果的 `details` 中，确保 session fork 后可以恢复。
+- 状态与配置查询交互规范：所有提供 `/command status` 或类似只读配置/状态查询的扩展，**统一使用 `ctx.ui.custom()` 模态悬浮窗口（Modal Component）呈现**，不得依赖 `ctx.ui.notify(info)` 打印长文本。因为长文本通知容易被 `rolling-tools` 的通知静音拦截规则吞掉，且在终端中没有结构化视觉焦点。无 UI 降级环境（如非交互终端）方可回退到控制台或 notify。
 - Extension 运行时拥有完整系统权限，涉及写文件、执行命令、网络请求或凭据时，必须在文档中说明风险。
 
 ### Skills
