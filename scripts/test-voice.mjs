@@ -66,16 +66,18 @@ await test("disabled/start/stop/off/tool activation and no network on disabled s
 	} finally { h.close(); }
 });
 
-await test("live off aborts background capture and discards late result; repeated on is idempotent", async () => {
+await test("live off finishes pending in-flight utterance then exits gracefully; Alt+X strictly aborts", async () => {
 	const h = harness();
 	try {
 		h.runtime.enable(); h.runtime.setLive(true); h.editor = "typed draft";
 		h.runtime.enable(); assert.equal(h.recordings.length, 1);
-		h.runtime.setLive(false); assert(h.recordings[0].signal.aborted);
-		h.recordings[0].resolve({ text: "must not arrive", durationMs: 0 }); await tick();
-		assert.equal(h.editor, "typed draft"); assert.equal(h.recordings.length, 1);
-		h.runtime.setLive(true); assert.equal(h.recordings.length, 2);
+		// 1. live off allows in-flight speech to settle and deliver
 		h.runtime.setLive(false);
+		h.recordings[0].resolve({ text: "final words", durationMs: 1 }); await tick();
+		assert.equal(h.editor, "typed draft final words"); assert.equal(h.recordings.length, 1);
+		// 2. Alt+X strictly invalidates and cancels
+		h.runtime.setLive(true); assert.equal(h.recordings.length, 2);
+		h.runtime.stop(); assert(h.recordings[1].signal.aborted);
 	} finally { h.close(); }
 });
 

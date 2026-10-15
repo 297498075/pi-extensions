@@ -226,7 +226,7 @@ export interface RecordingResult { text: string; durationMs: number; }
 export interface VoiceGateway {
 	probe(signal: AbortSignal): Promise<{ online: boolean }>;
 	getVoices(signal: AbortSignal): Promise<VoiceItem[]>;
-	recordAndTranscribe(options: { maxDurationSec: number; signal: AbortSignal }): Promise<RecordingResult>;
+	recordAndTranscribe(options: { maxDurationSec: number; silenceTimeoutMs?: number; signal: AbortSignal }): Promise<RecordingResult>;
 	speak(text: string, options: { voiceId: string; instruct?: string; speed: number; signal: AbortSignal }): Promise<void>;
 }
 export const UNSUPPORTED_SPEAKER = "当前 TtsGateway 不提供任务级取消和扬声器物理播放完成确认；已拒绝发音，不发送全局停播。需要后端协议升级。";
@@ -251,9 +251,10 @@ export class TtsGatewayAdapter implements VoiceGateway {
 	public async getVoices(signal: AbortSignal): Promise<VoiceItem[]> {
 		return parseVoices(await this.json("/api/voices", signal), true);
 	}
-	public async recordAndTranscribe(options: { maxDurationSec: number; signal: AbortSignal }): Promise<RecordingResult> {
+	public async recordAndTranscribe(options: { maxDurationSec: number; silenceTimeoutMs?: number; signal: AbortSignal }): Promise<RecordingResult> {
 		const data = await this.json("/api/v1/input/record-and-transcribe", options.signal, {
-			max_duration_sec: options.maxDurationSec, silence_timeout_ms: 1200,
+			max_duration_sec: options.maxDurationSec,
+			silence_timeout_ms: options.silenceTimeoutMs ?? 1000,
 		});
 		if (!isObject(data) || data.code !== 0 || typeof data.text !== "string" ||
 			(data.duration_ms !== undefined && (typeof data.duration_ms !== "number" || !Number.isFinite(data.duration_ms) || data.duration_ms < 0))) {
@@ -458,18 +459,65 @@ export class VoiceRuntime {
 	private readonly auxiliary = new Set<AbortController>();
 	private initialization?: { epoch: number; url: string; promise: Promise<VoiceListVoicesResult> };
 
+	private toastTimer?: NodeJS.Timeout;
+	private footerTimer?: NodeJS.Timeout;
+
 	constructor(pi: ExtensionAPI, options: VoiceRuntimeOptions = {}) {
 		this.pi = pi;
 		this.config = options.config ?? new VoiceConfigManager();
 		this.gateway = options.gateway ?? (url => new TtsGatewayAdapter(url));
 	}
 	public attach(ctx: ExtensionContext): void { this.context = ctx; }
-	private notify(message: string, level: "info" | "warning" | "error" = "info"): void {
-		if (this.context?.hasUI) this.context.ui.notify(message, level);
+	
+	/**
+	 * 显示交互反馈：优先使用输入框上方靠左底部 Widget (aboveEditor) 与最下方状态栏 (setStatus)，
+	 * 彻底绕过被 rolling-tools 拦截静音的 ctx.ui.notify，并在变更时立即触发 TUI 界面重绘！
+	 */
+	public showToast(message: string, durationMs = 3500): void {
+		if (!this.context?.hasUI) return;
+		if (this.toastTimer) {
+			clearTimeout(this.toastTimer);
+			this.toastTimer = undefined;
+		}
+
+		// 1. 输入框上方靠左底部 Widget
+		if (typeof this.context.ui?.setWidget === "function") {
+			try {
+				this.context.ui.setWidget("voice-toast", [message], { placement: "aboveEditor" });
+				this.toastTimer = setTimeout(() => {
+					try {
+						this.context?.ui?.setWidget?.("voice-toast", undefined);
+					} catch {}
+					this.toastTimer = undefined;
+				}, durationMs);
+			} catch {}
+		}
+
+		// 2. 最下方状态栏单启一行（靠右）实时状态
+		this.footer(message);
+		if (this.footerTimer) {
+			clearTimeout(this.footerTimer);
+		}
+		this.footerTimer = setTimeout(() => {
+			this.footer();
+			this.footerTimer = undefined;
+		}, durationMs);
 	}
-	private footer(): void {
-		if (this.context?.hasUI) this.context.ui.setStatus("voice", !this.enabled ? "Voice: OFF" :
-			`Voice: ON | Live: ${this.live ? "ON" : "OFF"}${this.active ? ` | ${this.active.kind}` : ""}`);
+
+	private notify(message: string, level: "info" | "warning" | "error" = "info"): void {
+		// 重要错误/警告使用 notify；常规提示一律使用 showToast 保证可见性与即时重绘
+		if (level === "error" || level === "warning") {
+			if (this.context?.hasUI) this.context.ui.notify(message, level);
+		}
+		this.showToast(message);
+	}
+
+	private footer(extra?: string): void {
+		if (!this.context?.hasUI) return;
+		const base = !this.enabled ? "Voice: OFF" :
+			`Voice: ON | Live: ${this.live ? "ON" : "OFF"}${this.active ? ` | ${this.active.kind}` : ""}`;
+		const text = extra ? `${base} | ${extra}` : base;
+		this.context.ui.setStatus("voice", text);
 	}
 	private tools(): void {
 		const names = ["voice_speak", "voice_listen", "voice_list_voices"];
@@ -484,10 +532,13 @@ export class VoiceRuntime {
 	public setLive(enabled: boolean): void {
 		if (enabled && !this.enabled) throw new Error("请先执行 /voice on");
 		this.live = enabled;
-		// Listen has its OWN request; live off never cancels a listen.
-		if (!enabled) this.suspendLive();
-		else this.resumeLive();
-		this.footer();
+		if (!enabled) {
+			// 关闭 Live 时：不粗暴 abort 当前正在录音或正在转写的请求，允许当前正在说的这句顺利完成并出字！
+			this.footer();
+		} else {
+			this.resumeLive();
+			this.footer();
+		}
 	}
 	public stop(disable = false): void {
 		if (disable) this.enabled = false;
@@ -500,6 +551,11 @@ export class VoiceRuntime {
 		for (const controller of this.auxiliary) controller.abort();
 		this.auxiliary.clear();
 		this.initialization = undefined;
+		if (this.toastTimer) {
+			clearTimeout(this.toastTimer);
+			this.toastTimer = undefined;
+			try { this.context?.ui?.setWidget?.("voice-toast", undefined); } catch {}
+		}
 		// No network cleanup behind the audio mutex, no global stop endpoint.
 		if (disable) this.tools();
 		this.footer();
@@ -623,13 +679,11 @@ export class VoiceRuntime {
 		void this.pumpLive(run);
 	}
 	private liveCurrent(run: LiveRun): boolean {
-		return this.liveRun === run && run.epoch === this.generationEpoch && this.enabled && this.live && !this.active && !run.controller.signal.aborted;
+		return this.liveRun === run && run.epoch === this.generationEpoch && this.enabled && !this.active && !run.controller.signal.aborted;
 	}
 	private async pumpLive(run: LiveRun): Promise<void> {
 		try {
-			while (this.liveCurrent(run)) {
-				// Freeze gateway and delivery mode for this whole request, never read
-				// preferences midway and never redirect a cancelled result to listen.
+			while (this.liveCurrent(run) && this.live) {
 				const cfg = structuredClone(this.config.get());
 				const gateway = this.gateway(cfg.gatewayUrl);
 				const request = new AbortController();
@@ -637,21 +691,29 @@ export class VoiceRuntime {
 				const timer = setTimeout(() => request.abort(), 20000);
 				let result: RecordingResult;
 				try {
-					result = await abortable(gateway.recordAndTranscribe({ maxDurationSec: 15, signal }), signal);
+					result = await abortable(gateway.recordAndTranscribe({ maxDurationSec: 10, silenceTimeoutMs: 1000, signal }), signal);
 				} finally { clearTimeout(timer); request.abort(); }
-				if (!this.liveCurrent(run)) break;
-				if (result.text.trim()) this.deliver(result.text.trim(), cfg.deliveryMode);
+
+				// 关键契约：只要代次未被 stop/Alt+X 作废，即使用户刚刚在说话后按 F2 关闭了 Live，这次在途录音也必须正常出字！
+				if (run.epoch === this.generationEpoch && this.enabled && !run.controller.signal.aborted) {
+					if (result.text.trim()) {
+						this.deliver(result.text.trim(), cfg.deliveryMode);
+					}
+				}
+
+				if (!this.live) break; // 若已退出持续模式，交付本句后优雅结束循环
 				await delay(100, run.controller.signal);
 			}
 		} catch (error) {
-			if (this.liveCurrent(run)) {
-				// Fail closed rather than spin/hit an offline gateway indefinitely.
+			if (this.live && run.epoch === this.generationEpoch && !run.controller.signal.aborted) {
 				this.live = false;
-				this.notify(`Live 已停止: ${errorText(error)}；可执行 /voice live on 重启`, "warning");
+				this.showToast(`Live 已停止: ${errorText(error)}`);
 			}
 		} finally {
-			run.controller.abort();
-			if (this.liveRun === run) { this.liveRun = undefined; this.footer(); }
+			if (this.liveRun === run) {
+				this.liveRun = undefined;
+				this.footer();
+			}
 		}
 	}
 	private deliver(text: string, mode: DeliveryMode): void {
@@ -667,9 +729,15 @@ export class VoiceRuntime {
 				const newText = draft + (draft && !/\s$/.test(draft) ? " " : "") + text;
 				ctx.ui.setEditorText(newText);
 			}
-			this.notify(`🎙️ 已识别: "${text}"`, "info");
-		} else if (ctx?.isIdle()) this.pi.sendUserMessage(text);
-		else { this.pi.sendUserMessage(text, { deliverAs: "followUp" }); this.notify("语音已作为 followUp 排队"); }
+			// 在输入框上方靠左底部显示已识别提示，同时触发 TUI 即时重绘刷新输入框！
+			this.showToast(`🎙️ 已识别: "${text}"`);
+		} else if (ctx?.isIdle()) {
+			this.pi.sendUserMessage(text);
+			this.showToast(`🎙️ 语音已提交: "${text}"`);
+		} else {
+			this.pi.sendUserMessage(text, { deliverAs: "followUp" });
+			this.showToast(`📥 语音已排队: "${text}"`);
+		}
 	}
 	public async listVoices(params: VoiceListVoicesParams, signal?: AbortSignal): Promise<VoiceListVoicesResult> {
 		let cfg: VoiceConfig;
