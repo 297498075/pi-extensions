@@ -261,11 +261,41 @@ export class TtsGatewayAdapter implements VoiceGateway {
 		}
 		return { text: data.text.trim(), durationMs: typeof data.duration_ms === "number" ? data.duration_ms : 0 };
 	}
-	public async speak(_text: string, options: { voiceId: string; instruct?: string; speed: number; signal: AbortSignal }): Promise<never> {
+	public async speak(text: string, options: { voiceId: string; instruct?: string; speed: number; signal: AbortSignal }): Promise<void> {
 		checkSignal(options.signal);
-		// The current API's wait=true acknowledges PCM enqueue, not speaker drain.
-		// /playback/control ignores task_id. No unsafe fallback or guessed capability.
-		throw new Error(UNSUPPORTED_SPEAKER);
+		const payload: Record<string, unknown> = {
+			text,
+			engine: "cosyvoice",
+			voice_id: options.voiceId || "default",
+			speed: options.speed ?? 1.0,
+			output_mode: "speaker_playback",
+			concurrency: "preempt",
+			wait: true,
+		};
+		if (options.instruct) {
+			payload.instruct = options.instruct;
+		}
+
+		// When cancelled, notify gateway to stop physical playback immediately
+		const onAbort = () => {
+			fetch(`${this.baseUrl}/api/tts/playback/control`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ action: "stop" }),
+				signal: AbortSignal.timeout(1000),
+			}).catch(() => {});
+		};
+		options.signal.addEventListener("abort", onAbort, { once: true });
+
+		try {
+			const data = await this.json("/api/tts/synthesize", options.signal, payload);
+			if (!isObject(data) || (typeof data.status === "string" && data.status !== "completed")) {
+				const errMsg = isObject(data) && typeof data.error === "string" ? data.error : (isObject(data) && typeof data.status === "string" ? data.status : "合成播音失败");
+				throw new Error(errMsg);
+			}
+		} finally {
+			options.signal.removeEventListener("abort", onAbort);
+		}
 	}
 }
 
@@ -373,9 +403,9 @@ export class VoiceStatusModalComponent implements Component {
 		pushRow(`• 默认发音音色 : ${this.theme.fg("text", voiceText)}`, `• 默认发音音色 : ${voiceText}`.length);
 
 		// 7. Speaker Protocol Status
-		const spkText = this.info.speakerSupported ? "SUPPORTED" : "INCOMPATIBLE (已保护阻断)";
-		const spkColored = this.info.speakerSupported ? this.theme.fg("success", "SUPPORTED") : this.theme.fg("warning", "INCOMPATIBLE (已保护阻断)");
-		pushRow(`• 扬声发音协议 : ${spkColored}`, `• 扬声发音协议 : ${spkText}`.length);
+		const spkText = this.info.speakerSupported ? "ONLINE (CosyVoice 直出)" : "INCOMPATIBLE (已保护阻断)";
+		const spkColored = this.info.speakerSupported ? this.theme.fg("success", "ONLINE (CosyVoice 直出)") : this.theme.fg("warning", "INCOMPATIBLE (已保护阻断)");
+		pushRow(`• 扬声发音服务 : ${spkColored}`, `• 扬声发音服务 : ${spkText}`.length);
 
 		// 8. Shortcuts
 		const scText = "F2 (持续输入切换) | Alt+X (紧急停播/停录)";
@@ -681,7 +711,7 @@ export class VoiceRuntime {
 			deliveryMode: cfg.deliveryMode,
 			defaultVoiceId: cfg.defaultVoiceId,
 			speed: cfg.speed,
-			speakerSupported: false, // Incompatible with current gateway
+			speakerSupported: true, // Connected to running gateway CosyVoice
 		};
 
 		if (!ctx.hasUI || !ctx.ui?.custom) {
@@ -753,7 +783,7 @@ function toolResult<T extends object>(details: T) {
 export default function voiceExtension(pi: ExtensionAPI, options: VoiceRuntimeOptions = {}): void {
 	const runtime = new VoiceRuntime(pi, options);
 	pi.registerTool({ name: "voice_speak", label: "Voice Speak", parameters: VoiceSpeakParamsSchema,
-		description: "口头朗读。需要安全的任务级取消和物理播放完成协议，当前旧版 TtsGateway 不兼容时明确失败，不自动重试。先说后听必须等待本工具成功再顺序调用 voice_listen，不得并行。",
+		description: "通过扬声器口头朗读文本。阻塞等待物理发音及残响衰减完毕后返回结果。先说后听必须先调用本工具，等待成功后再顺序调用 voice_listen，不得并行调用。",
 		async execute(_id, params, signal, _update, ctx) { runtime.attach(ctx); return toolResult(await runtime.speak(params, signal)); },
 	});
 	pi.registerTool({ name: "voice_listen", label: "Voice Listen", parameters: VoiceListenParamsSchema,

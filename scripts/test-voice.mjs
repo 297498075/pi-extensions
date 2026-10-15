@@ -244,15 +244,27 @@ await test("cache null/empty/refresh/failure and startup fetch deduplication", a
 	finally { cold.close(); }
 });
 
-await test("actual HTTP adapter fails closed for speaker, rejects bad ASR/catalog responses", async () => {
+await test("actual HTTP adapter sends synthesize request for speak and rejects bad responses", async () => {
 	const original = globalThis.fetch; const requests = [];
 	let response;
 	globalThis.fetch = async (url, options) => { requests.push({ url, options }); return Response.json(response); };
 	const adapter = new TtsGatewayAdapter("http://mock/");
 	const signal = new AbortController().signal;
 	try {
-		await assert.rejects(adapter.speak("x", { voiceId: "clone", speed: 1, signal }), error => error.message === UNSUPPORTED_SPEAKER);
-		assert.equal(requests.length, 0); // No synthesize/preempt or global stop, even if HTTP200 reports success.
+		response = { status: "completed", task_id: "t1" };
+		await adapter.speak("hello world", { voiceId: "clone", speed: 1.2, signal });
+		assert.equal(requests.length, 1);
+		assert(requests[0].url.includes("/api/tts/synthesize"));
+		const body = JSON.parse(requests[0].options.body);
+		assert.equal(body.text, "hello world");
+		assert.equal(body.engine, "cosyvoice");
+		assert.equal(body.voice_id, "clone");
+		assert.equal(body.output_mode, "speaker_playback");
+		assert.equal(body.wait, true);
+
+		response = { status: "error", error: "Synthesis failed" };
+		await assert.rejects(adapter.speak("x", { voiceId: "clone", speed: 1, signal }), /Synthesis failed/);
+
 		for (const bad of [{ code: 1, text: "", error: "ASR error" }, {}, { code: 0, text: "x", duration_ms: -1 }]) {
 			response = bad; await assert.rejects(adapter.recordAndTranscribe({ maxDurationSec: 15, signal }));
 		}
@@ -294,15 +306,21 @@ await test("cross-process read-merge-write preserves concurrent updates", async 
 	} finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-await test("default adapter reports incompatible_gateway rather than synthesizing or retrying", async () => {
-	const original = globalThis.fetch; let calls = 0;
-	globalThis.fetch = async () => { calls++; throw Error("unexpected network"); };
+await test("default adapter synthesizes via speak and handles abort cleanup", async () => {
+	const original = globalThis.fetch; const calls = [];
+	globalThis.fetch = async (url, opts) => {
+		calls.push({ url, body: opts.body ? JSON.parse(opts.body) : undefined });
+		if (url.includes("/api/tts/synthesize")) return Response.json({ status: "completed", task_id: "s1" });
+		if (url.includes("/api/tts/playback/control")) return Response.json({ action: "stop" });
+		return Response.json({});
+	};
 	const h = harness();
 	const runtime = new VoiceRuntime({ getActiveTools: () => ["read"], setActiveTools() {} }, { config: h.store });
 	try {
 		runtime.start(h.ctx); runtime.enable();
 		const result = await runtime.speak({ text: "hello", voice_id: "custom" });
-		assert.equal(result.reason, "incompatible_gateway"); assert.equal(calls, 0);
+		assert.equal(result.status, "success");
+		assert(calls.some(c => c.url.includes("/api/tts/synthesize") && c.body.voice_id === "custom"));
 	} finally { runtime.stop(true); h.close(); globalThis.fetch = original; }
 });
 
@@ -353,7 +371,7 @@ await test("status modal component renders nicely and handles key/click close", 
 		deliveryMode: "editor",
 		defaultVoiceId: "default",
 		speed: 1.0,
-		speakerSupported: false,
+		speakerSupported: true,
 	}, () => { closed = true; });
 
 	comp.invalidate();
@@ -362,8 +380,8 @@ await test("status modal component renders nicely and handles key/click close", 
 	assert(lines.some(l => l.includes("Pi Voice Extension Status")));
 	assert(lines.some(l => l.includes("扩展总开关")));
 	assert(lines.some(l => l.includes("ENABLED (ON)")));
-	assert(lines.some(l => l.includes("扬声发音协议")));
-	assert(lines.some(l => l.includes("INCOMPATIBLE")));
+	assert(lines.some(l => l.includes("扬声发音服务")));
+	assert(lines.some(l => l.includes("ONLINE (CosyVoice 直出)")));
 
 	// Keyboard input triggers close
 	comp.handleInput("q");
