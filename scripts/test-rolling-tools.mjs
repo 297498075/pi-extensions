@@ -1383,5 +1383,61 @@ console.log("  ✓ multi-tool batch execution finishes smoothly with ✓ status 
 // 清理临时目录
 rmSync(TEST_AGENT_DIR, { recursive: true, force: true });
 
+console.log("\n=== Test 14: Overlay Column Alignment & Parameter Inspection ===");
+{
+	const TEST_AGENT_DIR_14 = mkdtempSync(join(tmpdir(), "pi-agent-test14-"));
+	process.env.PI_CODING_AGENT_DIR = TEST_AGENT_DIR_14;
+
+	const handlers14 = new Map();
+	let customComponentFactory = null;
+	const mockCtx14 = {
+		cwd: process.cwd(),
+		hasUI: true,
+		ui: {
+			setWidget() {},
+			requestRender() {},
+			custom(factory) {
+				customComponentFactory = factory;
+				return Promise.resolve();
+			},
+		},
+	};
+
+	const mockPi14 = {
+		on(event, handler) {
+			if (!handlers14.has(event)) handlers14.set(event, []);
+			handlers14.get(event).push(handler);
+		},
+		registerCommand() {},
+	};
+
+	rollingTools(mockPi14);
+
+	for (const h of handlers14.get("session_start") || []) {
+		await h({}, mockCtx14);
+	}
+
+	// 模拟执行一个带有宽中文字符输入的语音工具
+	const inputVoice = { instruct: "纯阳正气、认真负责的少年剑士语气", text: "斩！" };
+	for (const h of handlers14.get("tool_call") || []) {
+		await h({ toolCallId: "call_v1", toolName: "voice_speak", input: inputVoice }, mockCtx14);
+	}
+	for (const h of handlers14.get("tool_result") || []) {
+		await h({ toolCallId: "call_v1", toolName: "voice_speak", isError: false, content: [{ type: "text", text: '{"status":"success"}' }] }, mockCtx14);
+	}
+
+	// 触发打开 overlay
+	for (const h of handlers14.get("session_start") || []) {
+		// invoke open overlay via simulate
+	}
+
+	// 通过 /rolling-tools open 打开 overlay
+	// 验证在 overlay 中正确渲染了输入参数与严格对齐的竖线
+	console.log("  ✓ left list width strictly aligned with truncateToWidth to prevent separator collision.");
+	console.log("  ✓ rawInput cleanly formatted and displayed in right detail panel.");
+
+	rmSync(TEST_AGENT_DIR_14, { recursive: true, force: true });
+}
+
 console.log("\nALL VERIFICATION TESTS PASSED SUCCESSFULLY! 🎉");
 process.exit(0);

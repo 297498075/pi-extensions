@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import type { Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
+import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 /**
  * 通知拦截规则
@@ -141,6 +141,7 @@ interface ToolItem {
 	summaryDisplay: string;
 	fullPath?: string;
 	fullCommand?: string;
+	rawInput?: any;
 	output?: string;
 	/** 完整可展示内容（如 edit/write 的 diff 或写入正文），用于 overlay 大窗体 */
 	detailContent?: string;
@@ -839,6 +840,7 @@ function serializeHistory(
 		summaryDisplay: t.summaryDisplay,
 		fullPath: t.fullPath,
 		fullCommand: t.fullCommand ? t.fullCommand.slice(0, PERSIST_MAX_FIELD) : undefined,
+		rawInput: t.rawInput,
 		output: t.output ? t.output.slice(0, PERSIST_MAX_FIELD) : undefined,
 		detailContent: t.detailContent ? t.detailContent.slice(0, PERSIST_MAX_FIELD) : undefined,
 		detailKind: t.detailKind,
@@ -859,6 +861,7 @@ function deserializeHistory(data: any): { items: ToolItem[]; total: number; view
 		summaryDisplay: String(raw.summaryDisplay ?? ""),
 		fullPath: raw.fullPath,
 		fullCommand: raw.fullCommand,
+		rawInput: raw.rawInput,
 		output: raw.output,
 		detailContent: raw.detailContent,
 		detailKind: raw.detailKind,
@@ -1475,8 +1478,12 @@ class ToolHistoryOverlayComponent implements Component {
 			const name = isSel
 				? theme.bold(theme.fg("accent", t.displayName || t.name))
 				: theme.fg("toolTitle", t.displayName || t.name);
-			const summary = theme.fg("dim", truncate(t.summaryDisplay, Math.max(8, listWidth - 18)));
-			const row = `${marker}${this.statusIcon(t)} ${badge} ${name} ${summary}`;
+			const fixedWidth = visibleWidth(`${marker}${this.statusIcon(t)} ${badge} ${name} `);
+			const summaryMaxCols = Math.max(0, listWidth - fixedWidth);
+			const summary = summaryMaxCols > 0
+				? theme.fg("dim", truncateToWidth(t.summaryDisplay, summaryMaxCols))
+				: "";
+			const row = `${marker}${this.statusIcon(t)} ${badge} ${name}${summary ? ` ${summary}` : ""}`;
 			// 行号：标题(0) + 分隔(1) + 内容起始(2)
 			this.listRowMap.push({ row: 2 + listRows.length, index: absIndex });
 			listRows.push(row);
@@ -1492,7 +1499,11 @@ class ToolHistoryOverlayComponent implements Component {
 		for (let row = 0; row < viewportHeight; row++) {
 			const left = listRows[row] ?? "";
 			const right = detailLines[detailStart + row] ?? "";
-			const leftPadded = left + " ".repeat(Math.max(0, listWidth - visibleWidth(left)));
+			// 严格按可见终端列宽进行左侧对齐截断/补齐，保证无论包含何种字符都不会溢出冲撞分隔线
+			const leftColWidth = visibleWidth(left);
+			const leftPadded = leftColWidth <= listWidth
+				? left + " ".repeat(listWidth - leftColWidth)
+				: truncateToWidth(left, listWidth);
 			const sep = theme.fg("dim", " │ ");
 			const content = `${leftPadded}${sep}${right}`;
 			const pad = Math.max(0, boxW - 2 - visibleWidth(content));
@@ -1565,6 +1576,16 @@ class ToolHistoryOverlayComponent implements Component {
 			out.push(theme.fg("accent", "── 命令 ──"));
 			for (const raw of t.fullCommand.split("\n")) {
 				out.push(...this.wrapLine(raw, width, (line) => theme.fg("accent", line)));
+			}
+			out.push("");
+		} else if (t.rawInput !== undefined && t.rawInput !== null) {
+			// 若没有专门的长文本（如 voice_speak 等工具），以格式化 JSON 展示完整输入参数
+			out.push(theme.fg("accent", "── 输入参数 ──"));
+			const formattedInput = typeof t.rawInput === "string"
+				? t.rawInput
+				: JSON.stringify(t.rawInput, null, 2);
+			for (const raw of formattedInput.split("\n")) {
+				out.push(...this.wrapLine(raw, width, (line) => theme.fg("text", line)));
 			}
 			out.push("");
 		}
@@ -2331,6 +2352,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 						extractSummaryAndMetadata(c.name, c.arguments, cwd, currentConfig);
 
 					if (existing) {
+						existing.rawInput = c.arguments ?? existing.rawInput;
 						if (
 							existing.summaryDisplay !== summaryDisplay ||
 							existing.fullPath !== fullPath ||
@@ -2355,6 +2377,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 							summaryDisplay,
 							fullPath,
 							fullCommand,
+							rawInput: c.arguments,
 							detailContent,
 							detailKind,
 							status: "running",
@@ -2431,6 +2454,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		const existing = state.recentTools.find((t) => t.id === event.toolCallId);
 		if (existing) {
 			// 在流式阶段已提前捕获：更新最终确认的完整入参与元数据，保持 running 状态
+			existing.rawInput = event.input ?? existing.rawInput;
 			existing.summaryDisplay = summaryDisplay || existing.summaryDisplay;
 			if (fullPath) existing.fullPath = fullPath;
 			if (fullCommand) existing.fullCommand = fullCommand;
@@ -2449,6 +2473,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				summaryDisplay,
 				fullPath,
 				fullCommand,
+				rawInput: event.input,
 				detailContent,
 				detailKind,
 				status: "running",
