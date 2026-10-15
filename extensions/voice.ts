@@ -658,8 +658,16 @@ export class VoiceRuntime {
 		const ctx = this.context;
 		if (mode === "editor") {
 			if (!ctx?.hasUI) throw new Error("editor 模式需要交互终端；不会自动降级为提交");
-			const draft = ctx.ui.getEditorText();
-			ctx.ui.setEditorText(draft + (draft && !/\s$/.test(draft) ? " " : "") + text);
+			if (typeof ctx.ui.pasteToEditor === "function") {
+				const draft = ctx.ui.getEditorText();
+				const prefix = draft && !/\s$/.test(draft) ? " " : "";
+				ctx.ui.pasteToEditor(prefix + text);
+			} else {
+				const draft = ctx.ui.getEditorText();
+				const newText = draft + (draft && !/\s$/.test(draft) ? " " : "") + text;
+				ctx.ui.setEditorText(newText);
+			}
+			this.notify(`🎙️ 已识别: "${text}"`, "info");
 		} else if (ctx?.isIdle()) this.pi.sendUserMessage(text);
 		else { this.pi.sendUserMessage(text, { deliverAs: "followUp" }); this.notify("语音已作为 followUp 排队"); }
 	}
