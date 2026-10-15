@@ -370,6 +370,30 @@ Ctrl+Shift+T      # 快速呼出/关闭任务树弹窗
 - **ComfyUI 目录映射**: 内置 Diffusion Models, Checkpoints, Text Encoders, VAE, LoRA, ControlNet 等分类的推荐存放子目录。
 - **镜像源解析指引**: 针对 ModelScope CDN、Hugging Face (含国内镜像) 及 Civitai 提供直接下载链接格式规范。
 
+## Media Gen (Image & Video Generation)
+
+`extensions/media-gen.ts` 为 LLM 提供轻量、高可用、开箱即用的多模态多媒体生成套件，包含两个核心工具：`generate_image` 与 `generate_video`：
+
+### 核心亮点
+- **极简参数，拒绝复杂配置**：面向 LLM 提供符合直觉的标准参数（`prompt`, `image`, `width`, `height`），去除了死板的 `aspectRatio` 枚举与多余的 `duration` 参数，由扩展内部自动推导最匹配的标准比例（`1:1`, `16:9`, `9:16`, `4:3`, `3:4`, `21:9`）以及上游所需的分辨率。
+- **前置网关无缝接入**：自动探测当前运行时 Provider 配置及环境变量（`CPA_BASE_URL` / `AI_API_KEY` 等），无需任何额外的配置繁琐项。
+- **自动模型降级（Fallback）**：图片生成默认使用 `gpt-image-2.5-flare`，遇故障自动尝试 `gemini-3.1-flash-image` 兜底；熔断与限流由上游网关调度，本地保持极简与纯粹。
+- **图视联动（Image-to-Video）**：`generate_image` 生成的图片路径可直接作为 `generate_video` 的首帧或参考输入（`image`），极大提升视频主体的一致性与稳定性。
+- **标准驱动架构（Video Driver）**：视频工具内置统一驱动契约，原生支持扩展对接 ComfyUI（`COMFYUI_URL`）或标准视频代理网关（`VIDEO_API_BASE_URL`）。
+- **本地落盘管理**：生成的图片与视频自动持久化落地至工作区 `.pi/images/` 与 `.pi/videos/`，并向 LLM 返回跨平台安全的 Markdown 预览与绝对路径。
+
+### 工具清单
+1. `generate_image`:
+   - `prompt` (string, required): Detailed prompt describing the image to generate or edits to perform.
+   - `image` (string, optional): Local file path or URL of an existing image to modify/edit (Image-to-Image / Edit).
+   - `width` (number, optional, default: 1024): Desired width in pixels.
+   - `height` (number, optional, default: 1024): Desired height in pixels.
+2. `generate_video`:
+   - `prompt` (string, required): Motion and scene prompt describing camera movements and dynamics.
+   - `image` (string, optional): Reference image or first frame path/URL (Image-to-Video).
+   - `width` (number, optional, default: 1280): Desired video width in pixels.
+   - `height` (number, optional, default: 720): Desired video height in pixels.
+
 ## Pi package
 
 ```bash

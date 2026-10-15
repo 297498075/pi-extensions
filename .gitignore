@@ -11,10 +11,12 @@ coverage/
 *.local
 
 # Pi local state and installed package caches
+.pi/
 .pi/npm/
 .pi/git/
 .pi/sessions/
 .pi/settings.json
+.pi/media/
 
 # OS and editor files
 .DS_Store
