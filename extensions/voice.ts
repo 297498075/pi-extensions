@@ -31,17 +31,17 @@ export const DEFAULT_CONFIG: VoiceConfig = {
 	voicesCacheByGateway: {},
 };
 export const VoiceSpeakParamsSchema = Type.Object({
-	text: Type.String({ minLength: 1, description: "精炼口语文本，不要朗读大段代码或表格" }),
-	voice_id: Type.Optional(Type.String({ description: "不传则使用持久化默认音色；无目录时按需调用 voice_list_voices" })),
-	instruct: Type.Optional(Type.String({ description: "可选的语气指导" })),
+	text: Type.String({ minLength: 1, description: "Concise, natural spoken text (1-2 sentences). Speak like a human; do not read code, paths, logs, or tables." }),
+	voice_id: Type.Optional(Type.String({ description: "Voice ID (optional; defaults to saved setting)" })),
+	instruct: Type.Optional(Type.String({ description: "Optional tone or emotion instruction (e.g. 'cheerful', 'urgent')" })),
 	speed: Type.Optional(Type.Number({ minimum: 0.5, maximum: 2 })),
 });
 export const VoiceListenParamsSchema = Type.Object({
-	prompt: Type.Optional(Type.String({ description: "仅显示在终端，不自动朗读" })),
-	timeout_sec: Type.Optional(Type.Integer({ minimum: 3, maximum: 60, description: "收音和转写的总时限，默认 15 秒" })),
+	prompt: Type.Optional(Type.String({ description: "Optional prompt displayed in the UI while listening (not spoken aloud)" })),
+	timeout_sec: Type.Optional(Type.Integer({ minimum: 3, maximum: 60, description: "Total timeout for recording and transcription in seconds (default 15)" })),
 });
 export const VoiceListVoicesParamsSchema = Type.Object({
-	refresh: Type.Optional(Type.Boolean({ description: "默认使用缓存；无缓存时获取，仅确需更新时强制刷新" })),
+	refresh: Type.Optional(Type.Boolean({ description: "Force refresh from gateway instead of using local cache" })),
 });
 export type VoiceSpeakParams = Static<typeof VoiceSpeakParamsSchema>;
 export type VoiceListenParams = Static<typeof VoiceListenParamsSchema>;
@@ -858,16 +858,35 @@ function toolResult<T extends object>(details: T) {
 }
 export default function voiceExtension(pi: ExtensionAPI, options: VoiceRuntimeOptions = {}): void {
 	const runtime = new VoiceRuntime(pi, options);
-	pi.registerTool({ name: "voice_speak", label: "Voice Speak", parameters: VoiceSpeakParamsSchema,
-		description: "通过扬声器口头朗读文本。阻塞等待物理发音及残响衰减完毕后返回结果。先说后听必须先调用本工具，等待成功后再顺序调用 voice_listen，不得并行调用。",
+	pi.registerTool({
+		name: "voice_speak",
+		label: "Voice Speak",
+		parameters: VoiceSpeakParamsSchema,
+		promptSnippet: "Speak concise, natural text aloud to verbally alert or prompt the user.",
+		promptGuidelines: [
+			"Call `voice_speak` when you need to verbally alert, prompt, or notify the user (e.g. asking questions, reporting key progress, or completing a task).",
+			"Speak naturally like a human: keep it concise and conversational (1-2 sentences). Never read code, logs, paths, or markdown tables directly.",
+		],
+		description: "Speak natural text aloud to verbally alert or notify the user (e.g. asking questions, completing a task, or flagging issues). Keep it brief and conversational like human speech.",
 		async execute(_id, params, signal, _update, ctx) { runtime.attach(ctx); return toolResult(await runtime.speak(params, signal)); },
 	});
-	pi.registerTool({ name: "voice_listen", label: "Voice Listen", parameters: VoiceListenParamsSchema,
-		description: "收取一次口头答复，prompt 仅终端展示。与背景 Live 使用同一输入能力，但交接时取消并丢弃当前背景录音，开启新的请求，可能丢失正在说的半句。取消不重问；超时不能推断用户未说话。",
+	pi.registerTool({
+		name: "voice_listen",
+		label: "Voice Listen",
+		parameters: VoiceListenParamsSchema,
+		promptSnippet: "Listen for a single spoken voice response ONLY when explicitly requested by the user.",
+		promptGuidelines: [
+			"Do NOT call `voice_listen` by default. Only call it when the user explicitly requests voice input or asks you to listen to their spoken answer.",
+		],
+		description: "Record and transcribe a single spoken response from the user. Do NOT call this tool unless the user explicitly requests voice input or asks you to listen.",
 		async execute(_id, params, signal, _update, ctx) { runtime.attach(ctx); return toolResult(await runtime.listen(params, signal)); },
 	});
-	pi.registerTool({ name: "voice_list_voices", label: "Voice List Voices", parameters: VoiceListVoicesParamsSchema,
-		description: "获取音色目录：优先持久化缓存，无缓存才联网；仅确需更新时 refresh=true，不要每次发音前查询。",
+	pi.registerTool({
+		name: "voice_list_voices",
+		label: "Voice List Voices",
+		parameters: VoiceListVoicesParamsSchema,
+		promptSnippet: "List available TTS voice options from cache or gateway.",
+		description: "Query available TTS voices. Prefers local cache; only use when specifically requested or changing voices.",
 		async execute(_id, params, signal, _update, ctx) { runtime.attach(ctx); return toolResult(await runtime.listVoices(params, signal)); },
 	});
 	pi.registerCommand("voice", { description: "Voice: on/off/stop/live/mode/set-voice/voices/status", handler: (args, ctx) => runtime.command(args, ctx) });

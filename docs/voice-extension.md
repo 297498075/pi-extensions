@@ -11,7 +11,7 @@
 | `voice_listen` | 支持 `POST /api/v1/input/record-and-transcribe`，包含收音和转写的总超时 |
 | Live 输入 | 支持连续调用上述单次接口；每段完成后才开始下一段，不是无缝音频流 |
 | 音色目录 | 支持 `GET /api/voices`，本地持久化缓存 |
-| `voice_speak` | **当前明确返回 `incompatible_gateway`，不发送合成或播放请求** |
+| `voice_speak` | 支持 `POST /api/tts/synthesize`，物理发音并在取消时发送 `playback/control: stop` |
 
 当前网关的 `wait: true` 只确认 PCM 已写入播放缓冲，不能确认扬声器实际播放完毕；`playback/control` 只支持全局控制，`task_id` 不起隔离作用。扩展不会以固定延时冒充物理完成，也不会调用全局 stop 或 preempt 干扰其他终端。仅修改扩展无法安全补齐这些后端契约。
 
@@ -56,6 +56,7 @@ stop/off 不等待网络清理，使用 AbortSignal 中止自身 HTTP 请求和�
 
 ### `voice_listen`
 
+- 仅在用户明确要求语音输入或听取回答时调用，默认情况下不要主动触发。
 - 参数：`prompt?`（仅终端文字提示，不朗读）、`timeout_sec?`（3–60 秒，默认 15）。
 - 同一会话最多一个主动音频工具；并发 speak/listen 等冲突立即返回 `reason: "busy"`，不排队猜测调用顺序。
 - 超时覆盖完整收音和转写，取消返回结构化 `status: "cancelled", text: ""`，不泄露内部 Promise 拒绝。
@@ -67,17 +68,10 @@ stop/off 不等待网络清理，使用 AbortSignal 中止自身 HTTP 请求和�
 
 ### `voice_speak`
 
-当前 HTTP 适配器拒绝执行并返回：
-
-```json
-{
-  "status": "error",
-  "reason": "incompatible_gateway",
-  "message": "当前 TtsGateway 不提供任务级取消和扬声器物理播放完成确认；已拒绝发音，不发送全局停播。需要后端协议升级。"
-}
-```
-
-不得自动重试。未来支持时，口头提问应在同一 Agent 执行过程中先等待 speak **成功**，再顺序调用 listen，不得并行。参数保留 `text`、`voice_id?`、`instruct?`、`speed?`，不会静默替换无效音色或绕到不同合成引擎。
+- 对接网关合成与播音接口，支持参数：`text`、`voice_id?`、`instruct?`、`speed?`。
+- 取消时通过 `/api/tts/playback/control` 请求后端立即停播。
+- 当语音启用时，扩展会向系统提示词（`<rules>`）注入 guidelines，引导 LLM 在提问、确认决策或任务结束时主动进行精炼口语播报。
+- 朗读文本必须口语化，严禁直接朗读代码、路径或表格。若用户明确要求语音输入答复，必须等发音完毕后方可调用 `voice_listen`。
 
 ### `voice_list_voices`
 
