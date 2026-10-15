@@ -106,6 +106,7 @@ const DEFAULT_CONFIG: RollingToolsConfig = {
 		"url",
 		"tool",
 		"prompt",
+		"text",
 		"id",
 		"message",
 	],
@@ -648,6 +649,21 @@ function extractSummaryAndMetadata(
 		};
 	}
 
+	// 1.8 语音工具：voice_speak & voice_listen
+	if (name === "voice_speak" || name === "voice_listen") {
+		const text = typeof input.text === "string" ? input.text : typeof input.prompt === "string" ? input.prompt : "";
+		const voice = typeof input.voice_id === "string" ? input.voice_id : "";
+		const prefix = voice ? `[${voice}] ` : "";
+		const cleanText = text.replace(/\r?\n/g, " ").trim();
+		const display = cleanText ? `${prefix}${truncate(cleanText, 45)}` : (voice ? `[${voice}]` : "");
+		return {
+			displayName: name,
+			summaryDisplay: display || truncate(JSON.stringify(input), 45),
+			detailContent: text || undefined,
+			detailKind: "content",
+		};
+	}
+
 	// 2. 内置文件工具：read / edit / write
 	if (name === "read" || name === "edit" || name === "write") {
 		const rawPath = typeof input.path === "string" ? input.path : "";
@@ -807,6 +823,7 @@ function pickGenericDetailContent(
 		{ key: "prompt", kind: "content" },
 		{ key: "content", kind: "content" },
 		{ key: "command", kind: "command" },
+		{ key: "text", kind: "content" },
 		{ key: "message", kind: "content" },
 		{ key: "query", kind: "content" },
 	];
@@ -827,6 +844,39 @@ const HISTORY_ENTRY_TYPE = "rolling-tools-history";
 const PERSIST_MAX_ITEMS = 200;
 const PERSIST_MAX_FIELD = 20000;
 
+function tryParseJson(str: string): any {
+	if (!str) return undefined;
+	try {
+		return JSON.parse(str);
+	} catch {
+		const trimmed = str.replace(/\.\.\.$/, "").trim();
+		for (const suffix of ['"}', '}', '"]}', ']}']) {
+			try {
+				return JSON.parse(trimmed + suffix);
+			} catch {}
+		}
+	}
+	return undefined;
+}
+
+function backfillInputsFromSession(entries: any[], items: ToolItem[]): void {
+	if (!Array.isArray(entries) || !Array.isArray(items)) return;
+	const callInputs = new Map<string, any>();
+	for (const entry of entries) {
+		if (entry?.type === "message" && entry.message?.role === "assistant" && Array.isArray(entry.message.content)) {
+			for (const c of entry.message.content) {
+				if (c && c.type === "toolCall" && c.id && c.arguments) {
+					callInputs.set(c.id, c.arguments);
+				}
+			}
+		}
+	}
+	for (const item of items) {
+		if ((item.rawInput === undefined || item.rawInput === null) && callInputs.has(item.id)) {
+			item.rawInput = callInputs.get(item.id);
+		}
+	}
+}
 function serializeHistory(
 	items: ToolItem[],
 	total: number,
@@ -1578,12 +1628,18 @@ class ToolHistoryOverlayComponent implements Component {
 				out.push(...this.wrapLine(raw, width, (line) => theme.fg("accent", line)));
 			}
 			out.push("");
-		} else if (t.rawInput !== undefined && t.rawInput !== null) {
-			// 若没有专门的长文本（如 voice_speak 等工具），以格式化 JSON 展示完整输入参数
+		}
+
+		// 展示完整输入参数（若存在且与 detailContent 不完全重复）
+		let inputToShow: any = t.rawInput;
+		if (inputToShow === undefined || inputToShow === null) {
+			inputToShow = tryParseJson(t.summaryDisplay);
+		}
+		if (inputToShow !== undefined && inputToShow !== null) {
 			out.push(theme.fg("accent", "── 输入参数 ──"));
-			const formattedInput = typeof t.rawInput === "string"
-				? t.rawInput
-				: JSON.stringify(t.rawInput, null, 2);
+			const formattedInput = typeof inputToShow === "string"
+				? inputToShow
+				: JSON.stringify(inputToShow, null, 2);
 			for (const raw of formattedInput.split("\n")) {
 				out.push(...this.wrapLine(raw, width, (line) => theme.fg("text", line)));
 			}
@@ -2080,7 +2136,11 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			for (let i = entries.length - 1; i >= 0; i--) {
 				const entry = entries[i];
 				if (entry?.type === "custom" && entry?.customType === HISTORY_ENTRY_TYPE) {
-					return deserializeHistory(entry.data);
+					const res = deserializeHistory(entry.data);
+					if (res && res.items) {
+						backfillInputsFromSession(entries, res.items);
+					}
+					return res;
 				}
 			}
 		} catch (e) {
