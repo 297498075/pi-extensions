@@ -4,6 +4,15 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- feat(timer): add scheduled message timer extension (`extensions/timer.ts`) with flexible time parsing, above-editor countdown widget, transcript entry cards, and agent tools (`timer_schedule`, `timer_cancel`, `timer_list`).
+  - Supports versatile duration formats: user-specified `seconds minutes hours` (e.g. `/timer 30 2 0 <prompt>`), natural time strings (e.g. `5m`, `30s`, `1h 30m`, `1小时30分钟`), and clock colon formats (`00:05:00`, `02:30`).
+  - Interactive input prompts when `/timer` is executed without arguments.
+  - Live ticking countdown widget (`aboveEditor`) showing remaining time and prompt preview with auto-cleanup on trigger/cancellation.
+  - Durable structured chat transcript cards (`EntryRenderer`) for task creation, trigger, and cancellation events.
+  - Seamless agent dispatch: dispatches via `sendUserMessage` when idle or queues as `followUp` when busy or streaming.
+  - Status modal overlay (`/timer status`) using `ctx.ui.custom()` compliant with repository UX standards.
+  - Tool integration for agent self-scheduling: `timer_schedule`, `timer_cancel`, and `timer_list`.
+
 - fix(rolling-tools): capture streaming tool calls in real time (fixes command not showing after thinking completed / flickering on execution end).
   - Previously, `rolling-tools` only tracked tools when the formal `tool_call` event fired after the entire LLM response stream had ended and local execution was about to begin. Because LLMs take seconds to generate tool call arguments (especially when generating multiple concurrent tool calls like multiple `read` / `bash` commands), the UI would stay stuck on `💡 思考完成` during streaming, followed by tool execution that completed in milliseconds (e.g. 1ms~50ms), causing the commands to appear as a brief "flash" when execution finished.
   - Now, `message_update` captures `toolCall` blocks as soon as the model begins streaming them, displaying them immediately with live spinner and elapsed timer (`⠋ [1] bash ... (0.5s)`).

@@ -378,6 +378,36 @@ Ctrl+Shift+T      # 快速呼出/关闭任务树弹窗
 - **ComfyUI 目录映射**: 内置 Diffusion Models, Checkpoints, Text Encoders, VAE, LoRA, ControlNet 等分类的推荐存放子目录。
 - **镜像源解析指引**: 针对 ModelScope CDN、Hugging Face (含国内镜像) 及 Civitai 提供直接下载链接格式规范。
 
+## Scheduled Timer (定时发送/计划任务)
+
+`extensions/timer.ts` 提供定时发送消息（启动 Agent 任务）的功能。用户或 Agent 设定延迟时间与提示词后，时间到达时会自动向会话发送该消息并启动 Agent 执行任务。
+
+### 核心亮点
+- **全格式智能时间解析**：
+  - 用户指定「秒 分 时」格式：`/timer 30 2 0 检查并修复单元测试`（表示 30秒 2分 0时 = 150秒）；
+  - 自然时间语法：`/timer 5m 执行代码重构`、`/timer 30s 提醒我提交代码`、`/timer 1h 30m 发布版本`、`/timer 1小时30分钟 测试`；
+  - 标准冒号时钟：`/timer 00:05:00 运行检查` 或 `/timer 02:30 启动构建`；
+  - 无参数交互式创建：直接运行 `/timer`，弹出输入框引导输入时间与提示词。
+- **Widget 实时秒级跳动倒计时**：
+  - 在输入框上方常驻 Widget 实时跳动显示最近待触发任务的倒计时（如 `⏳ [定时任务倒计时] [#t-1] 02:30 后触发`），视觉聚焦且绝不刷屏污染会话流；任务归零或取消后自动清理。
+- **正文结构化卡片提示 (Entry Renderer)**：
+  - 任务创建、取消以及时间到达触发时，均在会话正文输出美观的结构化持久卡片，清楚记录任务 ID、预定/触发时间、延迟时长与提示词。
+- **无缝衔接 Agent 忙碌状态**：
+  - 倒计时到达时，若 Agent 处于空闲状态则立即启动新一轮任务；若 Agent 正在流式输出或执行中，则自动作为 `followUp` 排队，确保不丢失、不中断。
+- **规范模态窗口与工具集成**：
+  - `/timer status` 遵循规范采用 `ctx.ui.custom()` 居中悬浮模态弹窗呈现任务详情，支持按键或鼠标点击关闭；
+  - 注册 `timer_schedule`、`timer_cancel`、`timer_list` 工具，Agent 自身亦可灵活安排延迟计划任务。
+
+```bash
+# 常用命令
+/timer 30 2 0 检查代码测试           # 2分30秒后发送消息启动 Agent
+/timer 5m 总结当前进度               # 5分钟后触发
+/timer 00:10:00 执行每日健康检查     # 10分钟后触发
+/timer status                        # 呼出居中悬浮状态模态窗口
+/timer list                          # 查看所有等待中任务列表
+/timer cancel t-1                    # 取消指定任务 (或 /timer cancel all)
+```
+
 ## Media Gen (Image & Video Generation)
 
 `extensions/media-gen.ts` 为 LLM 提供轻量、高可用、开箱即用的多模态多媒体生成套件，包含两个核心工具：`generate_image` 与 `generate_video`：
