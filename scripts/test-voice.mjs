@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import voiceExtension, {
-	DEFAULT_CONFIG, VoiceConfigManager, VoiceRuntime, TtsGatewayAdapter, UNSUPPORTED_SPEAKER, VoiceStatusModalComponent,
+	DEFAULT_CONFIG, VoiceConfigManager, VoiceRuntime, TtsGatewayAdapter, UNSUPPORTED_SPEAKER, VoiceStatusModalComponent, defaultVoiceConfigDir,
 } from "../extensions/voice.ts";
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -392,4 +392,18 @@ await test("status modal component renders nicely and handles key/click close", 
 	await h.runtime.command("status", modalCtx);
 	assert.equal(customCalled, true, "/voice status must invoke ctx.ui.custom modal");
 });
+
+await test("defaultVoiceConfigDir points to .pi/agent and respects PI_CODING_AGENT_DIR", async () => {
+	const original = process.env.PI_CODING_AGENT_DIR;
+	try {
+		delete process.env.PI_CODING_AGENT_DIR;
+		assert(defaultVoiceConfigDir().endsWith(join(".pi", "agent")));
+		process.env.PI_CODING_AGENT_DIR = "/custom/pi/agent";
+		assert.equal(defaultVoiceConfigDir(), "/custom/pi/agent");
+	} finally {
+		if (original !== undefined) process.env.PI_CODING_AGENT_DIR = original;
+		else delete process.env.PI_CODING_AGENT_DIR;
+	}
+});
+
 

@@ -50,7 +50,7 @@ pi --extension ./extensions/example.ts
 
 `extensions/voice.ts` 默认关闭，通过 `/voice on` 启用 LLM 单次收音和音色目录工具，通过 `/voice live on`（或 F2）单独开启持续语音输入。默认转写追加到草稿等待 Enter；`/voice stop` 取消现有工作但保留开关，`/voice off` 同时禁用后续调用。
 
-**兼容性限制**：当前 TtsGateway 缺少任务级停播与扬声器物理播放完成确认，因此 `voice_speak` 明确返回不兼容，不发送不安全的播放请求；Live 采用分段请求，交接到 listen 时会丢弃当前背景半句，并非无缝音频流。扩展会访问配置的网关并写入 `~/.pi/voice.json`，录音及云端 ASR 风险取决于后端配置。
+**兼容性限制**：当前 TtsGateway 缺少任务级停播与扬声器物理播放完成确认，因此 `voice_speak` 明确返回不兼容，不发送不安全的播放请求；Live 采用分段请求，交接到 listen 时会丢弃当前背景半句，并非无缝音频流。扩展会访问配置的网关并写入 `~/.pi/agent/voice.json`，录音及云端 ASR 风险取决于后端配置。
 
 加载、操作、限制和测试详见 [`docs/voice-extension.md`](docs/voice-extension.md)。
 

@@ -139,16 +139,22 @@ export interface VoiceConfigStore {
 	update(updater: (current: VoiceConfig) => VoiceConfig, signal?: AbortSignal): Promise<VoiceConfig>;
 }
 
+export function defaultVoiceConfigDir(): string {
+	return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+}
+
 /** Cross-process read/merge/replace. Failure to acquire the lock NEVER permits a write. */
 export class VoiceConfigManager implements VoiceConfigStore {
 	private readonly directory: string;
 	private readonly configPath: string;
+	private readonly legacyConfigPath: string;
 	private readonly lockPath: string;
 	private readonly lockTimeoutMs: number;
 
-	constructor(customDir = join(homedir(), ".pi"), lockTimeoutMs = 2000) {
+	constructor(customDir = defaultVoiceConfigDir(), lockTimeoutMs = 2000) {
 		this.directory = customDir;
 		this.configPath = join(customDir, "voice.json");
+		this.legacyConfigPath = join(homedir(), ".pi", "voice.json");
 		this.lockPath = join(customDir, "voice.json.lock");
 		this.lockTimeoutMs = lockTimeoutMs;
 	}
@@ -156,7 +162,18 @@ export class VoiceConfigManager implements VoiceConfigStore {
 		try {
 			return parseConfig(JSON.parse(readFileSync(this.configPath, "utf8")));
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return structuredClone(DEFAULT_CONFIG);
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				// Seamless migration from legacy ~/.pi/voice.json if present
+				try {
+					if (this.configPath !== this.legacyConfigPath) {
+						const legacy = parseConfig(JSON.parse(readFileSync(this.legacyConfigPath, "utf8")));
+						return legacy;
+					}
+				} catch {
+					// Ignore legacy fallback errors
+				}
+				return structuredClone(DEFAULT_CONFIG);
+			}
 			throw new Error(`读取 ${this.configPath} 失败: ${errorText(error)}`);
 		}
 	}
