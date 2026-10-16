@@ -348,7 +348,12 @@ assert.ok(lastCmdNotification?.includes("已启用"), "on command works");
 
 await registeredCommand.handler("reload", fakeCtx);
 assert.ok(lastCmdNotification?.includes("配置已重载"), "reload command works");
-console.log("  ✓ All commands (status, off, on, reload) work as expected.");
+
+await registeredCommand.handler("clear", fakeCtx);
+assert.ok(lastCmdNotification?.includes("已清空"), "clear command works");
+const clearedWidgetLines = widgetContent(dummyTui, dummyTheme).render(100);
+assert.equal(clearedWidgetLines.slice(1).filter((l) => l.includes("[") && l.includes("]")).length, 0, "history must be empty after clear");
+console.log("  ✓ All commands (status, off, on, reload, clear) work as expected.");
 
 console.log("\n=== Test 6: ➕ Button & Overlay Dialog ===");
 // 先制造足够多的历史（> 懒加载步长 10），以便验证懒加载

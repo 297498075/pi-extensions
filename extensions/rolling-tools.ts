@@ -2899,6 +2899,16 @@ export default function rollingTools(pi: ExtensionAPI): void {
 					`rolling-tools: 视图模式已切换为「${state.viewMode === "running" ? "仅显示正在执行的任务" : `固定最近 ${currentConfig.maxRecentTools} 行`}」`,
 					"info",
 				);
+			} else if (action === "clear") {
+				state.recentTools = [];
+				totalToolCount = 0;
+				state.activeError = null;
+				state.expandedItemId = null;
+				state.completedMessage = null;
+				persistHistory();
+				syncWidget(ctx);
+				activeOverlay?.refresh();
+				ctx.ui?.notify?.("✓ rolling-tools: 工具历史已清空", "info");
 			} else if (action === "history" || action === "open") {
 				openHistoryOverlay(ctx);
 			} else {
