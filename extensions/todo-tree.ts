@@ -1820,7 +1820,6 @@ export const TODO_SUBCOMMANDS: AutocompleteItem[] = [
 	{ value: "status", label: "status", description: "查看 Todo Tree 状态模态悬浮窗" },
 	{ value: "open", label: "open", description: "打开 Todo Tree 交互模态窗口" },
 	{ value: "clear", label: "clear", description: "清空当前全部待办事项" },
-	{ value: "toggle", label: "toggle", description: "切换 Todo Tree 启用/停用状态" },
 	{ value: "on", label: "on", description: "启用 Todo Tree 插件与 LLM 工具" },
 	{ value: "off", label: "off", description: "停用 Todo Tree 插件并隐藏工具" },
 ];

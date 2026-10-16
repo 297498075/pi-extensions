@@ -819,7 +819,8 @@ export class VoiceRuntime {
 
 	public async command(args: string, ctx: ExtensionContext): Promise<void> {
 		this.attach(ctx);
-		const [rawAction = "status", param] = args.trim().split(/\s+/);
+		const raw = args.trim();
+		const [rawAction = "status", param] = raw.split(/\s+/);
 		const action = rawAction.toLowerCase() || "status";
 		try {
 			switch (action) {
@@ -835,10 +836,24 @@ export class VoiceRuntime {
 					if (param !== "editor" && param !== "submit") throw new Error("用法: /voice mode editor|submit");
 					await this.config.update(current => ({ ...current, deliveryMode: param }));
 					this.notify(`投递模式已更新: ${param}`); break;
-				case "set-voice":
-					if (!param) throw new Error("用法: /voice set-voice <id>");
-					await this.config.update(current => ({ ...current, defaultVoiceId: param }));
-					this.notify(`默认音色已保存: ${param}`); break;
+				case "set-voice": {
+					const voiceArg = raw.slice(rawAction.length).trim();
+					if (!voiceArg) throw new Error("用法: /voice set-voice <音色名称或ID>");
+					const cfg = this.config.get();
+					const voices = cfg.voicesCacheByGateway[cfg.gatewayUrl] || [];
+					// 优先精确匹配名称或 ID，次选忽略大小写匹配，再次选子串模糊匹配
+					let matched = voices.find(v => v.name === voiceArg || v.id === voiceArg);
+					if (!matched) {
+						matched = voices.find(v => v.name.toLowerCase() === voiceArg.toLowerCase() || v.id.toLowerCase() === voiceArg.toLowerCase());
+					}
+					if (!matched) {
+						matched = voices.find(v => v.name.toLowerCase().includes(voiceArg.toLowerCase()) || v.id.toLowerCase().includes(voiceArg.toLowerCase()));
+					}
+					const targetId = matched ? matched.id : voiceArg;
+					const displayName = matched ? `${matched.name} (${matched.id})` : targetId;
+					await this.config.update(current => ({ ...current, defaultVoiceId: targetId }));
+					this.notify(`默认音色已保存: ${displayName}`); break;
+				}
 				case "voices": {
 					const result = await this.listVoices({});
 					this.notify(result.success ? [result.warning, `默认: ${result.default_voice_id}`, ...result.voices.map(v => `${v.id}: ${v.name}`)].filter(Boolean).join("\n") : result.message || "查询失败", result.success && !result.warning ? "info" : "warning");
@@ -899,7 +914,8 @@ export function getVoiceArgumentCompletions(
 	}
 
 	if (prefix.startsWith("set-voice")) {
-		const sub = prefix.slice(9).trimStart().toLowerCase();
+		const rawSub = prefix.slice(9).trimStart();
+		const sub = rawSub.toLowerCase();
 		const options: AutocompleteItem[] = [];
 		if (runtime) {
 			try {
@@ -907,15 +923,18 @@ export function getVoiceArgumentCompletions(
 				const voices = cfg.voicesCacheByGateway[cfg.gatewayUrl] || [];
 				for (const v of voices) {
 					options.push({
-						value: `set-voice ${v.id}`,
-						label: v.id,
-						description: v.name ? `${v.name} (${v.id})` : v.id,
+						value: `set-voice ${v.name}`,
+						label: v.name,
+						description: `音色ID: ${v.id}${v.description ? ` · ${v.description}` : ""}`,
 					});
 				}
 			} catch {}
 		}
 		const filtered = options.filter(
-			(o) => o.label.toLowerCase().startsWith(sub) || o.value.toLowerCase().startsWith(prefix.toLowerCase()),
+			(o) =>
+				o.label.toLowerCase().includes(sub) ||
+				o.value.toLowerCase().includes(sub) ||
+				(o.description && o.description.toLowerCase().includes(sub)),
 		);
 		return filtered.length > 0 ? filtered : options.length > 0 ? options : null;
 	}
