@@ -4,6 +4,12 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- fix(media-gen): support multimodal `/chat/completions` fallback for image generation and editing (Gemini, Claude, Qwen, OneAPI/NewAPI proxies).
+  - Proxy services and native endpoints often reject models like `gemini-3.1-flash-image` with HTTP 400 on `/v1/images/generations`.
+  - Added seamless fallback to `/v1/chat/completions`, supporting `message.images` (OpenAI-compatible image objects or data URIs), multimodal `message.content` parts (`image_url`), markdown image links (`![...](...)`), and embedded base64 data URIs.
+  - Enhanced error diagnostics detailing statuses of both `/images/generations` and `/chat/completions` endpoints upon failure.
+
+
 - feat(timer): add scheduled message timer extension (`extensions/timer.ts`) with flexible time parsing, above-editor countdown widget, transcript entry cards, and agent tools (`timer_schedule`, `timer_cancel`, `timer_list`).
   - Supports versatile duration formats: user-specified `seconds minutes hours` (e.g. `/timer 30 2 0 <prompt>`), natural time strings (e.g. `5m`, `30s`, `1h 30m`, `1小时30分钟`), and clock colon formats (`00:05:00`, `02:30`).
   - Interactive input prompts when `/timer` is executed without arguments.

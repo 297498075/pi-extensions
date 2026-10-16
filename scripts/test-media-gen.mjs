@@ -12,6 +12,8 @@ import {
 	loadMediaGenConfigFile,
 	getMediaGenContext,
 	resolveProviderFromModelsJson,
+	extractImageFromChatMessage,
+	resolveUrlOrDataUriToBuffer,
 	default as mediaGenExtension,
 } from "../extensions/media-gen.ts";
 
@@ -139,6 +141,68 @@ console.log("Starting test-media-gen.mjs...");
 	assert.ok(registeredTools.has("generate_image"), "Must register generate_image tool");
 	assert.ok(registeredTools.has("generate_video"), "Must register generate_video tool");
 	console.log("✓ Extension tool registration passed");
+}
+
+// 7. Test Image Extraction from Multimodal Chat Messages (Gemini, Claude, NewAPI/OneAPI)
+{
+	const sampleBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+	const sampleDataUri = `data:image/png;base64,${sampleBase64}`;
+
+	// 7.1 resolveUrlOrDataUriToBuffer with data URI
+	const buf1 = await resolveUrlOrDataUriToBuffer(sampleDataUri);
+	assert.ok(buf1 instanceof Buffer, "Must resolve data URI to Buffer");
+	assert.equal(buf1.toString("base64"), sampleBase64);
+
+	// 7.2 Message format with msg.images (Gemini via OpenAI-compatible proxy)
+	const msgGeminiImages = {
+		role: "assistant",
+		content: null,
+		images: [
+			{
+				type: "image_url",
+				image_url: { url: sampleDataUri },
+			},
+		],
+	};
+	const bufGemini = await extractImageFromChatMessage(msgGeminiImages);
+	assert.ok(bufGemini instanceof Buffer, "Must extract image from msg.images");
+	assert.equal(bufGemini.toString("base64"), sampleBase64);
+
+	// 7.3 Message format with string markdown image
+	const msgMarkdown = {
+		role: "assistant",
+		content: `Here is your image:\n![Generated Image](${sampleDataUri})`,
+	};
+	const bufMarkdown = await extractImageFromChatMessage(msgMarkdown);
+	assert.ok(bufMarkdown instanceof Buffer, "Must extract image from markdown link");
+	assert.equal(bufMarkdown.toString("base64"), sampleBase64);
+
+	// 7.4 Message format with embedded base64 data URI
+	const msgB64Text = {
+		role: "assistant",
+		content: `Image data: ${sampleDataUri} Done.`,
+	};
+	const bufB64 = await extractImageFromChatMessage(msgB64Text);
+	assert.ok(bufB64 instanceof Buffer, "Must extract image from embedded data URI");
+	assert.equal(bufB64.toString("base64"), sampleBase64);
+
+	// 7.5 Message format with multimodal content array
+	const msgMultimodal = {
+		role: "assistant",
+		content: [
+			{ type: "text", text: "Generated result:" },
+			{ type: "image_url", image_url: { url: sampleDataUri } },
+		],
+	};
+	const bufMultimodal = await extractImageFromChatMessage(msgMultimodal);
+	assert.ok(bufMultimodal instanceof Buffer, "Must extract image from multimodal content array");
+	assert.equal(bufMultimodal.toString("base64"), sampleBase64);
+
+	// 7.6 Empty or plain text without images returns null
+	assert.equal(await extractImageFromChatMessage(null), null);
+	assert.equal(await extractImageFromChatMessage({ content: "Just plain text without image." }), null);
+
+	console.log("✓ extractImageFromChatMessage and resolveUrlOrDataUriToBuffer passed all formats");
 }
 
 console.log("All test-media-gen.mjs assertions passed successfully!");

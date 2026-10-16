@@ -487,21 +487,19 @@ async function callImageApi(options: {
 
 		if (chatRes.ok) {
 			const chatData = (await chatRes.json()) as any;
-			const content = chatData?.choices?.[0]?.message?.content || "";
-			const matchUrl = content.match(/!\[.*?\]\((https?:\/\/[^\s)]+)\)/);
-			if (matchUrl?.[1]) {
-				const imgRes = await fetch(matchUrl[1]);
-				return Buffer.from(await imgRes.arrayBuffer());
-			}
-			const matchB64 = content.match(/data:image\/[a-zA-Z]+;base64,([A-Za-z0-9+/=]+)/);
-			if (matchB64?.[1]) {
-				return Buffer.from(matchB64[1], "base64");
+			const msg = chatData?.choices?.[0]?.message;
+			const extracted = await extractImageFromChatMessage(msg);
+			if (extracted) {
+				return extracted;
 			}
 		}
 
-		throw new Error(
-			`Failed to edit image with model ${model} (${response.status} ${response.statusText})`,
-		);
+		const editError = await response.text().catch(() => "");
+		const chatError = chatRes ? await chatRes.text().catch(() => "") : "";
+		const errorMsg = chatError
+			? `/images/edits: ${response.status} ${editError.slice(0, 100)} | /chat/completions: ${chatRes.status} ${chatError.slice(0, 100)}`
+			: `${response.status} ${response.statusText} ${editError.slice(0, 150)}`;
+		throw new Error(`Failed to edit image with model ${model} (${errorMsg})`);
 	}
 
 	// Branch 2: Text-to-Image via /images/generations
@@ -532,8 +530,121 @@ async function callImageApi(options: {
 		}
 	}
 
-	const errorBody = await res.text().catch(() => "");
-	throw new Error(`API call failed for ${model}: ${res.status} ${res.statusText} ${errorBody.slice(0, 200)}`);
+	// Fallback: Multimodal chat/completions (for Gemini, Claude, Qwen, or proxy aggregators)
+	const chatUrl = `${provider.baseUrl}/chat/completions`;
+	const chatRes = await fetch(chatUrl, {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${provider.apiKey}`,
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify({
+			model,
+			messages: [{ role: "user", content: prompt }],
+		}),
+	});
+
+	if (chatRes.ok) {
+		const chatData = (await chatRes.json()) as any;
+		const msg = chatData?.choices?.[0]?.message;
+		const extracted = await extractImageFromChatMessage(msg);
+		if (extracted) {
+			return extracted;
+		}
+	}
+
+	const genError = await res.text().catch(() => "");
+	const chatError = chatRes ? await chatRes.text().catch(() => "") : "";
+	const errorMsg = chatError
+		? `/images/generations: ${res.status} ${genError.slice(0, 100)} | /chat/completions: ${chatRes.status} ${chatError.slice(0, 100)}`
+		: `${res.status} ${res.statusText} ${genError.slice(0, 150)}`;
+	throw new Error(`API call failed for ${model}: ${errorMsg}`);
+}
+
+/**
+ * Resolves a direct image URL or base64 data URI into a Buffer.
+ */
+export async function resolveUrlOrDataUriToBuffer(urlOrDataUri: string): Promise<Buffer | null> {
+	if (!urlOrDataUri || typeof urlOrDataUri !== "string") return null;
+	const match = urlOrDataUri.match(/^data:image\/[a-zA-Z0-9+.-]+;base64,(.+)$/);
+	if (match) {
+		return Buffer.from(match[1], "base64");
+	}
+	if (urlOrDataUri.startsWith("http://") || urlOrDataUri.startsWith("https://")) {
+		const res = await fetch(urlOrDataUri);
+		if (res.ok) {
+			const arr = await res.arrayBuffer();
+			return Buffer.from(arr);
+		}
+	}
+	return null;
+}
+
+/**
+ * Extracts image buffer from various OpenAI-compatible /chat/completions multimodal responses
+ * (such as Gemini, Claude, Qwen, or proxy aggregators that return images in message.images or message.content).
+ */
+export async function extractImageFromChatMessage(msg: any): Promise<Buffer | null> {
+	if (!msg) return null;
+
+	// Format 1: Direct images field (e.g., OneAPI/NewAPI/yqdcc OpenAI-compatible Gemini or Claude image format)
+	if (Array.isArray(msg.images) && msg.images.length > 0) {
+		for (const imgItem of msg.images) {
+			const rawUrl = typeof imgItem === "string" ? imgItem : imgItem?.image_url?.url || imgItem?.url || "";
+			if (rawUrl) {
+				const buf = await resolveUrlOrDataUriToBuffer(rawUrl);
+				if (buf) return buf;
+			}
+		}
+	}
+
+	// Format 2: Multimodal array inside message.content
+	if (Array.isArray(msg.content)) {
+		for (const part of msg.content) {
+			const rawUrl = part?.image_url?.url || part?.url;
+			if (rawUrl) {
+				const buf = await resolveUrlOrDataUriToBuffer(rawUrl);
+				if (buf) return buf;
+			}
+			if (typeof part?.text === "string") {
+				const buf = await extractImageFromString(part.text);
+				if (buf) return buf;
+			}
+		}
+	}
+
+	// Format 3: String message.content
+	if (typeof msg.content === "string") {
+		return await extractImageFromString(msg.content);
+	}
+
+	return null;
+}
+
+async function extractImageFromString(content: string): Promise<Buffer | null> {
+	if (!content) return null;
+
+	// Markdown image syntax: ![...](url or data URI)
+	const mdMatch = content.match(/!\[.*?\]\((https?:\/\/[^\s)]+|data:image\/[a-zA-Z0-9+.-]+;base64,[A-Za-z0-9+/=]+)\)/);
+	if (mdMatch?.[1]) {
+		const buf = await resolveUrlOrDataUriToBuffer(mdMatch[1]);
+		if (buf) return buf;
+	}
+
+	// Direct base64 data URI in text
+	const b64Match = content.match(/data:image\/[a-zA-Z0-9+.-]+;base64,([A-Za-z0-9+/=]+)/);
+	if (b64Match?.[1]) {
+		return Buffer.from(b64Match[1], "base64");
+	}
+
+	// Standalone image URL
+	const urlMatch = content.match(/(https?:\/\/[^\s)]+\.(?:png|jpe?g|webp|gif))/i);
+	if (urlMatch?.[1]) {
+		const buf = await resolveUrlOrDataUriToBuffer(urlMatch[1]);
+		if (buf) return buf;
+	}
+
+	return null;
 }
 
 // ============================================================================
