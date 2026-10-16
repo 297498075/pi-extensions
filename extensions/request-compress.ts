@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import zlib from "node:zlib";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
 
 export type CompressionAlgorithm = "zstd" | "gzip" | "deflate" | "br";
 
@@ -528,6 +529,21 @@ export function resetStats(): void {
 	stats.compressedBytes = 0;
 }
 
+const REQUEST_COMPRESS_SUBCOMMANDS: AutocompleteItem[] = [
+	{ value: "status", label: "status", description: "查看当前压缩状态、算法与流量节省统计" },
+	{ value: "on", label: "on", description: "开启 HTTP 请求体压缩" },
+	{ value: "off", label: "off", description: "关闭 HTTP 请求体压缩" },
+	{ value: "reload", label: "reload", description: "从磁盘重新载入压缩配置" },
+];
+
+export function getRequestCompressArgumentCompletions(argumentPrefix: string): AutocompleteItem[] | null {
+	const prefix = (argumentPrefix || "").trimStart();
+	const filtered = REQUEST_COMPRESS_SUBCOMMANDS.filter((item) =>
+		item.value.toLowerCase().startsWith(prefix.toLowerCase()),
+	);
+	return filtered.length > 0 ? filtered : null;
+}
+
 export default function requestCompressExtension(pi: ExtensionAPI): void {
 	const activeConfig = loadConfig();
 	const activeEnvCtx = resolvePiEnvironment();
@@ -537,6 +553,7 @@ export default function requestCompressExtension(pi: ExtensionAPI): void {
 
 	pi.registerCommand("request-compress", {
 		description: "View or toggle HTTP request body compression status (zstd/gzip)",
+		getArgumentCompletions: getRequestCompressArgumentCompletions,
 		handler: async (args, ctx) => {
 			const currentConfig: RequestCompressConfig = (globalThis as any)[CONFIG_REF_SYMBOL] || activeConfig;
 			const sub = args?.trim().toLowerCase();

@@ -6,6 +6,7 @@ import type {
 	Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
+	type AutocompleteItem,
 	Box,
 	type Component,
 	Text,
@@ -987,6 +988,56 @@ export async function handleTimerCommand(
 // Extension 导出入口
 // ==========================================
 
+const TIMER_SUBCOMMANDS: AutocompleteItem[] = [
+	{ value: "status", label: "status", description: "查看定时任务状态与历史模态窗" },
+	{ value: "list", label: "list", description: "列出当前所有等待执行的定时任务" },
+	{ value: "cancel", label: "cancel", description: "取消指定的定时任务 (支持 cancel all 或 ID)" },
+	{ value: "help", label: "help", description: "查看定时时间表达式与使用指南" },
+	{ value: "5m ", label: "5m", description: "预设：5 分钟后发送提示词" },
+	{ value: "30s ", label: "30s", description: "预设：30 秒后发送提示词" },
+	{ value: "10m ", label: "10m", description: "预设：10 分钟后发送提示词" },
+	{ value: "30m ", label: "30m", description: "预设：30 分钟后发送提示词" },
+	{ value: "1h ", label: "1h", description: "预设：1 小时后发送提示词" },
+	{ value: "30 0 0 ", label: "30 0 0", description: "预设：30秒后 (秒 分 时)" },
+];
+
+export function getTimerArgumentCompletions(
+	argumentPrefix: string,
+	manager?: TimerManager,
+): AutocompleteItem[] | null {
+	const prefix = (argumentPrefix || "").trimStart();
+
+	if (prefix.startsWith("cancel")) {
+		const sub = prefix.slice(6).trimStart().toLowerCase();
+		const options: AutocompleteItem[] = [
+			{ value: "cancel all", label: "all", description: "取消所有等待执行的定时任务" },
+		];
+
+		if (manager) {
+			const pending = manager.getPendingTasks();
+			for (const t of pending) {
+				const rem = Math.max(0, Math.ceil((t.targetTime - Date.now()) / 1000));
+				options.push({
+					value: `cancel ${t.id}`,
+					label: t.id,
+					description: `取消任务 #${t.id} (剩余 ${formatClockTime(rem)}): "${t.prompt.slice(0, 20)}"`,
+				});
+			}
+		}
+
+		const filtered = options.filter(
+			(o) => o.label.toLowerCase().startsWith(sub) || o.value.toLowerCase().startsWith(prefix.toLowerCase()),
+		);
+		return filtered.length > 0 ? filtered : options;
+	}
+
+	const filtered = TIMER_SUBCOMMANDS.filter((item) =>
+		item.value.toLowerCase().startsWith(prefix.toLowerCase()) ||
+		item.label.toLowerCase().startsWith(prefix.toLowerCase()),
+	);
+	return filtered.length > 0 ? filtered : null;
+}
+
 export default function timerExtension(pi: ExtensionAPI): void {
 	const manager = new TimerManager(pi);
 
@@ -996,6 +1047,7 @@ export default function timerExtension(pi: ExtensionAPI): void {
 	// 注册主命令 /timer
 	pi.registerCommand("timer", {
 		description: "设置定时发送消息启动 Agent 任务，如 /timer 30 2 0 提示词 或 /timer 5m 提示词",
+		getArgumentCompletions: (prefix) => getTimerArgumentCompletions(prefix, manager),
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			await handleTimerCommand(args, ctx, manager);
 		},
@@ -1004,6 +1056,7 @@ export default function timerExtension(pi: ExtensionAPI): void {
 	// 注册别名命令 /schedule
 	pi.registerCommand("schedule", {
 		description: "设置定时任务别名 (/timer 的同义命令)",
+		getArgumentCompletions: (prefix) => getTimerArgumentCompletions(prefix, manager),
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			await handleTimerCommand(args, ctx, manager);
 		},

@@ -353,7 +353,15 @@ await registeredCommand.handler("clear", fakeCtx);
 assert.ok(lastCmdNotification?.includes("已清空"), "clear command works");
 const clearedWidgetLines = widgetContent(dummyTui, dummyTheme).render(100);
 assert.equal(clearedWidgetLines.slice(1).filter((l) => l.includes("[") && l.includes("]")).length, 0, "history must be empty after clear");
-console.log("  ✓ All commands (status, off, on, reload, clear) work as expected.");
+
+// 验证 argument completions
+assert.ok(typeof registeredCommand.getArgumentCompletions === "function", "command must provide getArgumentCompletions");
+const emptyCompletions = registeredCommand.getArgumentCompletions("");
+assert.ok(emptyCompletions?.some((c) => c.value === "status"), "must complete subcommands on empty prefix");
+assert.ok(emptyCompletions?.some((c) => c.value === "clear"), "must complete clear subcommand");
+const modeCompletions = registeredCommand.getArgumentCompletions("mode ");
+assert.ok(modeCompletions?.some((c) => c.value === "mode running"), "must complete mode running options");
+console.log("  ✓ All commands (status, off, on, reload, clear) and argument completions work as expected.");
 
 console.log("\n=== Test 6: ➕ Button & Overlay Dialog ===");
 // 先制造足够多的历史（> 懒加载步长 10），以便验证懒加载

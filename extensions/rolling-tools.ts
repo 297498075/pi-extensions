@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
-import type { Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
+import type { AutocompleteItem, Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 /**
@@ -2208,6 +2208,41 @@ function ensureGlobalPrototypeHooksInstalled(): void {
 	};
 }
 
+const ROLLING_TOOLS_SUBCOMMANDS: AutocompleteItem[] = [
+	{ value: "status", label: "status", description: "查看当前运行状态、视图模式与配置信息" },
+	{ value: "mode", label: "mode", description: "切换视图模式 (running | fixed)" },
+	{ value: "clear", label: "clear", description: "清空当前工具历史记录与错误提示" },
+	{ value: "history", label: "history", description: "打开工具历史大窗体 (Overlay)" },
+	{ value: "on", label: "on", description: "启用工具静音与滚动条" },
+	{ value: "off", label: "off", description: "禁用工具静音与滚动条" },
+	{ value: "reload", label: "reload", description: "从磁盘重新载入配置" },
+	{ value: "migrate", label: "migrate", description: "升级配置文件到最新规范 (v3)" },
+];
+
+/**
+ * rolling-tools 命令参数补全
+ */
+export function getRollingToolsArgumentCompletions(argumentPrefix: string): AutocompleteItem[] | null {
+	const prefix = (argumentPrefix || "").trimStart();
+
+	if (prefix.startsWith("mode")) {
+		const sub = prefix.slice(4).trimStart();
+		const options: AutocompleteItem[] = [
+			{ value: "mode running", label: "running", description: "仅显示正在执行的任务（单行状态行）" },
+			{ value: "mode fixed", label: "fixed", description: "固定展示最近 N 行工具历史" },
+		];
+		const filtered = options.filter(
+			(o) => o.label.toLowerCase().startsWith(sub.toLowerCase()) || o.value.toLowerCase().startsWith(prefix.toLowerCase()),
+		);
+		return filtered.length > 0 ? filtered : options;
+	}
+
+	const filtered = ROLLING_TOOLS_SUBCOMMANDS.filter((item) =>
+		item.value.toLowerCase().startsWith(prefix.toLowerCase()),
+	);
+	return filtered.length > 0 ? filtered : null;
+}
+
 export default function rollingTools(pi: ExtensionAPI): void {
 	let initialLoad = loadConfig(process.cwd());
 	let currentConfig: RollingToolsConfig = initialLoad.config;
@@ -2836,6 +2871,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	// 10. 管理控制命令
 	pi.registerCommand("rolling-tools", {
 		description: "Manage rolling tools widget mode, configuration, and reload",
+		getArgumentCompletions: getRollingToolsArgumentCompletions,
 		handler: async (args, ctx) => {
 			const action = (args || "").trim();
 			if (action === "reload") {

@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
+import type { AutocompleteItem, Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 
@@ -468,6 +468,7 @@ export class VoiceRuntime {
 		this.gateway = options.gateway ?? (url => new TtsGatewayAdapter(url));
 	}
 	public attach(ctx: ExtensionContext): void { this.context = ctx; }
+	public getVoiceConfig(): VoiceConfig { return this.config.get(); }
 	
 	/**
 	 * 显示交互反馈：优先使用输入框上方靠左底部 Widget (aboveEditor) 与最下方状态栏 (setStatus)，
@@ -856,6 +857,75 @@ export class VoiceRuntime {
 function toolResult<T extends object>(details: T) {
 	return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
 }
+const VOICE_SUBCOMMANDS: AutocompleteItem[] = [
+	{ value: "status", label: "status", description: "打开语音配置与状态模态窗" },
+	{ value: "on", label: "on", description: "启用语音扩展" },
+	{ value: "off", label: "off", description: "关闭语音扩展" },
+	{ value: "stop", label: "stop", description: "立即停止当前语音活动（播报或收音）" },
+	{ value: "live", label: "live", description: "持续收音模式开关 (live on | live off)" },
+	{ value: "mode", label: "mode", description: "转写投递模式 (mode editor | mode submit)" },
+	{ value: "voices", label: "voices", description: "列出当前网关可用音色" },
+	{ value: "set-voice", label: "set-voice", description: "设置默认音色 (用法: /voice set-voice <id>)" },
+];
+
+export function getVoiceArgumentCompletions(
+	argumentPrefix: string,
+	runtime?: VoiceRuntime,
+): AutocompleteItem[] | null {
+	const prefix = (argumentPrefix || "").trimStart();
+
+	if (prefix.startsWith("live")) {
+		const sub = prefix.slice(4).trimStart().toLowerCase();
+		const options: AutocompleteItem[] = [
+			{ value: "live on", label: "on", description: "开启持续语音输入模式" },
+			{ value: "live off", label: "off", description: "关闭持续语音输入模式" },
+		];
+		const filtered = options.filter(
+			(o) => o.label.toLowerCase().startsWith(sub) || o.value.toLowerCase().startsWith(prefix.toLowerCase()),
+		);
+		return filtered.length > 0 ? filtered : options;
+	}
+
+	if (prefix.startsWith("mode")) {
+		const sub = prefix.slice(4).trimStart().toLowerCase();
+		const options: AutocompleteItem[] = [
+			{ value: "mode editor", label: "editor", description: "转写结果填入输入框（可编辑后再发送）" },
+			{ value: "mode submit", label: "submit", description: "转写结果直接提交给 Agent" },
+		];
+		const filtered = options.filter(
+			(o) => o.label.toLowerCase().startsWith(sub) || o.value.toLowerCase().startsWith(prefix.toLowerCase()),
+		);
+		return filtered.length > 0 ? filtered : options;
+	}
+
+	if (prefix.startsWith("set-voice")) {
+		const sub = prefix.slice(9).trimStart().toLowerCase();
+		const options: AutocompleteItem[] = [];
+		if (runtime) {
+			try {
+				const cfg = runtime.getVoiceConfig();
+				const voices = cfg.voicesCacheByGateway[cfg.gatewayUrl] || [];
+				for (const v of voices) {
+					options.push({
+						value: `set-voice ${v.id}`,
+						label: v.id,
+						description: v.name ? `${v.name} (${v.id})` : v.id,
+					});
+				}
+			} catch {}
+		}
+		const filtered = options.filter(
+			(o) => o.label.toLowerCase().startsWith(sub) || o.value.toLowerCase().startsWith(prefix.toLowerCase()),
+		);
+		return filtered.length > 0 ? filtered : options.length > 0 ? options : null;
+	}
+
+	const filtered = VOICE_SUBCOMMANDS.filter((item) =>
+		item.value.toLowerCase().startsWith(prefix.toLowerCase()),
+	);
+	return filtered.length > 0 ? filtered : null;
+}
+
 export default function voiceExtension(pi: ExtensionAPI, options: VoiceRuntimeOptions = {}): void {
 	const runtime = new VoiceRuntime(pi, options);
 	pi.registerTool({
@@ -889,7 +959,11 @@ export default function voiceExtension(pi: ExtensionAPI, options: VoiceRuntimeOp
 		description: "Query available TTS voices. Prefers local cache; only use when specifically requested or changing voices.",
 		async execute(_id, params, signal, _update, ctx) { runtime.attach(ctx); return toolResult(await runtime.listVoices(params, signal)); },
 	});
-	pi.registerCommand("voice", { description: "Voice: on/off/stop/live/mode/set-voice/voices/status", handler: (args, ctx) => runtime.command(args, ctx) });
+	pi.registerCommand("voice", {
+		description: "Voice: on/off/stop/live/mode/set-voice/voices/status",
+		getArgumentCompletions: (prefix) => getVoiceArgumentCompletions(prefix, runtime),
+		handler: (args, ctx) => runtime.command(args, ctx),
+	});
 	pi.registerShortcut("alt+x", { description: "取消现有语音活动，保留开关", handler: async ctx => { runtime.attach(ctx); runtime.stop(); } });
 	pi.registerShortcut("f2", { description: "切换持续语音输入", handler: ctx => runtime.command("live", ctx) });
 	pi.on("session_start", (_event, ctx) => runtime.start(ctx));

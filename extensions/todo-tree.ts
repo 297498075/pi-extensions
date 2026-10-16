@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { Component, KeyId, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
+import type { AutocompleteItem, Component, KeyId, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { Key, matchesKey, sliceByColumn, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 
@@ -1816,6 +1816,26 @@ GUIDELINES:
 // 8. Extension Entry Point
 // ============================================================================
 
+export const TODO_SUBCOMMANDS: AutocompleteItem[] = [
+	{ value: "status", label: "status", description: "查看 Todo Tree 状态模态悬浮窗" },
+	{ value: "open", label: "open", description: "打开 Todo Tree 交互模态窗口" },
+	{ value: "clear", label: "clear", description: "清空当前全部待办事项" },
+	{ value: "toggle", label: "toggle", description: "切换 Todo Tree 启用/停用状态" },
+	{ value: "on", label: "on", description: "启用 Todo Tree 插件与 LLM 工具" },
+	{ value: "off", label: "off", description: "停用 Todo Tree 插件并隐藏工具" },
+];
+
+/**
+ * todo/todos 命令参数补全
+ */
+export function getTodoArgumentCompletions(argumentPrefix: string): AutocompleteItem[] | null {
+	const prefix = (argumentPrefix || "").trimStart();
+	const filtered = TODO_SUBCOMMANDS.filter((item) =>
+		item.value.toLowerCase().startsWith(prefix.toLowerCase()),
+	);
+	return filtered.length > 0 ? filtered : null;
+}
+
 export default function todoTreeExtension(pi: ExtensionAPI): void {
 	const config = loadConfig();
 	const store = new TodoTreeStore();
@@ -2285,11 +2305,13 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 
 	pi.registerCommand("todo", {
 		description: "Hierarchical todo list (/todo on|off|toggle|open|status|clear)",
+		getArgumentCompletions: getTodoArgumentCompletions,
 		handler: commandHandler,
 	});
 
 	pi.registerCommand("todos", {
 		description: "Alias for /todo",
+		getArgumentCompletions: getTodoArgumentCompletions,
 		handler: commandHandler,
 	});
 }
