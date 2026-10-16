@@ -254,6 +254,134 @@ function truncate(str: string, maxLen = 50): string {
 	return str.slice(0, maxLen - 3) + "...";
 }
 
+function stripFormatting(str: string): string {
+	return str
+		.replace(/\x1b\[[0-9;]*m/g, "")
+		.replace(/\[(accent|dim|muted|toolTitle|success|error|text)\]/g, "")
+		.replace(/\*([^*]+)\*/g, "$1");
+}
+
+function getVisualWidth(str: string): number {
+	return visibleWidth(stripFormatting(str));
+}
+
+/**
+ * 带有前缀的多行安全折行。首行使用 firstPrefix，续行使用 continuationPrefix，
+ * 严格按照可见终端列宽（考虑中文字符双列宽）折行，绝不省略截断。
+ */
+function wrapPrefixedText(
+	text: string,
+	width: number,
+	firstPrefix: string,
+	continuationPrefix: string,
+	styler: (s: string) => string = (s) => s,
+): string[] {
+	if (!text) return [`${firstPrefix}`];
+	const firstPrefixWidth = getVisualWidth(firstPrefix);
+	const contPrefixWidth = getVisualWidth(continuationPrefix);
+	const lines: string[] = [];
+
+	let remaining = text;
+	let isFirst = true;
+
+	while (remaining.length > 0) {
+		const prefix = isFirst ? firstPrefix : continuationPrefix;
+		const prefixWidth = isFirst ? firstPrefixWidth : contPrefixWidth;
+		const maxCols = Math.max(10, width - prefixWidth);
+
+		if (getVisualWidth(remaining) <= maxCols) {
+			lines.push(`${prefix}${styler(remaining)}`);
+			break;
+		}
+
+		let cut = 0;
+		let w = 0;
+		for (const ch of remaining) {
+			const cw = getVisualWidth(ch);
+			if (w + cw > maxCols) break;
+			w += cw;
+			cut += ch.length;
+		}
+		if (cut === 0) cut = 1;
+
+		lines.push(`${prefix}${styler(remaining.slice(0, cut))}`);
+		remaining = remaining.slice(cut);
+		isFirst = false;
+	}
+
+	return lines.length > 0 ? lines : [`${firstPrefix}`];
+}
+
+/**
+ * 将工具主行（图标 + 徽标 + 名称 + 命令/路径摘要 + 耗时）安全换行输出。
+ * 超过终端宽度时自动折到下一行对齐缩进，时间戳紧跟在最后一折行的末尾，绝不省略。
+ */
+function wrapToolHeaderLines(
+	icon: string,
+	arrow: string,
+	badge: string,
+	name: string,
+	summaryText: string,
+	timeColored: string,
+	timePlainWidth: number,
+	renderWidth: number,
+	themeStyler: (s: string) => string,
+): string[] {
+	const prefix1 = ` ${icon} ${arrow} ${badge} ${name}${summaryText ? " " : ""}`;
+	const contPrefix = "     ";
+	const singleLine = `${prefix1}${summaryText ? themeStyler(summaryText) : ""}${timeColored}`;
+	if (getVisualWidth(singleLine) <= renderWidth) {
+		return [singleLine];
+	}
+
+	const wPrefix1 = getVisualWidth(prefix1);
+	const wPrefixCont = getVisualWidth(contPrefix);
+	const lines: string[] = [];
+
+	let remaining = summaryText;
+	let isFirst = true;
+
+	while (remaining.length > 0) {
+		const prefix = isFirst ? prefix1 : contPrefix;
+		const pWidth = isFirst ? wPrefix1 : wPrefixCont;
+		const maxCols = Math.max(10, renderWidth - pWidth);
+
+		const remainingWidth = getVisualWidth(remaining);
+		// 若当前行能放下剩余文本及时间戳
+		if (remainingWidth + timePlainWidth <= maxCols) {
+			lines.push(`${prefix}${themeStyler(remaining)}${timeColored}`);
+			remaining = "";
+			break;
+		}
+
+		// 若当前行能放下剩余文本但放不下时间戳
+		if (remainingWidth <= maxCols) {
+			lines.push(`${prefix}${themeStyler(remaining)}`);
+			remaining = "";
+			if (timeColored) {
+				lines.push(`${contPrefix}${timeColored.trimStart()}`);
+			}
+			break;
+		}
+
+		let cut = 0;
+		let w = 0;
+		for (const ch of remaining) {
+			const cw = getVisualWidth(ch);
+			if (w + cw > maxCols) break;
+			w += cw;
+			cut += ch.length;
+		}
+		if (cut === 0) cut = 1;
+
+		lines.push(`${prefix}${themeStyler(remaining.slice(0, cut))}`);
+		remaining = remaining.slice(cut);
+		isFirst = false;
+	}
+
+	return lines.length > 0 ? lines : [singleLine];
+}
+
 function ensureDirectoryExists(dirPath: string): void {
 	try {
 		if (!existsSync(dirPath)) {
@@ -673,7 +801,7 @@ function extractSummaryAndMetadata(
 		if (name === "write" && typeof input.content === "string") {
 			const lineCount = input.content.split("\n").length;
 			return {
-				summaryDisplay: `${truncate(rawPath, 40)} (+${lineCount} lines)`,
+				summaryDisplay: `${rawPath} (+${lineCount} lines)`,
 				fullPath: absPath,
 				detailContent: input.content,
 				detailKind: "content",
@@ -681,27 +809,27 @@ function extractSummaryAndMetadata(
 		}
 		// edit：diff 在 tool_result.details.diff 中回填，这里先给出摘要
 		if (name === "edit") {
-			return { summaryDisplay: truncate(rawPath, 50), fullPath: absPath, detailKind: "diff" };
+			return { summaryDisplay: rawPath, fullPath: absPath, detailKind: "diff" };
 		}
-		return { summaryDisplay: truncate(rawPath, 50), fullPath: absPath };
+		return { summaryDisplay: rawPath, fullPath: absPath };
 	}
 
 	// 3. 内置搜索：grep
 	if (name === "grep") {
 		const scope = input.path ? resolve(cwd, input.path) : cwd;
-		const display = `"${input.pattern || ""}" in ${truncate(input.path || ".", 30)}`;
+		const display = `"${input.pattern || ""}" in ${input.path || "."}`;
 		return { summaryDisplay: display, fullPath: scope };
 	}
 
 	// 4. 内置文件查找：find
 	if (name === "find") {
-		return { summaryDisplay: truncate(input.pattern || "", 50) };
+		return { summaryDisplay: input.pattern || "" };
 	}
 
 	// 5. 内置目录列表：ls
 	if (name === "ls") {
 		const dirPath = input.path ? resolve(cwd, input.path) : cwd;
-		return { summaryDisplay: truncate(input.path || ".", 40), fullPath: dirPath };
+		return { summaryDisplay: input.path || ".", fullPath: dirPath };
 	}
 
 	// 6. SoL-Pi: obs_recall
@@ -862,6 +990,9 @@ function tryParseJson(str: string): any {
 function backfillInputsFromSession(entries: any[], items: ToolItem[]): void {
 	if (!Array.isArray(entries) || !Array.isArray(items)) return;
 	const callInputs = new Map<string, any>();
+	const toolResults = new Map<string, { isError: boolean; output?: string; durationMs?: number }>();
+	const omittedTargetIds = new Set<string>();
+
 	for (const entry of entries) {
 		if (entry?.type === "message" && entry.message?.role === "assistant" && Array.isArray(entry.message.content)) {
 			for (const c of entry.message.content) {
@@ -869,11 +1000,55 @@ function backfillInputsFromSession(entries: any[], items: ToolItem[]): void {
 					callInputs.set(c.id, c.arguments);
 				}
 			}
+		} else if (entry?.type === "message" && entry.message?.role === "toolResult" && entry.message.toolCallId) {
+			let output: string | undefined;
+			if (Array.isArray(entry.message.content)) {
+				const textC = entry.message.content.find((c: any) => c && c.type === "text");
+				if (textC && typeof textC.text === "string") output = textC.text;
+			}
+			toolResults.set(entry.message.toolCallId, {
+				isError: Boolean(entry.message.isError),
+				output,
+				durationMs: typeof entry.message.durationMs === "number" ? entry.message.durationMs : undefined,
+			});
+		} else if (entry?.type === "context_edit" && entry.targetId && entry.replacement === null) {
+			omittedTargetIds.add(entry.targetId);
 		}
 	}
+
+	// 找出所有属于被裁剪/丢弃的 assistant message 的 toolCallId
+	const omittedToolCallIds = new Set<string>();
+	if (omittedTargetIds.size > 0) {
+		for (const entry of entries) {
+			if (entry?.type === "message" && entry.message?.role === "assistant" && omittedTargetIds.has(entry.id)) {
+				if (Array.isArray(entry.message.content)) {
+					for (const c of entry.message.content) {
+						if (c?.type === "toolCall" && c.id) {
+							omittedToolCallIds.add(c.id);
+						}
+					}
+				}
+			}
+		}
+	}
+
 	for (const item of items) {
 		if ((item.rawInput === undefined || item.rawInput === null) && callInputs.has(item.id)) {
 			item.rawInput = callInputs.get(item.id);
+		}
+
+		// 回填会话中真实的工具执行结果与状态（对齐 toolResult 与中途终止的 context_edit）
+		const res = toolResults.get(item.id);
+		if (res) {
+			item.status = res.isError ? "error" : "done";
+			if (!item.output && res.output) item.output = res.output;
+			if (item.durationMs === undefined && res.durationMs !== undefined) {
+				item.durationMs = res.durationMs;
+			}
+		} else if (omittedToolCallIds.has(item.id) || item.status === "running") {
+			// 若未收到 toolResult 且属于已终止轮次，状态标记为 error 并注明中断
+			item.status = "error";
+			if (!item.output) item.output = "Terminated or aborted before completion";
 		}
 	}
 }
@@ -1175,23 +1350,59 @@ class RollingToolsWidgetComponent implements Component {
 				const summary = theme.fg("dim", t.summaryDisplay);
 
 				let time = "";
+				let timePlainWidth = 0;
 				if (t.status === "running") {
 					const elapsed = Math.max(0, Date.now() - t.startTime);
-					time = theme.fg("muted", formatDuration(elapsed));
+					const timeStr = formatDuration(elapsed);
+					time = theme.fg("muted", timeStr);
+					timePlainWidth = getVisualWidth(timeStr);
 				} else if (t.durationMs !== undefined) {
-					time = theme.fg("muted", formatDuration(t.durationMs));
+					const timeStr = formatDuration(t.durationMs);
+					time = theme.fg("muted", timeStr);
+					timePlainWidth = getVisualWidth(timeStr);
 				}
 
-				pushLine(` ${icon} ${arrow} ${badge} ${name} ${summary}${time}`, t, "header");
+				const toolHeaderLines = wrapToolHeaderLines(
+					icon,
+					arrow,
+					badge,
+					name,
+					t.summaryDisplay,
+					time,
+					timePlainWidth,
+					renderWidth,
+					(s) => theme.fg("dim", s),
+				);
+				for (const headerLine of toolHeaderLines) {
+					pushLine(headerLine, t, "header");
+				}
 
 				// 点击展开详情：展示完整路径/完整命令以及输出结果
 				if (isExpanded) {
 					if (t.fullPath) {
-						pushLine(`   ${theme.fg("accent", `↳ ${t.fullPath}`)}`, t, "detail_copyable", t.fullPath);
+						const pathLines = wrapPrefixedText(
+							t.fullPath,
+							renderWidth,
+							"   ↳ ",
+							"     ",
+							(s) => theme.fg("accent", s),
+						);
+						for (const pLine of pathLines) {
+							pushLine(pLine, t, "detail_copyable", t.fullPath);
+						}
 					} else if (t.fullCommand) {
 						const cmdLines = t.fullCommand.split("\n").slice(0, 8);
 						for (const cmdLine of cmdLines) {
-							pushLine(`   ${theme.fg("accent", `↳ $ ${cmdLine}`)}`, t, "detail_copyable", t.fullCommand);
+							const wrappedCmds = wrapPrefixedText(
+								cmdLine,
+								renderWidth,
+								"   ↳ $ ",
+								"       ",
+								(s) => theme.fg("accent", s),
+							);
+							for (const cLine of wrappedCmds) {
+								pushLine(cLine, t, "detail_copyable", t.fullCommand);
+							}
 						}
 						if (t.fullCommand.split("\n").length > 8) {
 							pushLine(
@@ -1211,12 +1422,16 @@ class RollingToolsWidgetComponent implements Component {
 							const maxShow = 6;
 							const shown = outLines.slice(0, maxShow);
 							for (const outLine of shown) {
-								pushLine(
-									`   ${theme.fg("muted", `↳ ${truncate(outLine, 80)}`)}`,
-									t,
-									"detail_copyable",
-									cleanOutput,
+								const wrappedOuts = wrapPrefixedText(
+									outLine,
+									renderWidth,
+									"   ↳ ",
+									"     ",
+									(s) => theme.fg("muted", s),
 								);
+								for (const oLine of wrappedOuts) {
+									pushLine(oLine, t, "detail_copyable", cleanOutput);
+								}
 							}
 							if (outLines.length > maxShow) {
 								pushLine(
@@ -1253,6 +1468,9 @@ class RollingToolsWidgetComponent implements Component {
 			this.state.copyFeedbackMessage = null;
 			this.tui?.requestRender?.();
 		}, 2500);
+		if (typeof this.copyFeedbackTimer === "object" && this.copyFeedbackTimer && "unref" in this.copyFeedbackTimer) {
+			this.copyFeedbackTimer.unref();
+		}
 
 		this.tui?.requestRender?.();
 	}
@@ -1768,6 +1986,9 @@ class ToolHistoryOverlayComponent implements Component {
 			this.copyFeedback = null;
 			this.requestRender();
 		}, 2500);
+		if (typeof this.copyFeedbackTimer === "object" && this.copyFeedbackTimer && "unref" in this.copyFeedbackTimer) {
+			this.copyFeedbackTimer.unref();
+		}
 		this.requestRender();
 	}
 
@@ -2122,6 +2343,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		statusTimer = setInterval(() => {
 			syncWidget(ctx);
 		}, 100);
+		if (typeof statusTimer === "object" && statusTimer && "unref" in statusTimer) {
+			(statusTimer as any).unref();
+		}
 	}
 
 	/**

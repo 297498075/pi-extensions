@@ -1439,5 +1439,199 @@ console.log("\n=== Test 14: Overlay Column Alignment & Parameter Inspection ==="
 	rmSync(TEST_AGENT_DIR_14, { recursive: true, force: true });
 }
 
+console.log("\n=== Test 15: Long Command & Path Auto-Wrapping (No Omission) ===");
+{
+	const handlers15 = new Map();
+	let widgetFactory15 = null;
+	const fakeCtx15 = {
+		cwd: process.cwd(),
+		hasUI: true,
+		ui: {
+			setWidget(k, f) {
+				if (typeof f === "function") widgetFactory15 = f;
+			},
+			notify() {},
+			setStatus() {},
+			setToolsExpanded() {},
+			requestRender() {},
+		},
+		sessionManager: { getEntries: () => [] },
+	};
+	const fakePi15 = {
+		on(e, h) {
+			const l = handlers15.get(e) || [];
+			l.push(h);
+			handlers15.set(e, l);
+		},
+		registerCommand() {},
+		appendEntry() {},
+	};
+
+	rollingTools(fakePi15);
+	for (const h of handlers15.get("session_start") || []) await h({ reason: "startup" }, fakeCtx15);
+
+	const longFilePath = ".trellis/tasks/09-19-api-v2-enrollment-pairing/completed-consumer-integration-ports.md";
+	for (const h of handlers15.get("tool_call") || []) {
+		await h(
+			{
+				toolCallId: "call_long_write",
+				toolName: "write",
+				input: { path: longFilePath, content: "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10" },
+			},
+			fakeCtx15,
+		);
+	}
+
+	const w15 = widgetFactory15(dummyTui, dummyTheme);
+	// 在较窄终端宽度（例如 60 列）下渲染
+	const lines60 = w15.render(60);
+	const toolHeaderLines = lines60.slice(1).filter((l) => l.includes("write") || l.includes("completed-consumer"));
+	assert.ok(toolHeaderLines.length > 1, "long tool path must wrap into multiple lines instead of single line");
+	const combinedText = toolHeaderLines.join("");
+	assert.ok(combinedText.includes("completed-consumer-integration-ports.md"), "full filename must not be truncated with ellipsis");
+	assert.ok(combinedText.includes("(+10 lines)"), "line count badge must be preserved");
+
+	// 展开详情时，完整路径与完整命令也支持安全折行
+	w15.handleMouse({
+		type: "click",
+		button: "left",
+		x: 5,
+		y: 1,
+		screenX: 5,
+		screenY: 1,
+		width: 60,
+		height: lines60.length,
+		shift: false,
+		alt: false,
+		ctrl: false,
+	});
+	const expandedLines60 = w15.render(60);
+	const pathSubLines = expandedLines60.filter((l) => l.includes("↳") || l.includes("completed-consumer"));
+	assert.ok(pathSubLines.length >= 1, "expanded full path must be visible");
+	assert.ok(expandedLines60.join("").includes("completed-consumer-integration-ports.md"), "expanded path must contain full path text");
+	console.log("  ✓ long paths and commands automatically wrap across lines without omission.");
+}
+
+console.log("\n=== Test 16: Interrupted / Terminated Tool Status Reconciliation ===");
+{
+	const handlers16 = new Map();
+	const mockEntries16 = [
+		// 1. 已正常完成的调用
+		{
+			type: "message",
+			id: "msg_norm_1",
+			message: {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "call_norm_done", name: "bash", arguments: { command: "echo done" } }],
+			},
+		},
+		{
+			type: "message",
+			id: "res_norm_1",
+			message: {
+				role: "toolResult",
+				toolCallId: "call_norm_done",
+				isError: false,
+				content: [{ type: "text", text: "done" }],
+				durationMs: 250,
+			},
+		},
+		// 2. 中途被中断/终止（如被 context_edit 裁剪）且永远没返回 toolResult 的调用
+		{
+			type: "message",
+			id: "msg_aborted_assistant",
+			message: {
+				role: "assistant",
+				stopReason: "error",
+				errorMessage: "terminated",
+				content: [
+					{
+						type: "toolCall",
+						id: "call_stuck_2274",
+						name: "write",
+						arguments: { path: ".trellis/tasks/09-19-api-v2-e", content: "data" },
+					},
+				],
+			},
+		},
+		{
+			type: "context_edit",
+			id: "edit_omit_1",
+			targetId: "msg_aborted_assistant",
+			replacement: null,
+		},
+		// 保存的旧快照：由于当时刚开始执行，快照里状态还是 "running"
+		{
+			type: "custom",
+			customType: "rolling-tools-history",
+			data: {
+				total: 2,
+				items: [
+					{
+						id: "call_norm_done",
+						index: 2273,
+						name: "bash",
+						summaryDisplay: "echo done",
+						status: "running",
+						startTime: Date.now() - 5000,
+					},
+					{
+						id: "call_stuck_2274",
+						index: 2274,
+						name: "write",
+						summaryDisplay: ".trellis/tasks/09-19-api-v2-e",
+						status: "running",
+						startTime: Date.now() - 10000,
+					},
+				],
+			},
+		},
+	];
+
+	let widgetFactory16 = null;
+	const fakeCtx16 = {
+		cwd: process.cwd(),
+		hasUI: true,
+		ui: {
+			setWidget(k, f) {
+				if (typeof f === "function") widgetFactory16 = f;
+			},
+			notify() {},
+			setStatus() {},
+			setToolsExpanded() {},
+			requestRender() {},
+		},
+		sessionManager: {
+			getEntries: () => mockEntries16,
+		},
+	};
+	const fakePi16 = {
+		on(e, h) {
+			const l = handlers16.get(e) || [];
+			l.push(h);
+			handlers16.set(e, l);
+		},
+		registerCommand() {},
+		appendEntry() {},
+	};
+
+	rollingTools(fakePi16);
+	// 启动会话并恢复历史
+	for (const h of handlers16.get("session_start") || []) await h({ reason: "reload" }, fakeCtx16);
+
+	const w16 = widgetFactory16(dummyTui, dummyTheme);
+	const lines16 = w16.render(100);
+
+	// 验证 1：已正常完成的工具被回填为 done (✓)
+	const doneLine = lines16.find((l) => l.includes("[2273]") && l.includes("bash"));
+	assert.ok(doneLine && doneLine.includes("✓"), "call_norm_done must be reconciled to done (✓)");
+
+	// 验证 2：被中断未执行完毕的工具被修正为 error (✗)，绝不再卡在 ⏳ running
+	const stuckLine = lines16.find((l) => l.includes("[2274]") && l.includes("write"));
+	assert.ok(stuckLine && stuckLine.includes("✗"), "stuck tool must be reconciled to error (✗) instead of staying running ⏳");
+	assert.ok(!stuckLine.includes("⏳"), "stuck tool must NOT show ⏳ running spinner");
+	console.log("  ✓ interrupted/terminated tools correctly reconciled to error status and never hang as running.");
+}
+
 console.log("\nALL VERIFICATION TESTS PASSED SUCCESSFULLY! 🎉");
 process.exit(0);
