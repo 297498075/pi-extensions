@@ -4,6 +4,12 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- fix(security): replace Windows `cmd /c start` file opening with a fixed ShellExecute adapter; paths remain literal data and must be existing local absolute paths.
+- fix(rolling-tools): enforce visible-column bounds in fixed/running/status/error/feedback layouts, wrapping long tool names and preserving full fixed-mode paths.
+- fix(desktop): handle async spawn/stdin errors, nonzero exits, timeouts and cancellation; report copy/open failures without crashing or falsely claiming success.
+- fix(tests): run todo mutation tests only in an isolated temporary copy, preventing source corruption on interruption and loss of concurrent edits.
+- test: add desktop-action/Unicode-width safety regressions and mutation interruption/concurrent-edit regressions; mock clipboard actions instead of touching the system clipboard.
+
 - fix(review): preserve assistant reasoning/signatures while hiding only the rendered view; restore global/UI hooks on extension shutdown.
 - fix(state): deep-copy todo snapshots, clear missing branch state, apply batch replacement atomically, and restore rolling history from the active branch.
 - fix(todo-loop): continue from the post-retry `agent_before_settle` boundary using persisted context messages; honor UI clear/completed/disabled state and existing follow-up budgets.

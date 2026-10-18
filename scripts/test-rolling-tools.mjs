@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+import { EventEmitter } from "node:events";
+import { Writable } from "node:stream";
 
 // 隔离测试环境：将全局配置目录指向临时目录，避免读到真实用户的 config.json
 const TEST_AGENT_DIR = mkdtempSync(join(tmpdir(), "rolling-tools-test-"));
@@ -244,9 +248,9 @@ for (const h of toolCallHandlers) {
 }
 
 const dummyTheme = {
-	fg: (col, str) => `[${col}]${str}`,
-	bg: (col, str) => str,
-	bold: (str) => `*${str}*`,
+	fg: (_col, str) => str,
+	bg: (_col, str) => str,
+	bold: (str) => str,
 };
 const dummyTui = { requestRender() {}, terminal: { rows: 30, columns: 100 } };
 
@@ -565,25 +569,42 @@ const o4Top = o4.findIndex((l) => stripTheme(l).includes("┌"));
 const o4Left = stripTheme(o4[o4Top]).indexOf("┌");
 // 内容行从 top+2 开始
 const rowY = o4Top + 2;
-overlayCompCopy.handleMouse({
-	type: "click",
-	button: "left",
-	x: o4Left + 4,
-	y: rowY,
-	screenX: o4Left + 4,
-	screenY: rowY,
-	width: 120,
-	height: o4.length,
-	shift: false,
-	alt: false,
-	ctrl: false,
-});
-const afterClick = overlayCompCopy.render(120);
-assert.ok(
-	afterClick.some((l) => l.includes("已复制")),
-	"clicking a left-list row must copy its detail and show feedback",
-);
-console.log("  ✓ clicking a left-list row copies its detail (with feedback).");
+const originalSpawnForCopy = childProcess.spawn;
+childProcess.spawn = () => {
+	const child = new EventEmitter();
+	child.stdin = new Writable({ write(chunk, _encoding, done) { copiedText = (copiedText || "") + chunk.toString(); done(); } });
+	child.stderr = new EventEmitter();
+	child.kill = () => true;
+	queueMicrotask(() => child.emit("close", 0, null));
+	return child;
+};
+syncBuiltinESMExports();
+try {
+	overlayCompCopy.handleMouse({
+		type: "click",
+		button: "left",
+		x: o4Left + 4,
+		y: rowY,
+		screenX: o4Left + 4,
+		screenY: rowY,
+		width: 120,
+		height: o4.length,
+		shift: false,
+		alt: false,
+		ctrl: false,
+	});
+	await new Promise(resolve => setImmediate(resolve));
+	const afterClick = overlayCompCopy.render(120);
+	assert.ok(copiedText, "clipboard helper receives the selected detail via stdin");
+	assert.ok(
+		afterClick.some((l) => l.includes("已复制")),
+		"copy success feedback is shown only after the helper exits successfully",
+	);
+} finally {
+	childProcess.spawn = originalSpawnForCopy;
+	syncBuiltinESMExports();
+}
+console.log("  ✓ clicking a left-list row copies its detail (with async feedback, no system clipboard access).");
 
 // 关闭 overlay，清空 activeOverlay，避免影响后续测试
 overlayCompCopy.handleInput("");
@@ -1498,9 +1519,10 @@ console.log("\n=== Test 15: Long Command & Path Auto-Wrapping (No Omission) ==="
 	const w15 = widgetFactory15(dummyTui, dummyTheme);
 	// 在较窄终端宽度（例如 60 列）下渲染
 	const lines60 = w15.render(60);
-	const toolHeaderLines = lines60.slice(1).filter((l) => l.includes("write") || l.includes("completed-consumer"));
+	const toolHeaderLines = lines60.slice(1);
 	assert.ok(toolHeaderLines.length > 1, "long tool path must wrap into multiple lines instead of single line");
-	const combinedText = toolHeaderLines.join("");
+	assert.ok(toolHeaderLines.every(line => visibleWidth(line) <= 60), "every wrapped header must fit the viewport");
+	const combinedText = toolHeaderLines.map(line => line.trimStart()).join("");
 	assert.ok(combinedText.includes("completed-consumer-integration-ports.md"), "full filename must not be truncated with ellipsis");
 	assert.ok(combinedText.includes("(+10 lines)"), "line count badge must be preserved");
 
@@ -1521,7 +1543,7 @@ console.log("\n=== Test 15: Long Command & Path Auto-Wrapping (No Omission) ==="
 	const expandedLines60 = w15.render(60);
 	const pathSubLines = expandedLines60.filter((l) => l.includes("↳") || l.includes("completed-consumer"));
 	assert.ok(pathSubLines.length >= 1, "expanded full path must be visible");
-	assert.ok(expandedLines60.join("").includes("completed-consumer-integration-ports.md"), "expanded path must contain full path text");
+	assert.ok(expandedLines60.map(line => line.trimStart()).join("").includes("completed-consumer-integration-ports.md"), "expanded path must contain full path text");
 	console.log("  ✓ long paths and commands automatically wrap across lines without omission.");
 }
 

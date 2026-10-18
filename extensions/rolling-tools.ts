@@ -1,12 +1,12 @@
-import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AssistantMessageComponent, InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem, Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { showStatusModal } from "./lib/status-modal.ts";
+import { copyToClipboard, openLocalFile } from "./lib/desktop-actions.ts";
 
 /**
  * 通知拦截规则
@@ -217,62 +217,15 @@ const dynamicHooks: DynamicHooksState = (globalThis as any)[DYNAMIC_HOOKS_KEY] ?
 };
 (globalThis as any)[DYNAMIC_HOOKS_KEY] = dynamicHooks;
 
-/**
- * 跨平台剪贴板复制
- */
-function copyToClipboard(text: string): void {
-	try {
-		if (process.platform === "win32") {
-			const proc = spawn("clip");
-			proc.stdin.write(text);
-			proc.stdin.end();
-		} else if (process.platform === "darwin") {
-			const proc = spawn("pbcopy");
-			proc.stdin.write(text);
-			proc.stdin.end();
-		} else {
-			const proc = spawn("xclip", ["-selection", "clipboard"]);
-			proc.stdin.write(text);
-			proc.stdin.end();
-		}
-	} catch {}
-}
-
-/**
- * 跨平台打开文件
- */
-function openFile(filePath: string): void {
-	try {
-		if (process.platform === "win32") {
-			spawn("cmd", ["/c", "start", "", filePath], { detached: true, stdio: "ignore" }).unref();
-		} else if (process.platform === "darwin") {
-			spawn("open", [filePath], { detached: true, stdio: "ignore" }).unref();
-		} else {
-			spawn("xdg-open", [filePath], { detached: true, stdio: "ignore" }).unref();
-		}
-	} catch {}
-}
-
 function truncate(str: string, maxLen = 50): string {
 	if (!str) return "";
 	if (str.length <= maxLen) return str;
 	return str.slice(0, maxLen - 3) + "...";
 }
 
-function stripFormatting(str: string): string {
-	return str
-		.replace(/\x1b\[[0-9;]*m/g, "")
-		.replace(/\[(accent|dim|muted|toolTitle|success|error|text)\]/g, "")
-		.replace(/\*([^*]+)\*/g, "$1");
-}
-
-function getVisualWidth(str: string): number {
-	return visibleWidth(stripFormatting(str));
-}
-
 /**
- * 带有前缀的多行安全折行。首行使用 firstPrefix，续行使用 continuationPrefix，
- * 严格按照可见终端列宽（考虑中文字符双列宽）折行，绝不省略截断。
+ * Reflow the complete styled line, including long prefixes/tool names. Never
+ * reserve a minimum payload width larger than the remaining terminal columns.
  */
 function wrapPrefixedText(
 	text: string,
@@ -281,46 +234,15 @@ function wrapPrefixedText(
 	continuationPrefix: string,
 	styler: (s: string) => string = (s) => s,
 ): string[] {
-	if (!text) return [`${firstPrefix}`];
-	const firstPrefixWidth = getVisualWidth(firstPrefix);
-	const contPrefixWidth = getVisualWidth(continuationPrefix);
-	const lines: string[] = [];
-
-	let remaining = text;
-	let isFirst = true;
-
-	while (remaining.length > 0) {
-		const prefix = isFirst ? firstPrefix : continuationPrefix;
-		const prefixWidth = isFirst ? firstPrefixWidth : contPrefixWidth;
-		const maxCols = Math.max(10, width - prefixWidth);
-
-		if (getVisualWidth(remaining) <= maxCols) {
-			lines.push(`${prefix}${styler(remaining)}`);
-			break;
-		}
-
-		let cut = 0;
-		let w = 0;
-		for (const ch of remaining) {
-			const cw = getVisualWidth(ch);
-			if (w + cw > maxCols) break;
-			w += cw;
-			cut += ch.length;
-		}
-		if (cut === 0) cut = 1;
-
-		lines.push(`${prefix}${styler(remaining.slice(0, cut))}`);
-		remaining = remaining.slice(cut);
-		isFirst = false;
-	}
-
-	return lines.length > 0 ? lines : [`${firstPrefix}`];
+	const columns = Math.max(1, Math.floor(width));
+	const indent = truncateToWidth(continuationPrefix, Math.max(0, columns - 1), "");
+	const continuationWidth = Math.max(1, columns - visibleWidth(indent));
+	return wrapTextWithAnsi(firstPrefix + styler(text), columns).flatMap((line, index) =>
+		index === 0 ? [line] : wrapTextWithAnsi(line, continuationWidth).map(part => indent + part),
+	);
 }
 
-/**
- * 将工具主行（图标 + 徽标 + 名称 + 命令/路径摘要 + 耗时）安全换行输出。
- * 超过终端宽度时自动折到下一行对齐缩进，时间戳紧跟在最后一折行的末尾，绝不省略。
- */
+/** Keep the full command/path and tool name in fixed mode, wrapping as needed. */
 function wrapToolHeaderLines(
 	icon: string,
 	arrow: string,
@@ -328,63 +250,11 @@ function wrapToolHeaderLines(
 	name: string,
 	summaryText: string,
 	timeColored: string,
-	timePlainWidth: number,
 	renderWidth: number,
 	themeStyler: (s: string) => string,
 ): string[] {
-	const prefix1 = ` ${icon} ${arrow} ${badge} ${name}${summaryText ? " " : ""}`;
-	const contPrefix = "     ";
-	const singleLine = `${prefix1}${summaryText ? themeStyler(summaryText) : ""}${timeColored}`;
-	if (getVisualWidth(singleLine) <= renderWidth) {
-		return [singleLine];
-	}
-
-	const wPrefix1 = getVisualWidth(prefix1);
-	const wPrefixCont = getVisualWidth(contPrefix);
-	const lines: string[] = [];
-
-	let remaining = summaryText;
-	let isFirst = true;
-
-	while (remaining.length > 0) {
-		const prefix = isFirst ? prefix1 : contPrefix;
-		const pWidth = isFirst ? wPrefix1 : wPrefixCont;
-		const maxCols = Math.max(10, renderWidth - pWidth);
-
-		const remainingWidth = getVisualWidth(remaining);
-		// 若当前行能放下剩余文本及时间戳
-		if (remainingWidth + timePlainWidth <= maxCols) {
-			lines.push(`${prefix}${themeStyler(remaining)}${timeColored}`);
-			remaining = "";
-			break;
-		}
-
-		// 若当前行能放下剩余文本但放不下时间戳
-		if (remainingWidth <= maxCols) {
-			lines.push(`${prefix}${themeStyler(remaining)}`);
-			remaining = "";
-			if (timeColored) {
-				lines.push(`${contPrefix}${timeColored.trimStart()}`);
-			}
-			break;
-		}
-
-		let cut = 0;
-		let w = 0;
-		for (const ch of remaining) {
-			const cw = getVisualWidth(ch);
-			if (w + cw > maxCols) break;
-			w += cw;
-			cut += ch.length;
-		}
-		if (cut === 0) cut = 1;
-
-		lines.push(`${prefix}${themeStyler(remaining.slice(0, cut))}`);
-		remaining = remaining.slice(cut);
-		isFirst = false;
-	}
-
-	return lines.length > 0 ? lines : [singleLine];
+	const prefix = ` ${icon} ${arrow} ${badge} ${name}${summaryText ? " " : ""}`;
+	return wrapPrefixedText(themeStyler(summaryText) + timeColored, renderWidth, prefix, "     ");
 }
 
 function ensureDirectoryExists(dirPath: string): void {
@@ -1172,9 +1042,9 @@ function formatRunningTasksLine(runningTools: ToolItem[], availableWidth: number
 		const maxSummaryWidth = Math.max(0, availableWidth - prefixWidth - timeWidth);
 		const summary =
 			maxSummaryWidth > 0 && t.summaryDisplay
-				? " " + theme.fg("dim", truncate(t.summaryDisplay, maxSummaryWidth))
+				? " " + theme.fg("dim", truncateToWidth(t.summaryDisplay, maxSummaryWidth))
 				: "";
-		return ` ${icon} ${badge} ${name}${summary}${time}`;
+		return truncateToWidth(` ${icon} ${badge} ${name}${summary}${time}`, availableWidth);
 	}
 
 	// 多个任务并发执行：优先并排展示
@@ -1185,7 +1055,7 @@ function formatRunningTasksLine(runningTools: ToolItem[], availableWidth: number
 		const badge = theme.fg("dim", `[${t.index}]`);
 		const labelName = t.displayName || t.name;
 		const name = theme.bold(theme.fg("toolTitle", labelName));
-		const summary = t.summaryDisplay ? " " + theme.fg("dim", truncate(t.summaryDisplay, 15)) : "";
+		const summary = t.summaryDisplay ? " " + theme.fg("dim", truncateToWidth(t.summaryDisplay, 15)) : "";
 		const time = " " + theme.fg("muted", timeStr);
 		return `${icon} ${badge} ${name}${summary}${time}`;
 	});
@@ -1211,9 +1081,9 @@ function formatRunningTasksLine(runningTools: ToolItem[], availableWidth: number
 	const maxSummaryWidth = Math.max(0, availableWidth - prefixWidth - suffixWidth);
 	const summary =
 		maxSummaryWidth > 0 && latest.summaryDisplay
-			? " " + theme.fg("dim", truncate(latest.summaryDisplay, maxSummaryWidth))
+			? " " + theme.fg("dim", truncateToWidth(latest.summaryDisplay, maxSummaryWidth))
 			: "";
-	return ` ${icon} ${badge} ${name}${summary} ${moreBadge}${time}`;
+	return truncateToWidth(` ${icon} ${badge} ${name}${summary} ${moreBadge}${time}`, availableWidth);
 }
 
 /**
@@ -1231,6 +1101,7 @@ class RollingToolsWidgetComponent implements Component {
 	private onToggleMode: ((newMode: ViewMode) => void) | null = null;
 	/** widget 中最多展示的条目数（overlay 仍可浏览全部历史） */
 	private displayLimit: number;
+	private actionSignal?: AbortSignal;
 
 	constructor(
 		tui: any,
@@ -1239,6 +1110,7 @@ class RollingToolsWidgetComponent implements Component {
 		onOpenOverlay?: (item?: ToolItem) => void,
 		displayLimit = 3,
 		onToggleMode?: (newMode: ViewMode) => void,
+		actionSignal?: AbortSignal,
 	) {
 		this.tui = tui;
 		this.theme = theme;
@@ -1246,13 +1118,15 @@ class RollingToolsWidgetComponent implements Component {
 		this.onOpenOverlay = onOpenOverlay ?? null;
 		this.displayLimit = Math.max(1, displayLimit);
 		this.onToggleMode = onToggleMode ?? null;
+		this.actionSignal = actionSignal;
 	}
 
 	render(width: number): string[] {
 		this.lineMap = [];
 		const lines: string[] = [];
 		const theme = this.theme;
-		const renderWidth = Math.max(20, width);
+		if (width < 1) return lines;
+		const renderWidth = Math.max(1, Math.floor(width));
 
 		const pushLine = (
 			text: string,
@@ -1261,15 +1135,19 @@ class RollingToolsWidgetComponent implements Component {
 			textToCopy?: string,
 			buttonBounds?: ButtonBounds,
 		) => {
-			lines.push(text);
-			this.lineMap.push({
-				item,
-				width: visibleWidth(text),
-				kind,
-				textToCopy,
-				buttonBounds,
-				hasOverlayButton: Boolean(buttonBounds?.overlayBtnStart !== undefined),
-			});
+			// Final invariant for every branch, including errors and async feedback.
+			for (const physicalLine of text.replace(/\r/g, "").split("\n")) {
+				const bounded = truncateToWidth(physicalLine, renderWidth);
+				lines.push(bounded);
+				this.lineMap.push({
+					item,
+					width: visibleWidth(bounded),
+					kind,
+					textToCopy,
+					buttonBounds,
+					hasOverlayButton: Boolean(buttonBounds?.overlayBtnStart !== undefined),
+				});
+			}
 		};
 
 		// 1. 常驻状态行（等待服务器响应 ➔ 思考中 ➔ 思考完成，共用一行平滑过渡）
@@ -1285,7 +1163,8 @@ class RollingToolsWidgetComponent implements Component {
 			const overlayBtnColored = theme.fg("accent", overlayBtnRaw);
 
 			const buttonsRawWidth = visibleWidth(modeBtnRaw) + 1 + visibleWidth(overlayBtnRaw);
-			const availableWidth = Math.max(10, renderWidth - buttonsRawWidth - 2);
+			const showButtons = renderWidth > buttonsRawWidth;
+			const availableWidth = Math.max(0, renderWidth - (showButtons ? buttonsRawWidth + 1 : 0));
 
 			const runningTools = this.state.recentTools.filter((t) => t.status === "running");
 
@@ -1311,8 +1190,9 @@ class RollingToolsWidgetComponent implements Component {
 				statusText = ` ${theme.fg("accent", "•")} ${theme.fg("muted", "就绪")}`;
 			}
 
-			const pad = Math.max(1, renderWidth - visibleWidth(statusText) - buttonsRawWidth - 1);
-			const headerLine = `${statusText}${' '.repeat(pad)}${modeBtnColored} ${overlayBtnColored}`;
+			statusText = truncateToWidth(statusText, availableWidth);
+			const pad = Math.max(1, renderWidth - visibleWidth(statusText) - buttonsRawWidth);
+			const headerLine = showButtons ? `${statusText}${' '.repeat(pad)}${modeBtnColored} ${overlayBtnColored}` : statusText;
 			const lineW = visibleWidth(headerLine);
 
 			const overlayBtnStart = lineW - visibleWidth(overlayBtnRaw);
@@ -1320,12 +1200,12 @@ class RollingToolsWidgetComponent implements Component {
 			const modeBtnEnd = overlayBtnStart - 1;
 			const modeBtnStart = modeBtnEnd - visibleWidth(modeBtnRaw);
 
-			pushLine(headerLine, headerItem, "header", undefined, {
+			pushLine(headerLine, headerItem, "header", undefined, showButtons ? {
 				modeBtnStart,
 				modeBtnEnd,
 				overlayBtnStart,
 				overlayBtnEnd,
-			});
+			} : undefined);
 		}
 
 		// 1.5 错误提示行（单行紧凑展示，running / fixed 两种模式下均可见；
@@ -1334,8 +1214,8 @@ class RollingToolsWidgetComponent implements Component {
 			const err = this.state.activeError;
 			const label = `[#${err.index} ${err.toolName}]`;
 			const prefix = ` ${theme.fg("error", "✗")} ${theme.bold(theme.fg("error", label))}`;
-			const budget = Math.max(8, renderWidth - visibleWidth(prefix) - 2);
-			const msg = truncate(err.message.replace(/\r?\n/g, " "), budget);
+			const budget = Math.max(0, renderWidth - visibleWidth(prefix) - 1);
+			const msg = truncateToWidth(err.message.replace(/\r?\n/g, " "), budget);
 			pushLine(`${prefix} ${theme.fg("muted", msg)}`, null, "detail_info");
 		}
 
@@ -1355,16 +1235,13 @@ class RollingToolsWidgetComponent implements Component {
 				const summary = theme.fg("dim", t.summaryDisplay);
 
 				let time = "";
-				let timePlainWidth = 0;
 				if (t.status === "running") {
 					const elapsed = Math.max(0, Date.now() - t.startTime);
 					const timeStr = formatDuration(elapsed);
 					time = theme.fg("muted", timeStr);
-					timePlainWidth = getVisualWidth(timeStr);
 				} else if (t.durationMs !== undefined) {
 					const timeStr = formatDuration(t.durationMs);
 					time = theme.fg("muted", timeStr);
-					timePlainWidth = getVisualWidth(timeStr);
 				}
 
 				const toolHeaderLines = wrapToolHeaderLines(
@@ -1374,7 +1251,6 @@ class RollingToolsWidgetComponent implements Component {
 					name,
 					t.summaryDisplay,
 					time,
-					timePlainWidth,
 					renderWidth,
 					(s) => theme.fg("dim", s),
 				);
@@ -1453,7 +1329,7 @@ class RollingToolsWidgetComponent implements Component {
 
 		// 3. 复制成功反馈（仅在 Widget 内部就地显示，绝对 0 污染）
 		if (this.state.copyFeedbackMessage) {
-			pushLine(`   ${theme.fg("success", `↳ ${this.state.copyFeedbackMessage}`)}`);
+			pushLine(`   ${theme.fg(this.state.copyFeedbackMessage.startsWith("✗") ? "error" : "success", `↳ ${this.state.copyFeedbackMessage}`)}`);
 		}
 
 		// 4. 主回复完成标识（仅在整个 Agent 回复完全生成完毕后才附带显示）
@@ -1465,9 +1341,16 @@ class RollingToolsWidgetComponent implements Component {
 	}
 
 	private triggerCopy(textToCopy: string, label: string): void {
-		copyToClipboard(textToCopy);
-		this.state.copyFeedbackMessage = `✓ 已复制${label}至剪贴板: ${truncate(textToCopy, 45)}`;
+		void copyToClipboard(textToCopy, this.actionSignal).then(result => {
+			this.showActionFeedback(result.ok
+				? `✓ 已复制${label}至剪贴板: ${truncate(textToCopy, 45)}`
+				: `✗ 复制失败: ${result.error}`);
+		});
+	}
 
+	private showActionFeedback(message: string): void {
+		if (this.actionSignal?.aborted) return;
+		this.state.copyFeedbackMessage = message;
 		if (this.copyFeedbackTimer) clearTimeout(this.copyFeedbackTimer);
 		this.copyFeedbackTimer = setTimeout(() => {
 			this.state.copyFeedbackMessage = null;
@@ -1536,8 +1419,11 @@ class RollingToolsWidgetComponent implements Component {
 
 			if (targetItem) {
 				// 2. Ctrl + 左键：打开文件
-				if (event.ctrl && targetItem.fullPath) {
-					openFile(targetItem.fullPath);
+				if (event.ctrl && event.button === "left" && targetItem.fullPath) {
+					const filePath = targetItem.fullPath;
+					void openLocalFile(filePath, this.actionSignal).then(result => {
+						this.showActionFeedback(result.ok ? `✓ 已发送打开请求: ${filePath}` : `✗ 打开失败: ${result.error}`);
+					});
 					return { handled: true };
 				}
 
@@ -1607,6 +1493,7 @@ class ToolHistoryOverlayComponent implements Component {
 	/** 复制反馈（就地显示在底部提示行） */
 	private copyFeedback: string | null = null;
 	private copyFeedbackTimer: any = null;
+	private actionSignal?: AbortSignal;
 	/** 居中方框在 overlay 内的几何位置（用于区分框内/框外点击） */
 	private boxTop = 0;
 	private boxLeft = 0;
@@ -1620,6 +1507,7 @@ class ToolHistoryOverlayComponent implements Component {
 		step: number,
 		onClose: () => void,
 		requestRender: () => void,
+		actionSignal?: AbortSignal,
 	) {
 		this.tui = tui;
 		this.theme = theme;
@@ -1627,6 +1515,7 @@ class ToolHistoryOverlayComponent implements Component {
 		this.step = Math.max(1, step);
 		this.onClose = onClose;
 		this.requestRender = requestRender;
+		this.actionSignal = actionSignal;
 		// 初始只加载最近 step 条（懒加载起点）
 		this.loadedCount = Math.min(this.step, items.length);
 		this.selectedIndex = items.length > 0 ? items.length - 1 : -1;
@@ -1787,7 +1676,7 @@ class ToolHistoryOverlayComponent implements Component {
 		boxLines.push(`${borderColor("├")}${theme.fg("dim", "─".repeat(boxW - 2))}${borderColor("┤")}`);
 		let hintText: string;
 		if (this.copyFeedback) {
-			hintText = theme.fg("success", `✓ ${this.copyFeedback}`);
+			hintText = theme.fg(this.copyFeedback.startsWith("✗") ? "error" : "success", this.copyFeedback);
 		} else if (this.detailLineCount > viewportHeight) {
 			hintText = theme.fg("muted", `详情 ${detailStart + 1}-${detailEnd}/${this.detailLineCount} · 滚轮滚动 · ↑↓ 选择 · Esc 关闭`);
 		} else {
@@ -1975,7 +1864,6 @@ class ToolHistoryOverlayComponent implements Component {
 			t.output ??
 			t.summaryDisplay;
 		if (!text) return;
-		copyToClipboard(text);
 		const label = t.detailContent
 			? t.detailKind === "diff"
 				? "diff"
@@ -1985,16 +1873,19 @@ class ToolHistoryOverlayComponent implements Component {
 				: t.fullPath
 					? "路径"
 					: "输出";
-		this.copyFeedback = `已复制${label}: ${truncate(text.replace(/\r?\n/g, " "), 50)}`;
-		if (this.copyFeedbackTimer) clearTimeout(this.copyFeedbackTimer);
-		this.copyFeedbackTimer = setTimeout(() => {
-			this.copyFeedback = null;
+		void copyToClipboard(text, this.actionSignal).then(result => {
+			if (this.actionSignal?.aborted) return;
+			this.copyFeedback = result.ok
+				? `✓ 已复制${label}: ${truncate(text.replace(/\r?\n/g, " "), 50)}`
+				: `✗ 复制失败: ${result.error}`;
+			if (this.copyFeedbackTimer) clearTimeout(this.copyFeedbackTimer);
+			this.copyFeedbackTimer = setTimeout(() => {
+				this.copyFeedback = null;
+				this.requestRender();
+			}, 2500);
+			this.copyFeedbackTimer.unref?.();
 			this.requestRender();
-		}, 2500);
-		if (typeof this.copyFeedbackTimer === "object" && this.copyFeedbackTimer && "unref" in this.copyFeedbackTimer) {
-			this.copyFeedbackTimer.unref();
-		}
-		this.requestRender();
+		});
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
@@ -2274,6 +2165,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	let statusTimer: any = null;
 	let lastCtx: any = null;
 	let hooksActive = true;
+	const desktopActions = new AbortController();
 	const uiHookCleanups: Array<() => void> = [];
 	let legacyNoticeTimer: ReturnType<typeof setTimeout> | undefined;
 	/** 待展示的旧配置迁移提示（仅提示一次） */
@@ -2492,6 +2384,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 					() => {
 						persistHistory();
 					},
+					desktopActions.signal,
 				),
 			{ placement: "aboveEditor" },
 		);
@@ -2538,6 +2431,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 							done(undefined);
 						},
 						() => tui?.requestRender?.(),
+						desktopActions.signal,
 					);
 					activeOverlay = component;
 					// 若指定了初始条目，直接选中它
@@ -2918,6 +2812,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", async () => {
 		persistHistory();
 		hooksActive = false;
+		desktopActions.abort();
 		for (const cleanup of uiHookCleanups.splice(0)) cleanup();
 		if (dynamicHooks.handleAssistantContent === ownedHooks.assistantContent) dynamicHooks.handleAssistantContent = undefined;
 		if (dynamicHooks.handleAssistantRender === ownedHooks.assistantRender) dynamicHooks.handleAssistantRender = undefined;

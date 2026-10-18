@@ -6,7 +6,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "validate": "node ./scripts/validate-package.mjs",
-    "test": "npm run check && npm run validate && node ./scripts/test-rolling-tools.mjs && node ./scripts/test-request-compress.mjs && node ./scripts/test-image-pager.mjs && node ./scripts/test-ask-user.mjs && node ./scripts/test-todo-tree.mjs && node ./scripts/test-mutation-todo-tree.mjs && node ./scripts/test-media-gen.mjs && node ./scripts/test-voice-runner.mjs && node ./scripts/test-timer.mjs && node ./scripts/test-extension-regressions.mjs"
+    "test": "npm run check && npm run validate && node ./scripts/test-rolling-tools.mjs && node ./scripts/test-rolling-tools-safety.mjs && node ./scripts/test-request-compress.mjs && node ./scripts/test-image-pager.mjs && node ./scripts/test-ask-user.mjs && node ./scripts/test-todo-tree.mjs && node ./scripts/test-mutation-todo-tree.mjs && node ./scripts/test-mutation-isolation.mjs && node ./scripts/test-media-gen.mjs && node ./scripts/test-voice-runner.mjs && node ./scripts/test-timer.mjs && node ./scripts/test-extension-regressions.mjs"
   },
   "keywords": [
     "pi-package",

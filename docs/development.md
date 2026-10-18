@@ -31,12 +31,20 @@ When adding a Pi package dependency that must ship with this package, follow Pi'
 
 `extensions/lib/status-modal.ts` is an imported helper, not an extension entry (no `index.ts`). Read-only status commands use it to avoid muted notifications. TUI gets a scrollable, width-bounded overlay; RPC/print/JSON fall back to notifications. Local `.ts` imports are checked via `allowImportingTsExtensions` and run directly in Pi/Node without emitted build files.
 
+`extensions/lib/desktop-actions.ts` is also import-only. Fixed executable/script definitions keep user paths out of command text; every helper process handles `error`, stdin failure, exit status, cancellation and a bounded deadline. Windows file-open uses `ProcessStartInfo.UseShellExecute` via a fixed `-EncodedCommand` script and a literal environment value, not `cmd /c start`. OS file associations may still execute trusted files by design.
+
 ## Upgrading from the pre-review build
 
 Restart the Pi process once after updating. The old build installed process-wide hooks and UI wrappers without complete ownership/teardown metadata; `/reload` cannot reliably recover every old wrapper chain. New request-compress code detects that legacy fetch-hook state, disables compression and asks for a restart rather than overwriting another extension's wrapper. Subsequent reload/unload cycles of the new build are covered by regression tests. Previously deleted reasoning blocks cannot be recovered from already-written session entries.
+
+## Mutation test isolation
+
+`scripts/test-mutation-todo-tree.mjs` copies extensions and the focused test suite into a temporary workspace (dereferencing source symlinks), links installed `node_modules` for resolution, and uses an isolated agent/home directory. Mutations and test execution occur only in that copy. It never backs up/restores checkout files, so concurrent editing is safe and an interrupt cannot leave mutants in production source. A hard kill may leave a disposable temp directory; normal completion/failure cleans it up. Timeouts or unexpected failures do not count as killed mutants.
 
 ## Validation
 
 `npm run check` validates TypeScript sources. `npm run validate` checks that every manifest path exists and that JSON themes are parseable. Use `npm pack --dry-run` to inspect the publishable file set.
 
-`npm test` includes `scripts/test-extension-regressions.mjs`: real in-memory SessionManager snapshot isolation and boundary projection, branch navigation, global hook unload/off behavior, notification/status interactions, reasoning preservation, bounded timer chaining, compression isolation and strict voice response validation. Media generation uses temporary agent/project directories and mocked fetch only, with no personal provider or credentials required. Questionnaire tests validate schemas and exercise narrow widths, cancellation and non-TUI stdout. See `docs/known-issues.md` for deliberately deferred behavior; mocks do not certify physical audio playback.
+`npm test` includes `scripts/test-extension-regressions.mjs`: real in-memory SessionManager snapshot isolation and boundary projection, branch navigation, global hook unload/off behavior, notification/status interactions, reasoning preservation, bounded timer chaining, compression isolation and strict voice response validation. Media generation uses temporary agent/project directories and mocked fetch only, with no personal provider or credentials required. Questionnaire tests validate schemas and exercise narrow widths, cancellation and non-TUI stdout.
+
+`test-rolling-tools-safety.mjs` checks literal path transport, mocked Ctrl-click/copy routes, helper spawn/stdin/exit/timeout failures, shutdown cancellation and 1–140-column layouts. It never touches the real clipboard or opens GUI applications. `test-mutation-isolation.mjs` uses disposable repository fixtures to interrupt a mutation runner and simulate concurrent edits, proving that neither success nor interruption rewrites checkout source. See `docs/known-issues.md` for deliberately deferred behavior; mocks do not certify physical audio playback.
