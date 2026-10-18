@@ -37,6 +37,16 @@ When adding a Pi package dependency that must ship with this package, follow Pi'
 
 Restart the Pi process once after updating. The old build installed process-wide hooks and UI wrappers without complete ownership/teardown metadata; `/reload` cannot reliably recover every old wrapper chain. New request-compress code detects that legacy fetch-hook state, disables compression and asks for a restart rather than overwriting another extension's wrapper. Subsequent reload/unload cycles of the new build are covered by regression tests. Previously deleted reasoning blocks cannot be recovered from already-written session entries.
 
+## Tool lifecycle tracking
+
+Rolling tools distinguishes streamed **preparing** drafts from dispatched **running** calls. `message_update` is only a preview, not proof that `execute()` ran. Failed/aborted assistant streams may be omitted during core retry with no tool result at all, so their matching unexecuted drafts must be closed on `message_end`.
+
+Use `tool_execution_start`/`tool_execution_end` as the native dispatch boundaries. They also cover validation/blocked calls that bypass `tool_call`/`tool_result` hooks; a missing core `durationMs` can mean `execute()` never ran. Prefer core-measured duration over the elapsed time since the first streamed argument. A fast execution can end long before the parallel batch's persisted result messages are appended. Result hooks/messages are supplementary reconciliation sources, not the only terminal signal.
+
+At `agent_end`, first reconcile final tool results, then close remaining orphan records before persisting. Settlement and shutdown provide fallback cleanup. Do not impose duration/index heuristics on genuine long-running calls. Active records survive history-window trimming, and snapshots include active calls as well as the recent history tail.
+
+`test-rolling-tool-lifecycle.mjs` exercises overload/abort→retry, elapsed-clock reset, validation rejection, missing terminal hooks, clear/reload/shutdown and a long task across a 600-call history window. It also runs a real in-memory Agent-core stream/parallel batch to verify native event ordering without user session data, file tools or network access.
+
 ## Mutation test isolation
 
 `scripts/test-mutation-todo-tree.mjs` copies extensions and the focused test suite into a temporary workspace (dereferencing source symlinks), links installed `node_modules` for resolution, and uses an isolated agent/home directory. Mutations and test execution occur only in that copy. It never backs up/restores checkout files, so concurrent editing is safe and an interrupt cannot leave mutants in production source. A hard kill may leave a disposable temp directory; normal completion/failure cleans it up. Timeouts or unexpected failures do not count as killed mutants.

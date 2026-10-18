@@ -4,6 +4,11 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- fix(rolling-tools): separate streamed parameter drafts from dispatched executions; failed/aborted provider streams can no longer leave phantom `read` timers running through retries.
+- fix(rolling-tools): consume native execution start/end and finalized result messages, prefer core-measured duration, and close orphan records at run/settlement/shutdown boundaries.
+- fix(rolling-tools): retain genuine active calls across history-window trimming and clear live overlay history in place; never expire calls by elapsed time or index.
+- test: add lifecycle regressions with native Agent-core overload, validation rejection and parallel tool completion ordering, plus clear/reload and long-running sibling coverage.
+
 - fix(security): replace Windows `cmd /c start` file opening with a fixed ShellExecute adapter; paths remain literal data and must be existing local absolute paths.
 - fix(rolling-tools): enforce visible-column bounds in fixed/running/status/error/feedback layouts, wrapping long tool names and preserving full fixed-mode paths.
 - fix(desktop): handle async spawn/stdin errors, nonzero exits, timeouts and cancellation; report copy/open failures without crashing or falsely claiming success.

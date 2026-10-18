@@ -149,7 +149,7 @@ interface ToolItem {
 	detailContent?: string;
 	/** detailContent 的语义标签，用于 overlay 标题 */
 	detailKind?: "diff" | "content" | "command" | "output";
-	status: "running" | "done" | "error";
+	status: "preparing" | "running" | "done" | "error";
 	durationMs?: number;
 	startTime: number;
 }
@@ -197,7 +197,7 @@ interface RenderedLineInfo {
 }
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-/** 内存中保留的工具历史上限（widget 只展示最近 maxRecentTools 条，overlay 可浏览全部） */
+/** Target history window; preparing/running calls are retained until terminal events. */
 const HISTORY_MEMORY_LIMIT = 500;
 const DYNAMIC_HOOKS_KEY = Symbol.for("pi-rolling-tools.dynamicHooks.v3");
 const ASSISTANT_DISPLAY_FILTERED = Symbol.for("pi-rolling-tools.assistantDisplayFiltered.v1");
@@ -844,7 +844,7 @@ function pickGenericDetailContent(
  * 只保留最近 N 条，并裁剪过长字段，避免 session 文件膨胀。
  */
 const HISTORY_ENTRY_TYPE = "rolling-tools-history";
-const PERSIST_MAX_ITEMS = 200;
+const PERSIST_MAX_ITEMS = 200; // Recent history tail; active calls are retained in addition.
 const PERSIST_MAX_FIELD = 20000;
 
 function tryParseJson(str: string): any {
@@ -917,10 +917,10 @@ function backfillInputsFromSession(entries: any[], items: ToolItem[]): void {
 		if (res) {
 			item.status = res.isError ? "error" : "done";
 			if (!item.output && res.output) item.output = res.output;
-			if (item.durationMs === undefined && res.durationMs !== undefined) {
+			if (res.durationMs !== undefined) {
 				item.durationMs = res.durationMs;
 			}
-		} else if (omittedToolCallIds.has(item.id) || item.status === "running") {
+		} else if (omittedToolCallIds.has(item.id) || isPendingTool(item)) {
 			// 若未收到 toolResult 且属于已终止轮次，状态标记为 error 并注明中断
 			item.status = "error";
 			if (!item.output) item.output = "Terminated or aborted before completion";
@@ -932,7 +932,8 @@ function serializeHistory(
 	total: number,
 	viewMode?: ViewMode,
 ): { total: number; items: any[]; viewMode?: ViewMode } {
-	const trimmed = items.slice(-PERSIST_MAX_ITEMS).map((t) => ({
+	// Keep active calls even when newer completed tools have moved the tail.
+	const trimmed = items.filter((item, index) => index >= items.length - PERSIST_MAX_ITEMS || isPendingTool(item)).map((t) => ({
 		id: t.id,
 		index: t.index,
 		name: t.name,
@@ -965,7 +966,7 @@ function deserializeHistory(data: any): { items: ToolItem[]; total: number; view
 		output: raw.output,
 		detailContent: raw.detailContent,
 		detailKind: raw.detailKind,
-		status: raw.status === "error" ? "error" : raw.status === "running" ? "running" : "done",
+		status: raw.status === "error" ? "error" : raw.status === "running" ? "running" : raw.status === "preparing" ? "preparing" : "done",
 		durationMs: typeof raw.durationMs === "number" ? raw.durationMs : undefined,
 		startTime: Number(raw.startTime ?? Date.now()),
 	}));
@@ -1022,6 +1023,14 @@ function formatDuration(durationMs: number): string {
 	return ` (${(durationMs / 1000).toFixed(1)}s)`;
 }
 
+function isPendingTool(item: ToolItem): boolean {
+	return item.status === "preparing" || item.status === "running";
+}
+
+function toolDisplayLabel(item: ToolItem): string {
+	return `${item.displayName || item.name}${item.status === "preparing" ? " [生成参数]" : ""}`;
+}
+
 /**
  * 格式化正在运行的任务行（用于 running 模式直接合并到状态行，避免高度上下闪动）
  */
@@ -1030,10 +1039,10 @@ function formatRunningTasksLine(runningTools: ToolItem[], availableWidth: number
 	if (runningTools.length === 1) {
 		const t = runningTools[0];
 		const elapsed = Math.max(0, Date.now() - t.startTime);
-		const timeStr = formatDuration(elapsed);
-		const icon = theme.fg("accent", spinner);
+		const timeStr = t.status === "preparing" ? "" : formatDuration(elapsed);
+		const icon = theme.fg("accent", t.status === "preparing" ? "✎" : spinner);
 		const badge = theme.fg("dim", `[${t.index}]`);
-		const labelName = t.displayName || t.name;
+		const labelName = toolDisplayLabel(t);
 		const name = theme.bold(theme.fg("toolTitle", labelName));
 		const time = theme.fg("muted", timeStr);
 
@@ -1050,10 +1059,10 @@ function formatRunningTasksLine(runningTools: ToolItem[], availableWidth: number
 	// 多个任务并发执行：优先并排展示
 	const parts = runningTools.map((t) => {
 		const elapsed = Math.max(0, Date.now() - t.startTime);
-		const timeStr = formatDuration(elapsed);
-		const icon = theme.fg("accent", spinner);
+		const timeStr = t.status === "preparing" ? "" : formatDuration(elapsed);
+		const icon = theme.fg("accent", t.status === "preparing" ? "✎" : spinner);
 		const badge = theme.fg("dim", `[${t.index}]`);
-		const labelName = t.displayName || t.name;
+		const labelName = toolDisplayLabel(t);
 		const name = theme.bold(theme.fg("toolTitle", labelName));
 		const summary = t.summaryDisplay ? " " + theme.fg("dim", truncateToWidth(t.summaryDisplay, 15)) : "";
 		const time = " " + theme.fg("muted", timeStr);
@@ -1068,10 +1077,10 @@ function formatRunningTasksLine(runningTools: ToolItem[], availableWidth: number
 	// 若宽度不够并排，显示最新的一个任务 + (+N) 并发徽标
 	const latest = runningTools[runningTools.length - 1];
 	const elapsed = Math.max(0, Date.now() - latest.startTime);
-	const timeStr = formatDuration(elapsed);
-	const icon = theme.fg("accent", spinner);
+	const timeStr = latest.status === "preparing" ? "" : formatDuration(elapsed);
+	const icon = theme.fg("accent", latest.status === "preparing" ? "✎" : spinner);
 	const badge = theme.fg("dim", `[${latest.index}]`);
-	const labelName = latest.displayName || latest.name;
+	const labelName = toolDisplayLabel(latest);
 	const name = theme.bold(theme.fg("toolTitle", labelName));
 	const moreBadge = theme.fg("accent", `(+${runningTools.length - 1})`);
 	const time = theme.fg("muted", timeStr);
@@ -1166,7 +1175,7 @@ class RollingToolsWidgetComponent implements Component {
 			const showButtons = renderWidth > buttonsRawWidth;
 			const availableWidth = Math.max(0, renderWidth - (showButtons ? buttonsRawWidth + 1 : 0));
 
-			const runningTools = this.state.recentTools.filter((t) => t.status === "running");
+			const runningTools = this.state.recentTools.filter(isPendingTool);
 
 			let statusText: string;
 			let headerItem: ToolItem | null = null;
@@ -1224,13 +1233,13 @@ class RollingToolsWidgetComponent implements Component {
 			const visibleTools = this.state.recentTools.slice(-this.displayLimit);
 			for (const t of visibleTools) {
 				const isExpanded = this.state.expandedItemId === t.id;
-				let icon = theme.fg("accent", "⏳");
+				let icon = theme.fg("accent", t.status === "preparing" ? "✎" : "⏳");
 				if (t.status === "done") icon = theme.fg("success", "✓");
 				if (t.status === "error") icon = theme.fg("error", "✗");
 
 				const arrow = isExpanded ? theme.fg("accent", "▾") : theme.fg("dim", "▸");
 				const badge = theme.fg("dim", `[${t.index}]`);
-				const labelName = t.displayName || t.name;
+				const labelName = toolDisplayLabel(t);
 				const name = theme.bold(theme.fg("toolTitle", labelName));
 				const summary = theme.fg("dim", t.summaryDisplay);
 
@@ -1577,6 +1586,7 @@ class ToolHistoryOverlayComponent implements Component {
 
 	private statusIcon(t: ToolItem): string {
 		const theme = this.theme;
+		if (t.status === "preparing") return theme.fg("accent", "✎");
 		if (t.status === "done") return theme.fg("success", "✓");
 		if (t.status === "error") return theme.fg("error", "✗");
 		return theme.fg("accent", "⏳");
@@ -1638,8 +1648,8 @@ class ToolHistoryOverlayComponent implements Component {
 			const marker = isSel ? theme.fg("accent", "▸") : " ";
 			const badge = theme.fg("dim", `[${t.index}]`);
 			const name = isSel
-				? theme.bold(theme.fg("accent", t.displayName || t.name))
-				: theme.fg("toolTitle", t.displayName || t.name);
+				? theme.bold(theme.fg("accent", toolDisplayLabel(t)))
+				: theme.fg("toolTitle", toolDisplayLabel(t));
 			const fixedWidth = visibleWidth(`${marker}${this.statusIcon(t)} ${badge} ${name} `);
 			const summaryMaxCols = Math.max(0, listWidth - fixedWidth);
 			const summary = summaryMaxCols > 0
@@ -1711,7 +1721,7 @@ class ToolHistoryOverlayComponent implements Component {
 			return out;
 		}
 
-		out.push(theme.bold(theme.fg("toolTitle", `${t.displayName || t.name}  [${t.index}]`)));
+		out.push(theme.bold(theme.fg("toolTitle", `${toolDisplayLabel(t)}  [${t.index}]`)));
 		if (t.durationMs !== undefined) {
 			out.push(theme.fg("muted", `耗时 ${t.durationMs}ms · 状态 ${t.status}`));
 		}
@@ -2166,6 +2176,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	let lastCtx: any = null;
 	let hooksActive = true;
 	const desktopActions = new AbortController();
+	const streamedDrafts = new Set<string>();
 	const uiHookCleanups: Array<() => void> = [];
 	let legacyNoticeTimer: ReturnType<typeof setTimeout> | undefined;
 	/** 待展示的旧配置迁移提示（仅提示一次） */
@@ -2494,6 +2505,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 	// 2. 会话启动
 	pi.on("session_start", async (event, ctx) => {
+		streamedDrafts.clear();
 		lastCtx = ctx;
 		const loaded = loadConfig(ctx?.cwd || process.cwd());
 		currentConfig = loaded.config;
@@ -2607,8 +2619,12 @@ export default function rollingTools(pi: ExtensionAPI): void {
 					if (!shouldIncludeInWidget(c.name, currentConfig)) {
 						continue;
 					}
-					hasStreamingTools = true;
 					const existing = state.recentTools.find((t) => t.id === c.id);
+					if (existing && !isPendingTool(existing)) continue;
+					if (!existing || existing.status === "preparing") {
+						hasStreamingTools = true;
+						streamedDrafts.add(c.id);
+					}
 					const { summaryDisplay, fullPath, fullCommand, displayName, detailContent, detailKind } =
 						extractSummaryAndMetadata(c.name, c.arguments, cwd, currentConfig);
 
@@ -2641,13 +2657,11 @@ export default function rollingTools(pi: ExtensionAPI): void {
 							rawInput: c.arguments,
 							detailContent,
 							detailKind,
-							status: "running",
+							status: "preparing",
 							startTime: Date.now(),
 						});
 
-						if (state.recentTools.length > HISTORY_MEMORY_LIMIT) {
-							state.recentTools.splice(0, state.recentTools.length - HISTORY_MEMORY_LIMIT);
-						}
+						trimToolHistory();
 						hasToolChanges = true;
 					}
 				}
@@ -2663,133 +2677,195 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		}
 	});
 
-	// 6. 任务结束处理与 settled 最终状态标记
-	pi.on("agent_end", async (_event, ctx) => {
+	function trimToolHistory(): void {
+		let excess = Math.max(0, state.recentTools.length - HISTORY_MEMORY_LIMIT);
+		for (let index = 0; excess > 0 && index < state.recentTools.length;) {
+			if (isPendingTool(state.recentTools[index])) { index++; continue; }
+			state.recentTools.splice(index, 1);
+			excess--;
+		}
+	}
+
+	/** Apply completion from hooks, execution events or persisted result messages. */
+	function recordToolCompletion(event: {
+		toolCallId: string; toolName: string; isError: boolean;
+		content?: unknown; details?: unknown; durationMs?: number;
+	}, authoritativeDuration = false): void {
+		streamedDrafts.delete(event.toolCallId);
+		const item = state.recentTools.find(tool => tool.id === event.toolCallId);
+		const content = Array.isArray(event.content) ? event.content : [];
+		const text = content.find((block: any) => block?.type === "text" && typeof block.text === "string")?.text;
+		if (item) {
+			const previous = item.status;
+			item.status = event.isError ? "error" : "done";
+			if (authoritativeDuration || event.durationMs !== undefined) {
+				// Core duration excludes parameter streaming and approval waits.
+				// Undefined on an execution-end event means execute() did not run.
+				item.durationMs = event.durationMs;
+			} else if (previous === "running" && item.durationMs === undefined) {
+				item.durationMs = Math.max(0, Date.now() - item.startTime);
+			}
+			if (typeof text === "string") item.output = text;
+			const details = event.details as { diff?: unknown } | undefined;
+			if (!item.detailContent && typeof details?.diff === "string" && details.diff) {
+				item.detailContent = details.diff;
+				item.detailKind = "diff";
+			}
+		}
+		if (event.isError) {
+			state.activeError = {
+				toolName: event.toolName,
+				index: item?.index ?? totalToolCount,
+				summary: item?.summaryDisplay || "",
+				message: typeof text === "string" ? text.trim() : "Tool execution failed",
+			};
+		} else {
+			state.activeError = null;
+		}
+		trimToolHistory();
+	}
+
+	function refreshToolActivity(ctx: ExtensionContext): void {
+		if (state.recentTools.some(isPendingTool)) {
+			if (!statusTimer) startStatusTimer(ctx);
+		} else if (state.headerStatus.type !== "thinking" && state.headerStatus.type !== "waiting_server") {
+			stopStatusTimer();
+		}
+		syncWidget(ctx);
+	}
+
+	function interruptTool(item: ToolItem, reason: string): void {
+		const wasRunning = item.status === "running";
+		item.status = "error";
+		item.durationMs = wasRunning ? Math.max(0, Date.now() - item.startTime) : undefined;
+		item.output = item.output || (wasRunning ? `执行中断：${reason}` : `未执行：${reason}`);
+	}
+
+	function closeUnfinishedTools(reason: string): boolean {
+		streamedDrafts.clear();
+		const unfinished = state.recentTools.filter(isPendingTool);
+		for (const item of unfinished) interruptTool(item, reason);
+		trimToolHistory();
+		return unfinished.length > 0;
+	}
+
+	// A streamed tool-call draft is not proof of dispatch. Failed/aborted
+	// responses can be omitted by core retries without ever emitting tool_result.
+	pi.on("message_end", (event, ctx) => {
+		const message = event.message;
+		if (message.role === "toolResult") {
+			recordToolCompletion(message, true);
+			refreshToolActivity(ctx);
+			return;
+		}
+		if (message.role !== "assistant") return;
+		const ids = new Set(message.content.filter(block => block.type === "toolCall").map(block => block.id));
+		const failed = message.stopReason === "error" || message.stopReason === "aborted";
+		const previews = new Set(streamedDrafts);
+		streamedDrafts.clear();
+		const reason = failed
+			? message.errorMessage || (message.stopReason === "aborted" ? "模型响应已取消" : "模型响应失败")
+			: "流式草稿未进入最终工具调用";
+		for (const item of state.recentTools) {
+			// Final errors may omit their partial content entirely. Also retire
+			// preview calls retracted by a successful final message, but never
+			// touch a real sibling execution or another call based on age/index.
+			const withdrawn = failed ? previews.has(item.id) || ids.has(item.id) : previews.has(item.id) && !ids.has(item.id);
+			if (item.status === "preparing" && withdrawn) interruptTool(item, reason);
+		}
+		trimToolHistory();
+		if (failed && (state.headerStatus.type === "waiting_server" || state.headerStatus.type === "thinking")) {
+			state.headerStatus = { type: "idle" };
+		}
+		refreshToolActivity(ctx);
+	});
+
+	// Core has awaited all dispatched calls at agent_end. Reconcile finalized
+	// messages first, then close any draft/call missing its terminal event.
+	pi.on("agent_end", async (event, ctx) => {
+		for (const message of event.messages) {
+			if (message.role === "toolResult") recordToolCompletion(message, true);
+		}
+		closeUnfinishedTools("本轮已结束，未收到该工具的完成事件");
 		stopStatusTimer();
-		// 保留“思考完成”状态；仅将等待/思考中收敛为就绪
 		if (state.headerStatus.type === "waiting_server" || state.headerStatus.type === "thinking") {
 			state.headerStatus = { type: "idle" };
 		}
-		// 持久化一次即可：每次工具都写会在 session 中产生 O(N²) 体积的快照
 		persistHistory();
 		syncWidget(ctx);
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
+		const changed = closeUnfinishedTools("Agent 已停止，未收到该工具的完成事件");
 		stopStatusTimer();
 		if (state.headerStatus.type === "waiting_server" || state.headerStatus.type === "thinking") {
 			state.headerStatus = { type: "idle" };
 		}
+		if (changed) persistHistory();
 		state.completedMessage = "Completed";
 		syncWidget(ctx);
 	});
 
-	// 7. 工具调用开始：记录进 recentTools 并滚动
-	pi.on("tool_call", async (event, ctx) => {
-		if (state.headerStatus.type === "waiting_server") {
-			state.headerStatus = { type: "idle" };
-		}
-		if (!shouldIncludeInWidget(event.toolName, currentConfig)) {
-			return;
-		}
-
-		// 任务执行期间保持/开启动态计时器，使秒数与 spinner 平滑刷新。
-		// 仅对纳入 widget 的工具启动，避免被静音工具留下无人停止的 100ms 重渲染定时器。
-		startStatusTimer(ctx);
-
-		const cwd = ctx?.cwd || process.cwd();
-		const { summaryDisplay, fullPath, fullCommand, displayName, detailContent, detailKind } =
-			extractSummaryAndMetadata(event.toolName, event.input, cwd, currentConfig);
-
-		const existing = state.recentTools.find((t) => t.id === event.toolCallId);
+	function startTool(toolCallId: string, toolName: string, input: unknown, ctx: ExtensionContext): void {
+		streamedDrafts.delete(toolCallId);
+		if (!shouldIncludeInWidget(toolName, currentConfig)) return;
+		if (state.headerStatus.type === "waiting_server") state.headerStatus = { type: "idle" };
+		const metadata = extractSummaryAndMetadata(toolName, input, ctx.cwd || process.cwd(), currentConfig);
+		const existing = state.recentTools.find(tool => tool.id === toolCallId);
 		if (existing) {
-			// 在流式阶段已提前捕获：更新最终确认的完整入参与元数据，保持 running 状态
-			existing.rawInput = event.input ?? existing.rawInput;
-			existing.summaryDisplay = summaryDisplay || existing.summaryDisplay;
-			if (fullPath) existing.fullPath = fullPath;
-			if (fullCommand) existing.fullCommand = fullCommand;
-			if (displayName) existing.displayName = displayName;
-			if (detailContent) existing.detailContent = detailContent;
-			if (detailKind) existing.detailKind = detailKind;
+			existing.rawInput = input ?? existing.rawInput;
+			existing.summaryDisplay = metadata.summaryDisplay || existing.summaryDisplay;
+			if (metadata.fullPath) existing.fullPath = metadata.fullPath;
+			if (metadata.fullCommand) existing.fullCommand = metadata.fullCommand;
+			if (metadata.displayName) existing.displayName = metadata.displayName;
+			if (metadata.detailContent) existing.detailContent = metadata.detailContent;
+			if (metadata.detailKind) existing.detailKind = metadata.detailKind;
+			if (existing.status !== "running") {
+				existing.startTime = Date.now();
+				existing.durationMs = undefined;
+			}
 			existing.status = "running";
 		} else {
-			// 若未在流式阶段中捕获（如非 assistant 流式下直接触发的调用）：分配新序号入队
-			totalToolCount++;
 			state.recentTools.push({
-				id: event.toolCallId,
-				index: totalToolCount,
-				name: event.toolName,
-				displayName,
-				summaryDisplay,
-				fullPath,
-				fullCommand,
-				rawInput: event.input,
-				detailContent,
-				detailKind,
-				status: "running",
-				startTime: Date.now(),
+				id: toolCallId, index: ++totalToolCount, name: toolName,
+				...metadata, rawInput: input, status: "running", startTime: Date.now(),
 			});
-
-			if (state.recentTools.length > HISTORY_MEMORY_LIMIT) {
-				state.recentTools.splice(0, state.recentTools.length - HISTORY_MEMORY_LIMIT);
-			}
+			trimToolHistory();
 		}
-
-		if (state.expandedItemId && !state.recentTools.some((t) => t.id === state.expandedItemId)) {
+		if (state.expandedItemId && !state.recentTools.some(tool => tool.id === state.expandedItemId)) {
 			state.expandedItemId = null;
 		}
+		refreshToolActivity(ctx);
+	}
 
-		syncWidget(ctx);
+	pi.on("tool_execution_start", (event, ctx) => {
+		startTool(event.toolCallId, event.toolName, event.args, ctx);
 	});
 
-	// 8. 工具调用完成：记录耗时、状态与输出内容
-	pi.on("tool_result", async (event, ctx) => {
-		const item = state.recentTools.find((t) => t.id === event.toolCallId);
-		if (item) {
-			item.status = event.isError ? "error" : "done";
-			item.durationMs = Date.now() - item.startTime;
+	// Retain compatibility with hook-only integrations; don't restart a clock
+	// that tool_execution_start has already started.
+	pi.on("tool_call", (event, ctx) => {
+		const existing = state.recentTools.find(tool => tool.id === event.toolCallId);
+		if (existing && !isPendingTool(existing)) return;
+		startTool(event.toolCallId, event.toolName, event.input, ctx);
+	});
 
-			const textContent = (event.content as any[])?.find((c) => c && c.type === "text");
-			if (textContent && typeof textContent.text === "string") {
-				item.output = textContent.text;
-			}
+	pi.on("tool_execution_end", (event, ctx) => {
+		recordToolCompletion({
+			toolCallId: event.toolCallId, toolName: event.toolName,
+			isError: event.isError, content: event.result?.content, details: event.result?.details,
+			durationMs: event.durationMs,
+		}, true);
+		refreshToolActivity(ctx);
+	});
 
-			// edit：从 details.diff 回填完整 diff，供 overlay 大窗体展示
-			const details = (event as any).details;
-			if (!item.detailContent && details && typeof details.diff === "string" && details.diff.length > 0) {
-				item.detailContent = details.diff;
-				item.detailKind = "diff";
-			}
-		}
-
-		if (event.isError) {
-			const textContent = (event.content as any[])?.find((c) => c && c.type === "text");
-			const rawError = textContent?.text || "Tool execution failed";
-			state.activeError = {
-				toolName: event.toolName,
-				index: item?.index ?? totalToolCount,
-				summary: item?.summaryDisplay || "",
-				message: rawError.trim(),
-			};
-		} else {
-			state.activeError = null;
-		}
-
-		const hasRunning = state.recentTools.some((t) => t.status === "running");
-		if (
-			!hasRunning &&
-			state.headerStatus.type !== "thinking" &&
-			state.headerStatus.type !== "waiting_server"
-		) {
-			stopStatusTimer();
-		}
-
-		// 不在此处持久化：逐个工具写快照会使 session 体积呈 O(N²) 增长，
-		// 改由 agent_end / session_shutdown 在轮次边界统一写入。
-		syncWidget(ctx);
+	pi.on("tool_result", (event, ctx) => {
+		recordToolCompletion(event);
+		refreshToolActivity(ctx);
 	});
 
 	pi.on("session_tree", (_event, ctx) => {
+		streamedDrafts.clear();
 		stopStatusTimer();
 		const restored = currentConfig.persistAcrossSessions ? restoreHistoryFromSession(ctx) : null;
 		state.recentTools = restored?.items ?? [];
@@ -2810,6 +2886,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		status: dynamicHooks.handleSetExtensionStatus,
 	};
 	pi.on("session_shutdown", async () => {
+		closeUnfinishedTools("扩展运行时已关闭");
 		persistHistory();
 		hooksActive = false;
 		desktopActions.abort();
@@ -2900,7 +2977,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 					"info",
 				);
 			} else if (action === "clear") {
-				state.recentTools = [];
+				// The live overlay retains this array; clear it in place as well.
+				state.recentTools.splice(0);
+				streamedDrafts.clear();
 				totalToolCount = 0;
 				state.activeError = null;
 				state.expandedItemId = null;

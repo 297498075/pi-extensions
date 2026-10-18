@@ -677,7 +677,7 @@ console.log("  ✓ edit diff captured from details and shown in overlay.");
 
 // 持久化：确认 appendEntry 被调用（轮次边界写一次）
 const agentEndHandlers = handlers.get("agent_end") || [];
-for (const h of agentEndHandlers) await h({}, fakeCtx);
+for (const h of agentEndHandlers) await h({ messages: [] }, fakeCtx);
 assert.ok(appendedEntries.length > 0, "history must be persisted via pi.appendEntry");
 assert.ok(
 	appendedEntries.some((e) => e.customType === "rolling-tools-history"),
@@ -1311,6 +1311,7 @@ lines13 = w13.render(100);
 const fixedToolLines = lines13.slice(1).filter((l) => l.includes("[") && l.includes("]"));
 assert.equal(fixedToolLines.length, 1, "tool is visible in fixed list immediately during streaming before tool_call");
 assert.ok(fixedToolLines[0].includes("bash"), "streaming tool name is visible in widget");
+assert.ok(fixedToolLines[0].includes("生成参数") && fixedToolLines[0].includes("✎"), "a streamed draft must not be labelled executing");
 console.log("  ✓ streaming tool call captured immediately after thinking completed (before execution).");
 
 // 4. 模拟参数流式注入（toolcall_delta），验证参数在 widget 中实时更新
