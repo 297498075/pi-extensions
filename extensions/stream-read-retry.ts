@@ -18,12 +18,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
  * reclassify deterministic errors (quota, billing, invalid request, ...).
  */
 const PREMATURE_STREAM_END_SIGNATURES = [
-	"stream error",
 	"stream disconnected",
 	"disconnected before completion",
 	"stream closed before",
 	"closed before response.completed",
-	"before completion",
 	"connection reset",
 	"connection closed",
 	"connection lost",
@@ -70,6 +68,9 @@ export default function streamReadRetry(pi: ExtensionAPI): void {
 		if (!errorMessage) return;
 
 		const normalized = errorMessage.toLowerCase();
+		// A deterministic provider rejection may be wrapped in a stream error.
+		// Transport wording must never override authentication, schema or limits.
+		if (/invalid[_ -]?request|unsupported|invalid[_ -]?parameter|authentication|unauthorized|forbidden|api[_ -]?key|quota|billing|budget|usage[_ -]?limit|content[_ -]?policy|safety|\b40[0134]\b/.test(normalized)) return;
 		if (!includesAny(normalized, PREMATURE_STREAM_END_SIGNATURES)) return;
 		// Already retryable (or already rewritten by us): nothing to do.
 		if (includesAny(normalized, ALREADY_RETRYABLE_SIGNATURES)) return;

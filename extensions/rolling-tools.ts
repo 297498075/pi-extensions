@@ -3,9 +3,10 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
+import { AssistantMessageComponent, InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem, Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { showStatusModal } from "./lib/status-modal.ts";
 
 /**
  * 通知拦截规则
@@ -199,9 +200,13 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 /** 内存中保留的工具历史上限（widget 只展示最近 maxRecentTools 条，overlay 可浏览全部） */
 const HISTORY_MEMORY_LIMIT = 500;
 const DYNAMIC_HOOKS_KEY = Symbol.for("pi-rolling-tools.dynamicHooks.v3");
+const ASSISTANT_DISPLAY_FILTERED = Symbol.for("pi-rolling-tools.assistantDisplayFiltered.v1");
 
 interface DynamicHooksState {
 	installed: boolean;
+	assistantInstalled?: boolean;
+	handleAssistantContent?: (target: any, message: any, isStreaming: boolean | undefined, original: Function) => void;
+	handleAssistantRender?: (target: any, width: number, original: Function) => string[];
 	handleToolRender?: (target: any, width: number, origRender: Function) => string[];
 	handleShowExtensionNotify?: (target: any, message: string, type: string | undefined, origFn: Function) => void;
 	handleSetExtensionStatus?: (target: any, key: string, text: string | undefined, origFn: Function) => void;
@@ -1090,7 +1095,7 @@ function deserializeHistory(data: any): { items: ToolItem[]; total: number; view
 		output: raw.output,
 		detailContent: raw.detailContent,
 		detailKind: raw.detailKind,
-		status: raw.status === "error" ? "error" : raw.status === "running" ? "done" : "done",
+		status: raw.status === "error" ? "error" : raw.status === "running" ? "running" : "done",
 		durationMs: typeof raw.durationMs === "number" ? raw.durationMs : undefined,
 		startTime: Number(raw.startTime ?? Date.now()),
 	}));
@@ -2179,6 +2184,25 @@ function installToolNotificationStripper(
  * 安装原型劫持骨架（仅在进程初次加载时拦截一次，后续所有 reload 均由 dynamicHooks 委托热刷新）
  */
 function ensureGlobalPrototypeHooksInstalled(): void {
+	if (!dynamicHooks.assistantInstalled) {
+		dynamicHooks.assistantInstalled = true;
+		const originalUpdate = AssistantMessageComponent.prototype.updateContent;
+		const originalRender = AssistantMessageComponent.prototype.render;
+		AssistantMessageComponent.prototype.updateContent = function (this: any, message: any, isStreaming?: boolean) {
+			if (dynamicHooks.handleAssistantContent) dynamicHooks.handleAssistantContent(this, message, isStreaming, originalUpdate);
+			else originalUpdate.call(this, message, isStreaming);
+		};
+		AssistantMessageComponent.prototype.render = function (this: any, width: number) {
+			if (dynamicHooks.handleAssistantRender) return dynamicHooks.handleAssistantRender(this, width, originalRender);
+			// A component rendered while the extension was loaded may still have a
+			// filtered visual tree. Rebuild once from the retained original message.
+			if (this[ASSISTANT_DISPLAY_FILTERED] && this.lastMessage) {
+				this[ASSISTANT_DISPLAY_FILTERED] = false;
+				this.updateContent(this.lastMessage);
+			}
+			return originalRender.call(this, width);
+		};
+	}
 	if (dynamicHooks.installed) return;
 	dynamicHooks.installed = true;
 
@@ -2249,6 +2273,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	let totalToolCount = 0;
 	let statusTimer: any = null;
 	let lastCtx: any = null;
+	let hooksActive = true;
+	const uiHookCleanups: Array<() => void> = [];
+	let legacyNoticeTimer: ReturnType<typeof setTimeout> | undefined;
 	/** 待展示的旧配置迁移提示（仅提示一次） */
 	let pendingLegacyNotice: string | undefined;
 	if (initialLoad.legacyDetected) {
@@ -2274,6 +2301,23 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	// 1.5 注册工具渲染器：剥掉插件在工具行里重复画的提示头（通道 C）
 	installToolNotificationStripper(pi, () => currentConfig.enabled && currentConfig.stripToolNotificationHeaders !== false);
 
+	// Filter only the component's view, never agent messages or persisted signatures.
+	dynamicHooks.handleAssistantContent = (target, message, isStreaming, original) => {
+		const hide = currentConfig.enabled && hooksActive;
+		const view = hide && Array.isArray(message.content)
+			? { ...message, content: message.content.filter((block: any) => block.type !== "thinking") }
+			: message;
+		original.call(target, view, isStreaming);
+		target.lastMessage = message;
+		target[ASSISTANT_DISPLAY_FILTERED] = hide;
+	};
+	dynamicHooks.handleAssistantRender = (target, width, original) => {
+		if (target.lastMessage && Boolean(target[ASSISTANT_DISPLAY_FILTERED]) !== currentConfig.enabled) {
+			target.updateContent(target.lastMessage);
+		}
+		return original.call(target, width);
+	};
+
 	// 2. 动态更新委派处理函数（支持任意次数的 /reload 即刻生效！）
 	dynamicHooks.handleToolRender = (target: any, width: number, origRender: Function) => {
 		if (currentConfig.enabled && !target.expanded && shouldSilenceInTranscript(target.toolName, currentConfig)) {
@@ -2288,6 +2332,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		type: string | undefined,
 		origFn: Function,
 	) => {
+		if (!currentConfig.enabled) return origFn.call(target, message, type);
 		// 重要信息（error / warning 类型，或命中关键词）不被拦截
 		if (isImportantNotification(message, type, currentConfig.notificationKeywords)) {
 			return origFn.call(target, message, type);
@@ -2305,6 +2350,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		text: string | undefined,
 		origFn: Function,
 	) => {
+		if (!currentConfig.enabled) return origFn.call(target, key, text);
 		// 常驻状态（如 blackhole 仪表盘、MCP 服务器状态）：完全放行。
 		// 不倒计时，也不拦截它们自己的清除调用，否则会卡住不消失。
 		if (isPersistentStatusKey(key, currentConfig.statusEnhancements)) {
@@ -2375,6 +2421,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 	function startStatusTimer(ctx: any): void {
 		stopStatusTimer();
+		if (!currentConfig.enabled || !hooksActive) return;
 		statusTimer = setInterval(() => {
 			syncWidget(ctx);
 		}, 100);
@@ -2390,7 +2437,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		ctx: any,
 	): { items: ToolItem[]; total: number; viewMode?: ViewMode } | null {
 		try {
-			const entries = ctx?.sessionManager?.getEntries?.();
+			const entries = ctx?.sessionManager?.getBranch?.();
 			if (!Array.isArray(entries)) return null;
 			for (let i = entries.length - 1; i >= 0; i--) {
 				const entry = entries[i];
@@ -2458,7 +2505,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	 * 支持鼠标滚轮滚动，以及“上滑到顶再加载 step 条”的懒加载。
 	 */
 	function openHistoryOverlay(ctx: any, initialItem?: ToolItem): void {
-		if (!ctx?.hasUI || !ctx.ui?.custom) {
+		if (!ctx?.hasUI || ctx.mode === "rpc" || !ctx.ui?.custom) {
 			ctx?.ui?.notify?.("rolling-tools: 当前环境不支持大窗体", "warning");
 			return;
 		}
@@ -2523,13 +2570,16 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	function installUiHooks(ctx: ExtensionContext): void {
 		if (!ctx?.hasUI || !ctx.ui) return;
 		const ui = ctx.ui as any;
-		const hookKey = Symbol.for("pi-rolling-tools.contextUiHook.v1");
+		const hookKey = Symbol.for("pi-rolling-tools.contextUiHook.v2");
 		if (ui[hookKey]) return;
-		ui[hookKey] = true;
+		const owner = {};
+		ui[hookKey] = owner;
 
-		const originalNotify = ui.notify?.bind(ui);
+		const originalNotifyMethod = ui.notify;
+		const originalNotify = originalNotifyMethod?.bind(ui);
 		if (originalNotify) {
-			ui.notify = (message: string, type?: string) => {
+			const wrappedNotify = (message: string, type?: string) => {
+				if (!currentConfig.enabled || !hooksActive) return originalNotify(message, type);
 				// 重要信息（error / warning 类型，或命中关键词）不被拦截
 				if (isImportantNotification(message, type, currentConfig.notificationKeywords)) {
 					return originalNotify(message, type);
@@ -2540,13 +2590,11 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				}
 				return originalNotify(message, type);
 			};
-		}
-
-		const originalSetStatus = ui.setStatus?.bind(ui);
-		if (originalSetStatus) {
-			ui.setStatus = (key: string, text: string | undefined) => {
-				return originalSetStatus(key, text);
-			};
+			ui.notify = wrappedNotify;
+			uiHookCleanups.push(() => {
+				if (ui.notify === wrappedNotify) ui.notify = originalNotifyMethod;
+				if (ui[hookKey] === owner) delete ui[hookKey];
+			});
 		}
 	}
 
@@ -2564,9 +2612,11 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		// - reload/new/resume/fork：都尝试从当前 session 的 entries 中恢复。
 		//   注意：/reload 会重新加载扩展模块，内存中的 state 是全新的，必须从 session 恢复。
 		// - startup：全新进程，session 通常为空，恢复失败也不影响。
+		state.recentTools = [];
+		totalToolCount = 0;
 		if (currentConfig.persistAcrossSessions) {
 			const restored = restoreHistoryFromSession(ctx);
-			if (restored && restored.items.length > 0) {
+			if (restored) {
 				state.recentTools = restored.items;
 				totalToolCount = restored.total;
 				if (restored.viewMode) {
@@ -2581,7 +2631,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		if (pendingLegacyNotice) {
 			const notice = pendingLegacyNotice;
 			pendingLegacyNotice = undefined;
-			setTimeout(() => {
+			legacyNoticeTimer = setTimeout(() => {
+				legacyNoticeTimer = undefined;
+				if (!hooksActive) return;
 				try {
 					ctx.ui?.notify?.(notice, "warning");
 				} catch {
@@ -2616,10 +2668,6 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 	// 5. 消息流式事件
 	pi.on("message_update", async (event, ctx) => {
-		if (event.message?.role === "assistant" && Array.isArray(event.message.content)) {
-			event.message.content = event.message.content.filter((c: any) => c.type !== "thinking");
-		}
-
 		const ev = (event as any).assistantMessageEvent;
 		if (!ev) return;
 
@@ -2718,17 +2766,6 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			if (hasToolChanges) {
 				syncWidget(ctx);
 			}
-		}
-	});
-
-	pi.on("message_end", async (event) => {
-		if (event.message?.role === "assistant" && Array.isArray(event.message.content)) {
-			return {
-				message: {
-					...event.message,
-					content: event.message.content.filter((c: any) => c.type !== "thinking"),
-				},
-			};
 		}
 	});
 
@@ -2858,9 +2895,36 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		syncWidget(ctx);
 	});
 
-	// 9. 会话终止清理资源
+	pi.on("session_tree", (_event, ctx) => {
+		stopStatusTimer();
+		const restored = currentConfig.persistAcrossSessions ? restoreHistoryFromSession(ctx) : null;
+		state.recentTools = restored?.items ?? [];
+		totalToolCount = restored?.total ?? 0;
+		if (restored?.viewMode) state.viewMode = restored.viewMode;
+		state.headerStatus = { type: "idle" };
+		state.activeError = null;
+		syncWidget(ctx);
+	});
+
+	// Prototype wrappers are process-wide, but their delegates belong to this
+	// runtime. Removing the extension must leave inert pass-through wrappers.
+	const ownedHooks = {
+		assistantContent: dynamicHooks.handleAssistantContent,
+		assistantRender: dynamicHooks.handleAssistantRender,
+		render: dynamicHooks.handleToolRender,
+		notify: dynamicHooks.handleShowExtensionNotify,
+		status: dynamicHooks.handleSetExtensionStatus,
+	};
 	pi.on("session_shutdown", async () => {
 		persistHistory();
+		hooksActive = false;
+		for (const cleanup of uiHookCleanups.splice(0)) cleanup();
+		if (dynamicHooks.handleAssistantContent === ownedHooks.assistantContent) dynamicHooks.handleAssistantContent = undefined;
+		if (dynamicHooks.handleAssistantRender === ownedHooks.assistantRender) dynamicHooks.handleAssistantRender = undefined;
+		if (dynamicHooks.handleToolRender === ownedHooks.render) dynamicHooks.handleToolRender = undefined;
+		if (dynamicHooks.handleShowExtensionNotify === ownedHooks.notify) dynamicHooks.handleShowExtensionNotify = undefined;
+		if (dynamicHooks.handleSetExtensionStatus === ownedHooks.status) dynamicHooks.handleSetExtensionStatus = undefined;
+		if (legacyNoticeTimer) clearTimeout(legacyNoticeTimer);
 		stopStatusTimer();
 		if (activeStatusInterval) {
 			clearInterval(activeStatusInterval);
@@ -2897,6 +2961,11 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				}
 			} else if (action === "off") {
 				currentConfig.enabled = false;
+				stopStatusTimer();
+				if (activeStatusInterval) {
+					clearInterval(activeStatusInterval);
+					activeStatusInterval = null;
+				}
 				syncWidget(ctx);
 				ctx.ui?.notify?.("rolling-tools: 已禁用正文静音与滚动条", "info");
 			} else if (action === "on") {
@@ -2919,7 +2988,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 					`• status 时长: ${currentConfig.statusEnhancements?.[0]?.durationMs ?? "默认"}ms`,
 					`• 剥离工具行提示头: ${currentConfig.stripToolNotificationHeaders !== false ? "已开启" : "已关闭"}`,
 				].join("\n");
-				ctx.ui?.notify?.(info, "info");
+				await showStatusModal(ctx, "Rolling Tools", info.split("\n"));
 			} else if (action === "mode" || action.startsWith("mode ")) {
 				const target = action.slice(4).trim().toLowerCase();
 				if (target === "running") {

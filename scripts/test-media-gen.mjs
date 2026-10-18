@@ -1,208 +1,157 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
-	resolveAspectAndSize,
-	resolveOutputDir,
-	getMediaOutputPath,
-	formatLocalFileUrl,
-	GenerateImageSchema,
-	GenerateVideoSchema,
-	loadMediaGenConfigFile,
-	getMediaGenContext,
-	resolveProviderFromModelsJson,
-	extractImageFromChatMessage,
-	resolveUrlOrDataUriToBuffer,
-	default as mediaGenExtension,
+	resolveAspectAndSize, resolveOutputDir, getMediaOutputPath, formatLocalFileUrl,
+	GenerateImageSchema, GenerateVideoSchema, loadMediaGenConfigFile, getMediaGenContext,
+	resolveProviderFromModelsJson, extractImageFromChatMessage, resolveUrlOrDataUriToBuffer,
+	executeImageGeneration, executeVideoGeneration, default as mediaGenExtension,
 } from "../extensions/media-gen.ts";
 
-console.log("Starting test-media-gen.mjs...");
+const root = mkdtempSync(join(tmpdir(), "media-gen-test-"));
+const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+const originalKey = process.env.PI_MEDIA_TEST_KEY;
+const originalFetch = globalThis.fetch;
+const agent = join(root, "agent"), cwd = join(root, "workspace"), output = join(root, "output");
+mkdirSync(agent); mkdirSync(cwd); mkdirSync(output);
+process.env.PI_CODING_AGENT_DIR = agent;
+process.env.PI_MEDIA_TEST_KEY = "test-only-not-a-real-key";
+const pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+const png = Buffer.from(pngBase64, "base64");
+const dataUri = `data:image/png;base64,${pngBase64}`;
+const provider = { providerName: "fixture", baseUrl: "https://api.example/v1", apiKey: "test-key", availableModels: ["image-primary", "image-fallback", "video-primary"] };
+const config = { primaryModel: "image-primary", fallbackModels: ["image-fallback"], outputDir: output };
+const modelsPath = join(agent, "models.json");
+const writeModels = apiKey => writeFileSync(modelsPath, JSON.stringify({ providers: { fixture: { baseUrl: provider.baseUrl, apiKey, models: provider.availableModels.map(id => ({ id })) } } }));
+const tools = new Map(); mediaGenExtension({ registerTool(tool) { tools.set(tool.name, tool); } });
+const ctx = { cwd, ui: { notify() {} } };
 
-// 1. Test Dimension & Aspect Ratio Resolution
-{
-	const res16_9 = resolveAspectAndSize(1920, 1080);
-	assert.equal(res16_9.aspectRatio, "16:9", "1920x1080 should map to 16:9");
-	assert.equal(res16_9.openAiSize, "1792x1024", "16:9 should map to openAiSize 1792x1024");
-	assert.equal(res16_9.alignedWidth % 64, 0, "alignedWidth must be multiple of 64");
-	assert.equal(res16_9.alignedHeight % 64, 0, "alignedHeight must be multiple of 64");
-
-	const res9_16 = resolveAspectAndSize(1080, 1920);
-	assert.equal(res9_16.aspectRatio, "9:16", "1080x1920 should map to 9:16");
-	assert.equal(res9_16.openAiSize, "1024x1792", "9:16 should map to openAiSize 1024x1792");
-
-	const res1_1 = resolveAspectAndSize(1024, 1024);
-	assert.equal(res1_1.aspectRatio, "1:1", "1024x1024 should map to 1:1");
-	assert.equal(res1_1.openAiSize, "1024x1024", "1:1 should map to openAiSize 1024x1024");
-
-	const res4_3 = resolveAspectAndSize(800, 600);
-	assert.equal(res4_3.aspectRatio, "4:3", "800x600 should map to 4:3");
-
-	const resCustomDefault = resolveAspectAndSize(undefined, undefined, 512, 512);
-	assert.equal(resCustomDefault.requestedWidth, 512);
-	assert.equal(resCustomDefault.requestedHeight, 512);
-	console.log("✓ resolveAspectAndSize passed");
-}
-
-// 2. Test Output Directory Resolution
-{
-	const cwd = "C:\\projects\\my-session";
-	// Default output dir (.pi/media relative to cwd)
-	const defOut = resolveOutputDir(undefined, cwd);
-	assert.ok(defOut.endsWith(join(".pi", "media")), "Default outputDir should be .pi/media");
-
-	// Relative custom path
-	const relOut = resolveOutputDir("custom/media/path", cwd);
-	assert.ok(relOut.endsWith(join("custom", "media", "path")), "Relative outputDir should resolve against cwd");
-
-	// Absolute path
-	const absInput = "D:\\absolute\\media";
-	const absOut = resolveOutputDir(absInput, cwd);
-	assert.equal(absOut, absInput, "Absolute outputDir should be preserved exactly");
-	console.log("✓ resolveOutputDir passed (relative/absolute/default)");
-}
-
-// 3. Test Provider Resolution From models.json
-{
-	const provider = resolveProviderFromModelsJson("yqdcc");
-	assert.equal(provider.providerName, "yqdcc");
-	assert.ok(provider.baseUrl.includes("https://cpa.yqdcc.site"), "baseUrl should be resolved from models.json");
-	assert.ok(provider.apiKey.length > 0, "apiKey should be resolved or expanded");
-	console.log(`✓ resolveProviderFromModelsJson passed for yqdcc (baseUrl=${provider.baseUrl})`);
-}
-
-// 4. Test Standalone Config File Loading & Context Resolution
-{
-	const tempDir = mkdtempSync(join(tmpdir(), "media-gen-test-"));
-	try {
-		const configContent = {
-			provider: "yqdcc",
-			image: {
-				primaryModel: "gpt-image-2.5-flare",
-				fallbackModels: ["gemini-3.1-flash-image", "dall-e-3"],
-				defaultWidth: 1024,
-				defaultHeight: 1024,
-				outputDir: ".pi/media",
-			},
-			video: {
-				primaryModel: "cogvideox-5b",
-				fallbackModels: ["wanx-v1"],
-				defaultWidth: 1280,
-				defaultHeight: 720,
-				outputDir: "C:\\videos\\output",
-			},
-		};
-
-		writeFileSync(join(tempDir, "media-gen.json"), JSON.stringify(configContent, null, 2), "utf8");
-
-		const loaded = loadMediaGenConfigFile(tempDir);
-		assert.ok(loaded, "Should load media-gen.json from tempDir");
-		assert.equal(loaded.config.provider, "yqdcc");
-		assert.equal(loaded.config.image?.primaryModel, "gpt-image-2.5-flare");
-		assert.deepEqual(loaded.config.image?.fallbackModels, ["gemini-3.1-flash-image", "dall-e-3"]);
-
-		const ctx = getMediaGenContext(tempDir);
-		assert.equal(ctx.provider.providerName, "yqdcc");
-		assert.equal(ctx.image?.primaryModel, "gpt-image-2.5-flare");
-		assert.equal(ctx.video?.primaryModel, "cogvideox-5b");
-		console.log("✓ Standalone media-gen.json loading & context resolution passed");
-	} finally {
-		rmSync(tempDir, { recursive: true, force: true });
+try {
+	for (const [w, h, ratio, size] of [[1920, 1080, "16:9", "1792x1024"], [1080, 1920, "9:16", "1024x1792"], [1024, 1024, "1:1", "1024x1024"], [800, 600, "4:3", "1792x1024"]]) {
+		const dims = resolveAspectAndSize(w, h);
+		assert.equal(dims.aspectRatio, ratio); assert.equal(dims.openAiSize, size);
+		assert.equal(dims.alignedWidth % 64, 0); assert.equal(dims.alignedHeight % 64, 0);
 	}
-}
+	assert.equal(resolveAspectAndSize(undefined, undefined, 512, 512).requestedWidth, 512);
+	assert.equal(resolveOutputDir(undefined, cwd), join(cwd, ".pi", "media"));
+	assert.equal(resolveOutputDir("custom/media", cwd), join(cwd, "custom", "media"));
+	assert.equal(resolveOutputDir(output, cwd), output);
+	assert.ok(isAbsolute(getMediaOutputPath("images", "png", output, cwd)));
+	const linked = join(output, "space # 图片.png");
+	assert.equal(formatLocalFileUrl(linked), pathToFileURL(linked).href);
+	assert.ok(formatLocalFileUrl(linked).includes("%23"));
+	for (const schema of [GenerateImageSchema, GenerateVideoSchema]) {
+		for (const key of ["prompt", "image", "width", "height"]) assert.ok(schema.properties[key]);
+		assert.equal(schema.properties.duration, undefined);
+	}
+	console.log("✓ dimensions, cross-platform paths, escaped URLs and schemas");
 
-// 5. Test Schema Properties
-{
-	const imgProps = GenerateImageSchema.properties;
-	assert.ok(imgProps.prompt, "generate_image schema must have prompt");
-	assert.ok(imgProps.image, "generate_image schema must have image");
-	assert.ok(imgProps.width, "generate_image schema must have width");
-	assert.ok(imgProps.height, "generate_image schema must have height");
+	writeModels("${PI_MEDIA_TEST_KEY}");
+	assert.equal(resolveProviderFromModelsJson("fixture").apiKey, process.env.PI_MEDIA_TEST_KEY);
+	writeModels("$PI_MEDIA_TEST_KEY");
+	assert.equal(resolveProviderFromModelsJson("fixture").apiKey, process.env.PI_MEDIA_TEST_KEY);
+	writeModels("${PI_MEDIA_TEST_MISSING_KEY}");
+	assert.throws(() => resolveProviderFromModelsJson("fixture"), /not set/);
+	writeModels("!echo secret");
+	assert.throws(() => resolveProviderFromModelsJson("fixture"), /does not execute/);
+	writeModels("$PI_MEDIA_TEST_KEY");
+	writeFileSync(join(agent, "media-gen.json"), JSON.stringify({ provider: "fixture", image: { ...config, primaryModel: "global-image" }, video: { ...config, primaryModel: "video-primary" } }));
+	assert.equal(getMediaGenContext(cwd).image.primaryModel, "global-image");
+	writeFileSync(join(cwd, "media-gen.json"), JSON.stringify({ provider: "fixture", image: config, video: { ...config, primaryModel: "video-primary" } }));
+	assert.equal(loadMediaGenConfigFile(cwd).config.provider, "fixture");
+	assert.equal(getMediaGenContext(cwd).configFilePath, join(cwd, "media-gen.json"));
+	assert.equal(getMediaGenContext(cwd).provider.baseUrl, provider.baseUrl);
+	console.log("✓ isolated agent directory, environment interpolation and session config precedence");
 
-	const vidProps = GenerateVideoSchema.properties;
-	assert.ok(vidProps.prompt, "generate_video schema must have prompt");
-	assert.ok(vidProps.image, "generate_video schema must have image");
-	assert.ok(vidProps.width, "generate_video schema must have width");
-	assert.ok(vidProps.height, "generate_video schema must have height");
-	assert.equal(vidProps.duration, undefined, "duration should NOT exist in generate_video schema");
-	console.log("✓ Schema properties verified (clean prompt in English, width/height present, duration removed)");
-}
-
-// 6. Test Extension Tool Registration
-{
-	const registeredTools = new Map();
-	const mockPi = {
-		registerTool(tool) {
-			registeredTools.set(tool.name, tool);
-		},
-	};
-
-	mediaGenExtension(mockPi);
-	assert.ok(registeredTools.has("generate_image"), "Must register generate_image tool");
-	assert.ok(registeredTools.has("generate_video"), "Must register generate_video tool");
-	console.log("✓ Extension tool registration passed");
-}
-
-// 7. Test Image Extraction from Multimodal Chat Messages (Gemini, Claude, NewAPI/OneAPI)
-{
-	const sampleBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
-	const sampleDataUri = `data:image/png;base64,${sampleBase64}`;
-
-	// 7.1 resolveUrlOrDataUriToBuffer with data URI
-	const buf1 = await resolveUrlOrDataUriToBuffer(sampleDataUri);
-	assert.ok(buf1 instanceof Buffer, "Must resolve data URI to Buffer");
-	assert.equal(buf1.toString("base64"), sampleBase64);
-
-	// 7.2 Message format with msg.images (Gemini via OpenAI-compatible proxy)
-	const msgGeminiImages = {
-		role: "assistant",
-		content: null,
-		images: [
-			{
-				type: "image_url",
-				image_url: { url: sampleDataUri },
-			},
-		],
-	};
-	const bufGemini = await extractImageFromChatMessage(msgGeminiImages);
-	assert.ok(bufGemini instanceof Buffer, "Must extract image from msg.images");
-	assert.equal(bufGemini.toString("base64"), sampleBase64);
-
-	// 7.3 Message format with string markdown image
-	const msgMarkdown = {
-		role: "assistant",
-		content: `Here is your image:\n![Generated Image](${sampleDataUri})`,
-	};
-	const bufMarkdown = await extractImageFromChatMessage(msgMarkdown);
-	assert.ok(bufMarkdown instanceof Buffer, "Must extract image from markdown link");
-	assert.equal(bufMarkdown.toString("base64"), sampleBase64);
-
-	// 7.4 Message format with embedded base64 data URI
-	const msgB64Text = {
-		role: "assistant",
-		content: `Image data: ${sampleDataUri} Done.`,
-	};
-	const bufB64 = await extractImageFromChatMessage(msgB64Text);
-	assert.ok(bufB64 instanceof Buffer, "Must extract image from embedded data URI");
-	assert.equal(bufB64.toString("base64"), sampleBase64);
-
-	// 7.5 Message format with multimodal content array
-	const msgMultimodal = {
-		role: "assistant",
-		content: [
-			{ type: "text", text: "Generated result:" },
-			{ type: "image_url", image_url: { url: sampleDataUri } },
-		],
-	};
-	const bufMultimodal = await extractImageFromChatMessage(msgMultimodal);
-	assert.ok(bufMultimodal instanceof Buffer, "Must extract image from multimodal content array");
-	assert.equal(bufMultimodal.toString("base64"), sampleBase64);
-
-	// 7.6 Empty or plain text without images returns null
+	assert.deepEqual(await resolveUrlOrDataUriToBuffer(dataUri), png);
+	for (const message of [
+		{ images: [{ image_url: { url: dataUri } }] },
+		{ content: [{ type: "image_url", image_url: { url: dataUri } }] },
+		{ content: `![generated](${dataUri})` }, { content: dataUri },
+	]) assert.deepEqual(await extractImageFromChatMessage(message), png);
 	assert.equal(await extractImageFromChatMessage(null), null);
-	assert.equal(await extractImageFromChatMessage({ content: "Just plain text without image." }), null);
+	assert.equal(await extractImageFromChatMessage({ content: "no image" }), null);
+	let signedUrl;
+	globalThis.fetch = async url => { signedUrl = url; return new Response(png); };
+	assert.deepEqual(await extractImageFromChatMessage({ content: "https://cdn.example/image.png?signature=keep-me&expires=123" }), png);
+	assert.equal(signedUrl, "https://cdn.example/image.png?signature=keep-me&expires=123", "URL extraction must not drop signed download queries");
+	await assert.rejects(resolveUrlOrDataUriToBuffer("data:image/png;base64,YmFk"), /unsupported/);
+	console.log("✓ multimodal extraction and invalid image payload rejection");
 
-	console.log("✓ extractImageFromChatMessage and resolveUrlOrDataUriToBuffer passed all formats");
+	let calls = [];
+	globalThis.fetch = async (url, init) => {
+		calls.push({ url, init });
+		return Response.json({ data: [{ b64_json: pngBase64 }] });
+	};
+	const result = await tools.get("generate_image").execute("image", { prompt: "test" }, undefined, undefined, ctx);
+	assert.equal(result.isError, undefined);
+	assert.equal(result.details.model, "image-primary", "tool must use ctx.cwd project config");
+	assert.deepEqual(readFileSync(result.details.filePath), png);
+	assert.equal(JSON.parse(calls[0].init.body).model, "image-primary");
+	assert.ok(calls[0].init.signal, "requests need cancellation and a bounded deadline");
+
+	calls = [];
+	globalThis.fetch = async (url, init) => {
+		calls.push(String(url));
+		if (String(url).includes("/images/generations")) return Response.json({ data: [{ url: "https://cdn.example/expired.png" }] });
+		return new Response("<html>Access denied</html>", { status: 403 });
+	};
+	const beforeFailure = readdirSync(output).length;
+	await assert.rejects(executeImageGeneration({ prompt: "test" }, config, provider, cwd), /HTTP 403/);
+	assert.equal(readdirSync(output).length, beforeFailure, "error pages must not be saved as images");
+	assert.equal(calls.length, 4, "failed image download must allow model fallback");
+	globalThis.fetch = async () => new Response("<html>error</html>", { status: 200 });
+	await assert.rejects(resolveUrlOrDataUriToBuffer("https://cdn.example/error.png"), /unsupported/);
+
+	let modelsTried = [];
+	globalThis.fetch = async (_url, init) => {
+		const body = JSON.parse(init.body); modelsTried.push(body.model);
+		if (body.model === "image-primary") return new Response("unavailable", { status: 503 });
+		return Response.json({ data: [{ b64_json: pngBase64 }] });
+	};
+	const fallback = await executeImageGeneration({ prompt: "test" }, config, provider, cwd);
+	assert.equal(fallback.usedModel, "image-fallback");
+	assert.deepEqual(modelsTried, ["image-primary", "image-primary", "image-fallback"]);
+	console.log("✓ actual generation, HTTP/download validation and ordered fallback");
+
+	const controller = new AbortController();
+	let requestSignal, complete;
+	let requests = 0;
+	globalThis.fetch = (_url, init) => {
+		requests++; requestSignal = init.signal;
+		return new Promise(resolve => { complete = resolve; }); // deliberately ignore cancellation
+	};
+	const beforeAbort = readdirSync(output).length;
+	const pending = tools.get("generate_image").execute("cancel", { prompt: "test" }, controller.signal, undefined, ctx);
+	controller.abort();
+	assert.equal(requestSignal.aborted, true);
+	complete(Response.json({ data: [{ b64_json: pngBase64 }] }));
+	const cancelled = await pending;
+	assert.equal(cancelled.isError, true);
+	assert.equal(requests, 1, "abort must not cascade into fallback API calls");
+	assert.equal(readdirSync(output).length, beforeAbort, "no output may be written after cancellation");
+	await assert.rejects(executeVideoGeneration({ prompt: "test" }, config, provider, cwd, controller.signal), /abort/i);
+	assert.equal(requests, 1, "already cancelled video must not call API");
+	console.log("✓ in-flight and preflight cancellation, no fallback or writes after abort");
+
+	const imagePath = join(cwd, "reference.png"); writeFileSync(imagePath, png);
+	let videoBody;
+	globalThis.fetch = async (_url, init) => { videoBody = JSON.parse(init.body); return Response.json({ data: [{ b64_json: Buffer.from("video-fixture").toString("base64") }] }); };
+	const video = await executeVideoGeneration({ prompt: "animate", image: basename(imagePath) }, { ...config, primaryModel: "video-primary" }, provider, cwd);
+	assert.equal(videoBody.image_url, dataUri, "local reference images must be sent as bytes, not workstation paths");
+	assert.equal(readFileSync(video.filePath, "utf8"), "video-fixture");
+	globalThis.fetch = async () => new Response("not authorized", { status: 401 });
+	for (const name of ["generate_image", "generate_video"]) {
+		const error = await tools.get(name).execute("failure", { prompt: "test" }, undefined, undefined, ctx);
+		assert.equal(error.isError, true); assert.ok(error.details.error);
+	}
+	console.log("✓ video reference encoding and true tool error results");
+} finally {
+	globalThis.fetch = originalFetch;
+	if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+	if (originalKey === undefined) delete process.env.PI_MEDIA_TEST_KEY; else process.env.PI_MEDIA_TEST_KEY = originalKey;
+	rmSync(root, { recursive: true, force: true });
 }
-
-console.log("All test-media-gen.mjs assertions passed successfully!");
+console.log("All isolated media-gen regressions passed.");

@@ -48,9 +48,9 @@ pi --extension ./extensions/example.ts
 
 ## Voice：语音输入适配
 
-`extensions/voice.ts` 默认关闭，通过 `/voice on` 启用 LLM 单次收音和音色目录工具，通过 `/voice live on`（或 F2）单独开启持续语音输入。默认转写追加到草稿等待 Enter；`/voice stop` 取消现有工作但保留开关，`/voice off` 同时禁用后续调用。
+`extensions/voice.ts` 默认关闭，通过 `/voice on` 启用 LLM 发音、单次收音和音色目录工具，通过 `/voice live on`（或 F2）单独开启持续语音输入。默认转写追加到草稿等待 Enter；`/voice stop` 取消现有工作但保留开关，`/voice off` 同时禁用后续调用。
 
-**兼容性限制**：当前 TtsGateway 缺少任务级停播与扬声器物理播放完成确认，因此 `voice_speak` 明确返回不兼容，不发送不安全的播放请求；Live 采用分段请求，交接到 listen 时会丢弃当前背景半句，并非无缝音频流。扩展会访问配置的网关并写入 `~/.pi/agent/voice.json`，录音及云端 ASR 风险取决于后端配置。
+**已知风险（本次按用户决定暂不修复）**：`voice_speak` 当前仍向 TtsGateway 发送 `concurrency: "preempt"`，取消时调用全局停播；网关缺少任务级取消和扬声器物理播放完成确认，可能打断其他终端或在尚未播完时恢复收音。不要将其视为多客户端安全。Live 为分段输入，并非无缝音频流。扩展会访问配置的网关并写入 `~/.pi/agent/voice.json`，录音及云端 ASR 风险取决于后端配置。详见 [已知问题](docs/known-issues.md)。
 
 加载、操作、限制和测试详见 [`docs/voice-extension.md`](docs/voice-extension.md)。
 
@@ -83,15 +83,15 @@ Keep agent-level retry enabled in `settings.json` (the default), and configure i
 
 ## Todo Loop
 
-`extensions/todo-loop.ts` continues the agent when the latest structured todo state still contains unfinished items. It reads `details.tasks` from `@juicesharp/rpiv-todo` and also accepts the `details.todos` format used by Pi's example todo extension. It also understands the `plan-mode` execution state used by Pi's example extension.
+`extensions/todo-loop.ts` continues the agent when the latest structured todo state still contains unfinished items. It requires Pi's `agent_before_settle` boundary API (verified with Pi 1.2/1.3). It reads `details.tasks` from `@juicesharp/rpiv-todo` and also accepts the `details.todos` format used by Pi's example todo extension. It also understands the `plan-mode` execution state used by Pi's example extension.
 
-When an agent run ends, the extension queues a follow-up user message if Pi is not already retrying or compacting. It stops when all todos are complete, the final assistant text explicitly says it cannot continue, the operation was aborted by the user, or the follow-up limit is reached. The default limit is 20 automatic follow-ups; configure it with a CLI flag:
+After core retries, compaction, and queued work finish, the extension uses `agent_before_settle` to append a `todo-loop-followup` context message and request one continuation. It also reads `todo-tree-state`, so UI completion, `/todo clear`, and `/todo off` override stale tool state. It stops when all todos are complete, the final assistant text explicitly says it cannot continue, the operation was aborted by the user, or the follow-up limit is reached. The default limit is 20 automatic follow-ups; configure it with a CLI flag:
 
 ```bash
 pi --todo-loop-max-followups 50
 ```
 
-The count is derived from follow-up messages in the current session branch, so it survives `/reload` and session resume. Set it to `0` to disable automatic follow-ups.
+The count includes persisted `todo-loop-followup` messages and legacy follow-up user messages in the current branch, so it survives `/reload` and session resume. Set it to `0` to disable automatic follow-ups.
 
 The extension has no network, file, command, or external state side effects. The todo extension that owns the `todo` tool must be loaded separately; this extension only observes its persisted task state (`details.tasks` or `details.todos`).
 
@@ -99,6 +99,7 @@ The extension has no network, file, command, or external state side effects. The
 
 `extensions/rolling-tools.ts` displays a compact rolling widget for tool executions above the input editor while silencing verbose tool calls in the chat transcript.
 
+- **Reasoning display only**: Thinking blocks are hidden by the assistant component renderer; persisted messages and provider reasoning signatures remain intact. `/rolling-tools off` restores the normal view and notifications. Shutdown releases runtime-owned hooks.
 - **All tools silenced by default**: Every tool (built-ins, `edit`, `write`, `codemode`, MCP proxies, SoL-Pi `recall`, Trellis `subagent`, and arbitrary third-party tools) is hidden from the transcript by default and rolled into the widget. Tune with `silencedTools` / `widgetTools` (supports `*` wildcards).
 - **Non-intrusive transcript**: Managed tools occupy 0 lines when collapsed, preventing terminal scroll floods. Press `Ctrl+O` to expand if full outputs are needed.
 - **History overlay dialog (`➕`)**: A persistent header row sits above the tool list and carries a `➕` button on its right edge. Clicking it opens a large bordered two-pane overlay dialog showing the full history on the left and the selected tool's complete content on the right — including `edit` diffs, `write` file bodies, full commands, and outputs. The overlay updates live while the agent is still running.
@@ -269,7 +270,7 @@ pi --extension ./extensions/rolling-tools.ts
 
 | 命令 | 说明 |
 | --- | --- |
-| `/image-pager [status]` | 查看当前换页状态、策略、已节省带宽与预估 Token 统计 |
+| `/image-pager [status]` | 模态窗口查看换页状态、策略、带宽与 Token 统计（RPC/无 UI 降级通知） |
 | `/image-pager on` / `off` | 启用或禁用智能图片换页 |
 | `/image-pager strategy <turn-boundary\|fifo>` | 切换换页策略（默认 `turn-boundary` 前缀缓存友好模式） |
 | `/image-pager keep <n>` | 设置保留活跃图片数（默认 `1`） |
@@ -306,10 +307,12 @@ pi --extension ./extensions/image-pager.ts
 - **算法支持**: 默认使用 **`zstd`**（高性能且为官方 Codex 网关原生接受标准），同时支持 `gzip`、`deflate` 和 `br`。
 - **开箱即用**: 基于 Node.js 内置 `node:zlib`，零第三方运行时依赖，零 C++ 原生编译。
 - **智能策略**:
-  - 自动识别当前生效的 `defaultProvider` 及其下的所有模型；
+  - 根据 `models.json` 的 provider 地址识别请求；默认仅处理已知 host 且 JSON 含 `model` 的请求，不再把未知目标归为默认 provider；
+  - 未知 host 或不含 `model` 的接口必须通过 `targetHosts` 显式允许，仍需确保服务器支持所选 `Content-Encoding`；
   - 支持通配符匹配（`yqdcc-*`, `gemini-*`）与黑白名单过滤；
   - 内置大小阈值（`minBytesThreshold`，默认 1KB），小请求自动忽略，避免小包负收益。
-- **TUI 状态命令**: 提供 `/request-compress [status|on|off|reload]`，可随时查看实时压缩率、已节省带宽统计及动态热重载配置。
+- **TUI 状态命令**: 提供 `/request-compress [status|on|off|reload]`，状态使用模态窗口，避免被通知静音吞掉；非 TUI 模式降级通知。
+- **生命周期**: fetch hook 在 `session_start` 安装，关闭/卸载时恢复或变为透传，不覆盖其他扩展后来安装的 wrapper。
 
 ### 配置文件
 
@@ -340,7 +343,8 @@ pi --extension ./extensions/image-pager.ts
 - **灵活的选项数量 (1 ~ 12 项)**：彻底放开 4 个选项的死板限制，支持 1 项确认至 12 项复杂选择，内置平滑虚拟滚动视口（默认展示 4 项，高度控制在约 40% 紧凑区域，随光标上下滚动）。
 - **多选支持 (`multiSelect`)**：当 Agent 提出非互斥问题时，支持空格键自由勾选/反选 `[x]` 或 `[ ]`，数字键快速勾选，回车提交已选项。
 - **自定义回答**：每题自动追加 `Type something...` 行，支持按数字键、回车或空格直接拉起内嵌编辑器输入任意自定义回答或补充要求。
-- **全方位通知提醒**：Agent 发起提问时，同时触发 OSC 9 终端系统弹窗通知（Windows Terminal / WezTerm / iTerm2 原生支持）、终端提示蜂鸣（`\x07`）以及 Pi 应用内状态栏通知，后台等待不漏看。
+- **全方位通知提醒**：仅在 TUI 模式触发 OSC 9 终端系统弹窗通知（Windows Terminal / WezTerm / iTerm2 原生支持）、终端提示蜂鸣（`\x07`）以及 Pi 应用内状态栏通知，后台等待不漏看。
+- **宽度与取消安全**：题目、选项及 Review 按可见列宽折行；工具取消信号会关闭问答，JSON/RPC 输出不写终端控制字节。
 - **最小化与折叠**：支持 `Ctrl+]` 或 `Alt+H` 极速最小化为单行提示条，按任意键展开；`Esc` 可取消提问。
 - **全环境降级兼容**：在 RPC 模式（VSCode 插件端 / Zed）下自动降级为顺序 Dialog 提问，保证无交互环境不中断。
 
@@ -348,6 +352,7 @@ pi --extension ./extensions/image-pager.ts
 
 `extensions/todo-tree.ts` 为复杂开发任务提供层次化任务拆解（Hierarchy / Parent-Child Subtasks）、主窗体极简状态条与全功能居中弹出窗口（Modal Overlay with Scrollbar）：
 
+- **分支与批次一致性**：快照深拷贝，空分支恢复为空；`batch_create` 整批验证成功后再提交，包括自动清理已完成旧计划，失败不留下半棵树。
 - **分层级任务模型与动态演进**：支持多层级树状结构（如 `#1` $\rightarrow$ `#1.1` $\rightarrow$ `#1.1.1`），支持任务随进度中途追加小项或放弃取消（`cancelled`），取消项自动从进度有效项剔除，绝不阻塞整体推进。
 - **主窗体聚焦（仅展示进行中小项）**：输入栏上方仅展示总体进度、字符进度条（`[████░░░░░]`）以及当前所有正在执行的叶子小项（带父级面包屑，如 `[数据层] > 编写测试`）；多并行任务全行展开，不限死组件高度。
 - **右侧固定交互按钮 `[📋 ]`**：主行右端常驻 `[📋 ]` 按钮，支持鼠标直接点击以及键盘快捷键（默认 `Ctrl+Shift+T`）呼出任务树弹窗。
@@ -388,6 +393,7 @@ Ctrl+Shift+T      # 快速呼出/关闭任务树弹窗
   - 自然时间语法：`/timer 5m 执行代码重构`、`/timer 30s 提醒我提交代码`、`/timer 1h 30m 发布版本`、`/timer 1小时30分钟 测试`；
   - 标准冒号时钟：`/timer 00:05:00 运行检查` 或 `/timer 02:30 启动构建`；
   - 无参数交互式创建：直接运行 `/timer`，弹出输入框引导输入时间与提示词。
+- **长时长安全**：超过 Node 单次计时上限（约 24.9 天）时分段等待，到期前重新检查目标时间，避免大数溢出后立即执行。定时器只在当前进程/扩展运行时内有效，退出或 reload 不自动恢复待执行任务。
 - **Widget 实时秒级跳动倒计时**：
   - 在输入框上方常驻 Widget 实时跳动显示最近待触发任务的倒计时（如 `⏳ [定时任务倒计时] [#t-1] 02:30 后触发`），视觉聚焦且绝不刷屏污染会话流；任务归零或取消后自动清理。
 - **正文结构化卡片提示 (Entry Renderer)**：
@@ -414,11 +420,24 @@ Ctrl+Shift+T      # 快速呼出/关闭任务树弹窗
 
 ### 核心亮点
 - **极简参数，拒绝复杂配置**：面向 LLM 提供符合直觉的标准参数（`prompt`, `image`, `width`, `height`），去除了死板的 `aspectRatio` 枚举与多余的 `duration` 参数，由扩展内部自动推导最匹配的标准比例（`1:1`, `16:9`, `9:16`, `4:3`, `3:4`, `21:9`）以及上游所需的分辨率。
-- **前置网关无缝接入**：自动探测当前运行时 Provider 配置及环境变量（`CPA_BASE_URL` / `AI_API_KEY` 等），无需任何额外的配置繁琐项。
-- **自动模型降级（Fallback）**：图片生成默认使用 `gpt-image-2.5-flare`，遇故障自动尝试 `gemini-3.1-flash-image` 兜底；熔断与限流由上游网关调度，本地保持极简与纯粹。
+- **显式配置**：按会话 `ctx.cwd` 查找 `media-gen.json`、`.pi/media-gen.json`，然后回退到 `${PI_CODING_AGENT_DIR}/media-gen.json`（未设置时为 `~/.pi/agent`）。provider 从同一 agent 目录的 `models.json` 解析，支持 `$NAME` / `${NAME}` 环境引用；不执行 `!command` 凭据命令。
+- **自动模型降级（Fallback）**：必须配置 `primaryModel`，后备模型按 `fallbackModels` 顺序尝试，没有硬编码默认模型。总等待上限 5 分钟，取消或超时不继续 fallback，也不写入迟到结果。
 - **图视联动（Image-to-Video）**：`generate_image` 生成的图片路径可直接作为 `generate_video` 的首帧或参考输入（`image`），极大提升视频主体的一致性与稳定性。
-- **标准驱动架构（Video Driver）**：视频工具内置统一驱动契约，原生支持扩展对接 ComfyUI（`COMFYUI_URL`）或标准视频代理网关（`VIDEO_API_BASE_URL`）。
-- **本地落盘管理**：生成的图片与视频自动持久化落地至工作区 `.pi/images/` 与 `.pi/videos/`，并向 LLM 返回跨平台安全的 Markdown 预览与绝对路径。
+- **视频接口**：调用配置 provider 的 `/videos/generations`；本地参考图读取为 data URI，不将本机路径直接发送给远程服务。当前没有 ComfyUI 驱动或异步视频任务轮询。
+- **本地落盘管理**：默认写入会话工作区 `.pi/media/`，可设置 `outputDir`。图片下载检查 HTTP 状态及 PNG/JPEG/GIF/WebP 文件头；失败返回真正的 tool error，不把错误网页当成图片。
+- **安全影响**：提示词、参考图会发送给配置的网关及其返回的下载地址，文件写入 `outputDir`；仅使用可信服务。
+
+最小配置示例（模型 ID 请填写网关实际支持的值）：
+
+```json
+{
+  "provider": "your-provider",
+  "image": { "primaryModel": "your-image-model", "fallbackModels": [] },
+  "video": { "primaryModel": "your-video-model", "fallbackModels": [] }
+}
+```
+
+图片、视频可只配置其中一种；无需个人配置或真实 API 的测试：`node scripts/test-media-gen.mjs`。
 
 ### 工具清单
 1. `generate_image`:

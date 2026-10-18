@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import zlib from "node:zlib";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import { showStatusModal } from "./lib/status-modal.ts";
 
 export type CompressionAlgorithm = "zstd" | "gzip" | "deflate" | "br";
 
@@ -359,31 +360,23 @@ export function shouldCompressRequest(
 
 	let modelId: string | undefined;
 	try {
-		const preview = bodyRaw.subarray(0, 4096).toString("utf-8");
-		const match = preview.match(/"model"\s*:\s*"([^"]+)"/);
-		if (match) {
-			modelId = match[1];
-		} else {
-			const parsed = JSON.parse(bodyRaw.toString("utf-8"));
-			if (parsed && typeof parsed.model === "string") {
-				modelId = parsed.model;
-			}
-		}
+		const parsed = JSON.parse(bodyRaw.toString("utf-8"));
+		if (parsed && typeof parsed.model === "string") modelId = parsed.model;
 	} catch {
 		// 非合法 JSON 文本，避免对未知二进制乱压缩
 		return { shouldCompress: false, reason: "Body cannot be parsed as JSON text" };
 	}
 
-	let providerId: string | undefined;
-	if (modelId) {
-		providerId = envCtx.modelToProvider.get(modelId.toLowerCase());
+	// A model name alone is not proof of ownership: unrelated services can use
+	// the same JSON fields. Unknown hosts are opt-in only via targetHosts.
+	const knownProvider = urlObj && envCtx.providerBaseUrls.get(urlObj.host.toLowerCase());
+	if (!knownProvider && config.targetHosts.length === 0) {
+		return { shouldCompress: false, reason: "Unknown API host (not in provider base URLs or targetHosts)" };
 	}
-	if (!providerId && urlObj) {
-		providerId = envCtx.providerBaseUrls.get(urlObj.host.toLowerCase());
+	if (!modelId && config.targetHosts.length === 0) {
+		return { shouldCompress: false, reason: "Request has no model; explicit targetHosts opt-in required" };
 	}
-	if (!providerId) {
-		providerId = envCtx.defaultProvider;
-	}
+	const providerId = knownProvider || (modelId ? envCtx.modelToProvider.get(modelId.toLowerCase()) : undefined) || envCtx.defaultProvider;
 
 	if (providerId && matchesAnyPattern(providerId, config.excludeProviders)) {
 		return { shouldCompress: false, reason: `Provider ${providerId} is in excludeProviders` };
@@ -423,18 +416,33 @@ const HOOKED_SYMBOL = Symbol.for("__pi_request_compress_fetch_hooked__");
 const ORIGINAL_FETCH_SYMBOL = Symbol.for("__pi_request_compress_original_fetch__");
 const CONFIG_REF_SYMBOL = Symbol.for("__pi_request_compress_config_ref__");
 const ENV_REF_SYMBOL = Symbol.for("__pi_request_compress_env_ref__");
+const FETCH_WRAPPER_SYMBOL = Symbol.for("__pi_request_compress_fetch_wrapper__");
+const FETCH_ACTIVE_SYMBOL = Symbol.for("__pi_request_compress_fetch_active__");
 
-export function setupFetchHook(): void {
+function hasLegacyFetchHook(): boolean {
+	return Boolean((globalThis as any)[HOOKED_SYMBOL]) && !(globalThis as any)[FETCH_WRAPPER_SYMBOL];
+}
+
+export function setupFetchHook(): boolean {
+	// Older releases did not retain wrapper identity or an inert switch.
+	// Disable their shared config; do not overwrite an unknown wrapper chain.
+	if (hasLegacyFetchHook()) {
+		const config = (globalThis as any)[CONFIG_REF_SYMBOL] as RequestCompressConfig | undefined;
+		if (config) config.enabled = false;
+		return false;
+	}
+	(globalThis as any)[FETCH_ACTIVE_SYMBOL] = true;
 	// 如果已经 Hook 过 globalThis.fetch，不重复包装，只更新全局配置引用
 	if ((globalThis as any)[HOOKED_SYMBOL]) {
-		return;
+		return true;
 	}
 	(globalThis as any)[HOOKED_SYMBOL] = true;
 
 	const originalFetch = (globalThis as any)[ORIGINAL_FETCH_SYMBOL] || globalThis.fetch;
 	(globalThis as any)[ORIGINAL_FETCH_SYMBOL] = originalFetch;
 
-	globalThis.fetch = async function (input: any, init: RequestInit = {}) {
+	const wrappedFetch: typeof fetch = async function (input: any, init: RequestInit = {}) {
+		if (!(globalThis as any)[FETCH_ACTIVE_SYMBOL]) return originalFetch(input, init);
 		const liveConfig: RequestCompressConfig = (globalThis as any)[CONFIG_REF_SYMBOL] || DEFAULT_CONFIG;
 		const liveEnvCtx: PiEnvironmentContext = (globalThis as any)[ENV_REF_SYMBOL] || {
 			defaultProvider: undefined,
@@ -505,6 +513,24 @@ export function setupFetchHook(): void {
 			body: new Uint8Array(compressedRes.compressed),
 		});
 	};
+	(globalThis as any)[FETCH_WRAPPER_SYMBOL] = wrappedFetch;
+	globalThis.fetch = wrappedFetch;
+	return true;
+}
+
+export function teardownFetchHook(): void {
+	if (hasLegacyFetchHook()) {
+		const config = (globalThis as any)[CONFIG_REF_SYMBOL] as RequestCompressConfig | undefined;
+		if (config) config.enabled = false;
+	}
+	(globalThis as any)[FETCH_ACTIVE_SYMBOL] = false;
+	if (globalThis.fetch === (globalThis as any)[FETCH_WRAPPER_SYMBOL]) {
+		globalThis.fetch = (globalThis as any)[ORIGINAL_FETCH_SYMBOL];
+		delete (globalThis as any)[HOOKED_SYMBOL];
+		delete (globalThis as any)[ORIGINAL_FETCH_SYMBOL];
+		delete (globalThis as any)[FETCH_WRAPPER_SYMBOL];
+	}
+	// If another wrapper surrounds ours, leave it intact; ours is now inert.
 }
 
 export function updateLiveContext(config: RequestCompressConfig, envCtx: PiEnvironmentContext): void {
@@ -549,7 +575,11 @@ export default function requestCompressExtension(pi: ExtensionAPI): void {
 	const activeEnvCtx = resolvePiEnvironment();
 
 	updateLiveContext(activeConfig, activeEnvCtx);
-	setupFetchHook();
+	pi.on("session_start", (_event, ctx) => {
+		updateLiveContext(loadConfig(ctx.cwd), resolvePiEnvironment());
+		if (!setupFetchHook()) ctx.ui.notify("request-compress: 旧版 fetch hook 无法安全热替换，已关闭压缩；请重启 Pi 后重新启用。", "warning");
+	});
+	pi.on("session_shutdown", () => teardownFetchHook());
 
 	pi.registerCommand("request-compress", {
 		description: "View or toggle HTTP request body compression status (zstd/gzip)",
@@ -559,6 +589,10 @@ export default function requestCompressExtension(pi: ExtensionAPI): void {
 			const sub = args?.trim().toLowerCase();
 
 			if (sub === "on") {
+				if (hasLegacyFetchHook()) {
+					ctx.ui.notify("request-compress: 请先重启 Pi，清理旧版 fetch hook。", "warning");
+					return;
+				}
 				currentConfig.enabled = true;
 				ctx.ui.notify("Request compression enabled (algorithm: " + currentConfig.algorithm + ")", "info");
 				return;
@@ -571,8 +605,9 @@ export default function requestCompressExtension(pi: ExtensionAPI): void {
 			}
 
 			if (sub === "reload") {
-				const reloaded = loadConfig();
+				const reloaded = loadConfig(ctx.cwd);
 				const env = resolvePiEnvironment();
+				if (hasLegacyFetchHook()) reloaded.enabled = false;
 				updateLiveContext(reloaded, env);
 				ctx.ui.notify("Request compression configuration reloaded", "info");
 				return;
@@ -603,7 +638,7 @@ export default function requestCompressExtension(pi: ExtensionAPI): void {
 				`Usage: /request-compress [status | on | off | reload]`,
 			];
 
-			ctx.ui.notify(lines.join("\n"), "info");
+			await showStatusModal(ctx, "Request Compression", lines);
 		},
 	});
 }

@@ -364,9 +364,18 @@ const tempCwd = mkdtempSync(join(tmpdir(), "pi-image-pager-test-"));
 
 const mockCtx = {
 	cwd: tempCwd,
+	hasUI: true,
+	mode: "tui",
 	ui: {
 		notify(msg) {
 			lastNotification = msg;
+		},
+		custom(factory, options) {
+			assert.equal(options.overlay, true);
+			const component = factory({ terminal: { rows: 50 }, requestRender() {} }, { fg: (_c, s) => s }, {}, () => {});
+			currentWidgetKey = "image-pager-status";
+			currentWidgetLines = component.render(120);
+			return Promise.resolve();
 		},
 		setWidget(key, content) {
 			currentWidgetKey = key;
@@ -379,7 +388,7 @@ imagePager(mockPi);
 
 assert.ok(registeredHandlers.has("session_start"), "session_start hook must be registered");
 assert.ok(registeredHandlers.has("context"), "context hook must be registered");
-assert.ok(registeredHandlers.has("session_shutdown"), "session_shutdown hook must be registered");
+assert.ok(!registeredHandlers.has("session_shutdown"), "status dialogs must not leave a background timer");
 assert.ok(registeredCommands.has("image-pager"), "image-pager command must be registered");
 assert.ok(registeredCommands.has("image-paging"), "image-paging alias must be registered");
 
@@ -399,13 +408,13 @@ console.log("  ✓ Context hook triggers paging and updates telemetry.");
 // Test command handler: default empty args should execute status!
 const cmd = registeredCommands.get("image-pager");
 await cmd.handler("", mockCtx);
-assert.equal(currentWidgetKey, "image-pager-status", "Should display widget for status");
+assert.equal(currentWidgetKey, "image-pager-status", "Should display modal for status");
 assert.ok(currentWidgetLines && currentWidgetLines.length > 0);
 const widgetText = currentWidgetLines.join("\n");
-assert.ok(widgetText.includes("image-pager"), "Widget text should have header");
+assert.ok(widgetText.includes("Image Pager"), "Widget text should have header");
 assert.ok(widgetText.includes("图像统计"), "Widget text should have image stats");
 assert.ok(!widgetText.includes("Commands:"), "Widget text MUST NOT include verbose commands usage list!");
-console.log("  ✓ Empty arguments default to compact status widget without usage clutter.");
+console.log("  ✓ Empty arguments default to compact status modal without usage clutter.");
 
 await cmd.handler("strategy fifo", mockCtx);
 assert.ok(lastNotification.includes("FIFO"));

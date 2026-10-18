@@ -109,7 +109,7 @@ const fakeCtx = {
 	ui: fakeUi,
 	cwd: process.cwd(),
 	sessionManager: {
-		getEntries() {
+		getBranch() {
 			return appendedEntries;
 		},
 	},
@@ -708,7 +708,7 @@ const ctx2 = {
 	hasUI: true,
 	ui: fakeUi2,
 	cwd: process.cwd(),
-	sessionManager: { getEntries: () => [] },
+	sessionManager: { getBranch: () => [] },
 };
 
 rollingTools(fakePi2);
@@ -804,7 +804,7 @@ function makeReloadEnv() {
 		hasUI: true,
 		ui: fakeUi,
 		cwd: process.cwd(),
-		sessionManager: { getEntries: () => sharedEntries },
+		sessionManager: { getBranch: () => sharedEntries },
 	};
 	return { handlers, fakePi, ctx, getWidget: () => widgetFactory };
 }
@@ -952,7 +952,7 @@ const ctx3 = {
 	hasUI: true,
 	ui: fakeUi3,
 	cwd: process.cwd(),
-	sessionManager: { getEntries: () => [] },
+	sessionManager: { getBranch: () => [] },
 };
 rollingTools(fakePi4);
 for (const h of handlers3.get("session_start") || []) await h({ reason: "startup" }, ctx3);
@@ -999,7 +999,7 @@ const ctx11 = {
 	hasUI: true,
 	ui: fakeUi11,
 	cwd: process.cwd(),
-	sessionManager: { getEntries: () => appendedEntries11 },
+	sessionManager: { getBranch: () => appendedEntries11 },
 };
 
 rollingTools(fakePi11);
@@ -1142,7 +1142,7 @@ const ctx12 = {
 	hasUI: true,
 	ui: fakeUi12,
 	cwd: process.cwd(),
-	sessionManager: { getEntries: () => [] },
+	sessionManager: { getBranch: () => [] },
 };
 
 rollingTools(fakePi12);
@@ -1239,7 +1239,7 @@ const ctx13 = {
 	hasUI: true,
 	ui: fakeUi13,
 	cwd: process.cwd(),
-	sessionManager: { getEntries: () => [] },
+	sessionManager: { getBranch: () => [] },
 };
 
 rollingTools(fakePi13);
@@ -1468,7 +1468,7 @@ console.log("\n=== Test 15: Long Command & Path Auto-Wrapping (No Omission) ==="
 			setToolsExpanded() {},
 			requestRender() {},
 		},
-		sessionManager: { getEntries: () => [] },
+		sessionManager: { getBranch: () => [] },
 	};
 	const fakePi15 = {
 		on(e, h) {
@@ -1615,7 +1615,7 @@ console.log("\n=== Test 16: Interrupted / Terminated Tool Status Reconciliation 
 			requestRender() {},
 		},
 		sessionManager: {
-			getEntries: () => mockEntries16,
+			getBranch: () => mockEntries16,
 		},
 	};
 	const fakePi16 = {

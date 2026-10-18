@@ -290,7 +290,7 @@ export class TtsGatewayAdapter implements VoiceGateway {
 
 		try {
 			const data = await this.json("/api/tts/synthesize", options.signal, payload);
-			if (!isObject(data) || (typeof data.status === "string" && data.status !== "completed")) {
+			if (!isObject(data) || data.status !== "completed" || data.error || (data.code !== undefined && data.code !== 0)) {
 				const errMsg = isObject(data) && typeof data.error === "string" ? data.error : (isObject(data) && typeof data.status === "string" ? data.status : "合成播音失败");
 				throw new Error(errMsg);
 			}
@@ -557,7 +557,12 @@ export class VoiceRuntime {
 			this.toastTimer = undefined;
 			try { this.context?.ui?.setWidget?.("voice-toast", undefined); } catch {}
 		}
-		// No network cleanup behind the audio mutex, no global stop endpoint.
+		if (this.footerTimer) {
+			clearTimeout(this.footerTimer);
+			this.footerTimer = undefined;
+		}
+		// Local state is invalidated synchronously. The HTTP speak adapter still
+		// issues global playback stop on abort (deferred risk VOICE-001).
 		if (disable) this.tools();
 		this.footer();
 	}
@@ -791,9 +796,9 @@ export class VoiceRuntime {
 			speakerSupported: true, // Connected to running gateway CosyVoice
 		};
 
-		if (!ctx.hasUI || !ctx.ui?.custom) {
-			this.notify(
-				`Voice: ${info.enabled ? "ON" : "OFF"}\nLive: ${info.live ? "ON" : "OFF"}\nGateway: ${info.gatewayUrl}\nMode: ${info.deliveryMode}\nVoice: ${info.defaultVoiceId}\n发音: ${UNSUPPORTED_SPEAKER}\n快捷键: F2 / Alt+X`,
+		if (!ctx.hasUI || ctx.mode === "rpc" || !ctx.ui?.custom) {
+			ctx.ui?.notify?.(
+				`Voice: ${info.enabled ? "ON" : "OFF"}\nLive: ${info.live ? "ON" : "OFF"}\nGateway: ${info.gatewayUrl}\nMode: ${info.deliveryMode}\nVoice: ${info.defaultVoiceId}\n发音风险: 全局抢占/停播，未确认物理播放完成（VOICE-001）\n快捷键: F2 / Alt+X`,
 				"info",
 			);
 			return;

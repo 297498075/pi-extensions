@@ -410,12 +410,15 @@ export class TodoTreeStore {
 		subject: string;
 		description?: string;
 		status?: TodoStatus;
-	}>): TodoItem[] {
-		const created: TodoItem[] = [];
-		for (const t of tasks) {
-			const item = this.createTask(t);
-			created.push(item);
-		}
+	}>, replaceExisting = false): TodoItem[] {
+		// Validate and apply to an isolated tree. A failed batch must not mutate
+		// existing tasks, their parents, or the tree scheduled for auto-clearing.
+		const staged = new TodoTreeStore();
+		if (!replaceExisting) staged.loadSnapshot(structuredClone(this.getAllTasks()));
+		const created = tasks.map(task => staged.createTask(task));
+		this.tasks = staged.tasks;
+		if (replaceExisting) this.collapsedNodes.clear();
+		this.notify();
 		return created;
 	}
 
@@ -1847,7 +1850,7 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 	function persistSnapshot(): void {
 		try {
 			pi.appendEntry(SNAPSHOT_ENTRY_TYPE, {
-				tasks: store.getAllTasks(),
+				tasks: structuredClone(store.getAllTasks()),
 				enabled: config.enabled,
 			});
 		} catch (e) {
@@ -1874,39 +1877,35 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 	}
 
 	function restoreFromBranch(ctx: ExtensionContext): void {
+		// Navigation can lead to a branch that predates the first todo entry.
+		// Never retain the previous branch's state in that case.
+		config.enabled = loadConfig().enabled;
+		store.loadSnapshot([]);
 		try {
 			const branch = ctx.sessionManager.getBranch();
 			let restored = false;
-
+			let restoredEnabled = false;
 			for (let i = branch.length - 1; i >= 0; i--) {
 				const entry = branch[i];
 				if (entry.type === "custom" && entry.customType === SNAPSHOT_ENTRY_TYPE) {
 					const data = entry.data as any;
-					if (data && Array.isArray(data.tasks)) {
+					if (!restoredEnabled && typeof data?.enabled === "boolean") {
+						config.enabled = data.enabled;
+						restoredEnabled = true;
+					}
+					if (!restored && Array.isArray(data?.tasks)) {
 						store.loadSnapshot(data.tasks);
-						if (typeof data.enabled === "boolean") {
-							config.enabled = data.enabled;
-						}
 						restored = true;
-						break;
+					}
+				} else if (!restored && entry.type === "message" && entry.message.role === "toolResult" &&
+					(entry.message.toolName === "todo" || entry.message.toolName === "todos")) {
+					const details = entry.message.details as any;
+					if (Array.isArray(details?.tasks)) {
+						store.loadSnapshot(details.tasks);
+						restored = true;
 					}
 				}
-			}
-
-			if (!restored) {
-				for (let i = branch.length - 1; i >= 0; i--) {
-					const entry = branch[i];
-					if (entry.type === "message" && entry.message.role === "toolResult") {
-						if (entry.message.toolName === "todo" || entry.message.toolName === "todos") {
-							const details = entry.message.details as any;
-							if (details && Array.isArray(details.tasks)) {
-								store.loadSnapshot(details.tasks);
-								restored = true;
-								break;
-							}
-						}
-					}
-				}
+				if (restored && restoredEnabled) break;
 			}
 		} catch (e) {
 			console.error("[todo-tree] Failed to restore branch:", e);
@@ -1946,7 +1945,7 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 		const activeTools = pi.getActiveTools?.() ?? [];
 		const isToolActive = activeTools.includes("todo");
 
-		if (!ctx.hasUI || !ctx.ui?.custom) {
+		if (!ctx.hasUI || ctx.mode === "rpc" || !ctx.ui?.custom) {
 			const info = [
 				`Todo Tree Status:`,
 				`• State: ${config.enabled ? "ENABLED" : "DISABLED (default)"}`,
@@ -2003,7 +2002,7 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 
 	// Open Fullscreen / Centered Overlay Modal
 	function openModal(ctx: ExtensionContext): void {
-		if (!ctx.hasUI || !ctx.ui?.custom) return;
+		if (!ctx.hasUI || ctx.mode === "rpc" || !ctx.ui?.custom) return;
 		if (activeModal || isPromptingUser) return;
 
 		Promise.resolve(
@@ -2099,7 +2098,9 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 					subject: t.subject,
 					description: t.description,
 					status: t.status,
-					notes: t.notes,
+					createdAt: t.createdAt,
+					updatedAt: t.updatedAt,
+					notes: structuredClone(t.notes),
 					completed: t.status === "completed" || t.status === "cancelled",
 					done: t.status === "completed" || t.status === "cancelled",
 				}));
@@ -2144,13 +2145,10 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 
 							// Also ensure new batch has at least one top-level task (initiating a new plan)
 							const hasNewRoot = params.tasks.some((t) => !t.parentId);
-							if (allFinished && hasNewRoot) {
-								store.clear();
-								autoCleared = true;
-							}
+							if (allFinished && hasNewRoot) autoCleared = true;
 						}
 
-						const created = store.batchCreate(params.tasks);
+						const created = store.batchCreate(params.tasks, autoCleared);
 						summary = autoCleared
 							? `✓ Cleared previous finished tasks & started new tree with ${created.length} tasks`
 							: `✓ Batch created ${created.length} tasks`;
@@ -2208,6 +2206,7 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 				};
 			} catch (err: any) {
 				return {
+					isError: true,
 					content: [{ type: "text", text: `Error: ${err?.message || String(err)}` }],
 					details: {
 						action,
@@ -2232,6 +2231,7 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 		lastCtx = ctx;
 		restoreFromBranch(ctx);
 		syncActiveTools(config.enabled);
+		syncWidget(ctx);
 		widgetComponent?.invalidate();
 	});
 

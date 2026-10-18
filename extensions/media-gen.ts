@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, extname, isAbsolute, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
+import { pathToFileURL } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 
@@ -20,11 +21,13 @@ export const GenerateImageSchema = Type.Object({
 	),
 	width: Type.Optional(
 		Type.Number({
+			minimum: 1,
 			description: "Desired image width in pixels. If omitted, uses defaultWidth from media-gen.json or 1024.",
 		}),
 	),
 	height: Type.Optional(
 		Type.Number({
+			minimum: 1,
 			description: "Desired image height in pixels. If omitted, uses defaultHeight from media-gen.json or 1024.",
 		}),
 	),
@@ -41,11 +44,13 @@ export const GenerateVideoSchema = Type.Object({
 	),
 	width: Type.Optional(
 		Type.Number({
+			minimum: 1,
 			description: "Desired video width in pixels. If omitted, uses defaultWidth from media-gen.json or 1280.",
 		}),
 	),
 	height: Type.Optional(
 		Type.Number({
+			minimum: 1,
 			description: "Desired video height in pixels. If omitted, uses defaultHeight from media-gen.json or 720.",
 		}),
 	),
@@ -158,11 +163,25 @@ export interface ResolvedMediaGenContext {
  * 1. Current workspace: ./media-gen.json or ./.pi/media-gen.json
  * 2. User agent home: ~/.pi/agent/media-gen.json
  */
+function agentDir(): string {
+	return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+}
+
+function resolveEnvValue(value: string): string {
+	if (value.startsWith("!")) throw new Error("media-gen does not execute credential commands; use a literal or an environment reference.");
+	return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (_match, braced, plain) => {
+		const name = braced || plain;
+		const resolved = process.env[name];
+		if (resolved === undefined) throw new Error(`Environment variable ${name} is not set.`);
+		return resolved;
+	});
+}
+
 export function findConfigFile(cwd: string = process.cwd()): string | null {
 	const candidates = [
 		resolve(cwd, "media-gen.json"),
 		resolve(cwd, ".pi", "media-gen.json"),
-		join(homedir(), ".pi", "agent", "media-gen.json"),
+		join(agentDir(), "media-gen.json"),
 	];
 
 	for (const candidate of candidates) {
@@ -196,7 +215,7 @@ export function loadMediaGenConfigFile(cwd: string = process.cwd()): { config: M
  * Reads provider details (baseUrl, apiKey) directly from ~/.pi/agent/models.json
  */
 export function resolveProviderFromModelsJson(providerName: string): ResolvedProviderInfo {
-	const modelsPath = join(homedir(), ".pi", "agent", "models.json");
+	const modelsPath = join(agentDir(), "models.json");
 	if (!existsSync(modelsPath)) {
 		throw new Error(
 			`models.json not found at ${modelsPath}. Cannot resolve provider "${providerName}".`,
@@ -221,19 +240,13 @@ export function resolveProviderFromModelsJson(providerName: string): ResolvedPro
 		);
 	}
 
-	let baseUrl = (provider.baseUrl || "").trim().replace(/\/+$/, "");
-	let apiKey = String(provider.apiKey || "");
+	const baseUrl = resolveEnvValue(String(provider.baseUrl || "")).trim().replace(/\/+$/, "");
+	const apiKey = resolveEnvValue(String(provider.apiKey || ""));
 
 	// Extract all configured model ids from provider
 	const availableModels: string[] = Array.isArray(provider.models)
 		? provider.models.map((m: any) => String(m.id || m.name || "")).filter(Boolean)
 		: [];
-
-	// Expand $ENV_VAR if defined in models.json
-	if (apiKey.startsWith("$")) {
-		const envVar = apiKey.slice(1);
-		apiKey = process.env[envVar] || "";
-	}
 
 	if (!baseUrl) {
 		throw new Error(`Provider "${providerName}" in models.json is missing a valid baseUrl.`);
@@ -253,7 +266,7 @@ export function resolveProviderFromModelsJson(providerName: string): ResolvedPro
 export function getMediaGenContext(cwd: string = process.cwd()): ResolvedMediaGenContext {
 	const loaded = loadMediaGenConfigFile(cwd);
 	if (!loaded) {
-		const expectedPath = join(homedir(), ".pi", "agent", "media-gen.json");
+		const expectedPath = join(agentDir(), "media-gen.json");
 		throw new Error(
 			`Configuration file not found. Please create standalone configuration at: ${expectedPath}`,
 		);
@@ -261,7 +274,7 @@ export function getMediaGenContext(cwd: string = process.cwd()): ResolvedMediaGe
 
 	const { config, filePath } = loaded;
 
-	if (!config.provider || typeof config.provider !== "string") {
+	if (!config || typeof config.provider !== "string" || !config.provider.trim()) {
 		throw new Error(
 			`Invalid media-gen.json at ${filePath}: "provider" field is required and must reference a provider in models.json.`,
 		);
@@ -312,25 +325,24 @@ export function getMediaOutputPath(type: "images" | "videos", extension: string,
  * Formats a local path into a valid Markdown link URL compatible with Windows and Unix.
  */
 export function formatLocalFileUrl(filePath: string): string {
-	const normalized = filePath.replace(/\\/g, "/");
-	if (/^[a-zA-Z]:/.test(normalized)) {
-		return `file:///${normalized}`;
-	}
-	return `file://${normalized}`;
+	return pathToFileURL(filePath).href;
 }
 
 /**
  * Resolves local file paths or downloads remote image URLs to buffer.
  */
-async function loadInputImage(input: string, cwd: string = process.cwd()): Promise<{ buffer: Buffer; mimeType: string }> {
+async function loadInputImage(input: string, cwd: string = process.cwd(), signal?: AbortSignal): Promise<{ buffer: Buffer; mimeType: string }> {
+	signal?.throwIfAborted();
 	if (input.startsWith("http://") || input.startsWith("https://")) {
-		const res = await fetch(input);
+		const res = await fetch(input, { signal });
 		if (!res.ok) {
 			throw new Error(`Failed to download input image from URL (${res.status} ${res.statusText})`);
 		}
 		const arrayBuf = await res.arrayBuffer();
 		const mime = res.headers.get("content-type") || "image/png";
-		return { buffer: Buffer.from(arrayBuf), mimeType: mime };
+		const buffer = Buffer.from(arrayBuf);
+		imageExtension(buffer);
+		return { buffer, mimeType: mime };
 	}
 
 	const resolvedPath = isAbsolute(input) ? input : resolve(cwd, input);
@@ -345,7 +357,25 @@ async function loadInputImage(input: string, cwd: string = process.cwd()): Promi
 	else if (ext === ".webp") mimeType = "image/webp";
 	else if (ext === ".gif") mimeType = "image/gif";
 
+	imageExtension(buffer);
 	return { buffer, mimeType };
+}
+
+/** Reject error pages/empty payloads, and keep file extensions consistent with the bytes. */
+function imageExtension(buffer: Buffer): string {
+	if (buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return "png";
+	if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "jpg";
+	if (/^GIF8[79]a$/.test(buffer.subarray(0, 6).toString("ascii"))) return "gif";
+	if (buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP") return "webp";
+	throw new Error("API returned an empty or unsupported image payload (expected PNG/JPEG/GIF/WebP).");
+}
+
+async function downloadImage(url: string, signal?: AbortSignal): Promise<Buffer> {
+	const response = await fetch(url, { signal });
+	if (!response.ok) throw new Error(`Image download returned HTTP ${response.status}`);
+	const buffer = Buffer.from(await response.arrayBuffer());
+	imageExtension(buffer);
+	return buffer;
 }
 
 // ============================================================================
@@ -365,7 +395,10 @@ export async function executeImageGeneration(
 	mediaConfig: MediaToolConfig,
 	provider: ResolvedProviderInfo,
 	cwd: string = process.cwd(),
+	signal?: AbortSignal,
 ): Promise<ImageExecutionResult> {
+	signal = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(300_000)]);
+	signal.throwIfAborted();
 	if (!mediaConfig.primaryModel || mediaConfig.primaryModel.trim().length === 0) {
 		throw new Error(`image.primaryModel is not configured in media-gen.json.`);
 	}
@@ -396,9 +429,12 @@ export async function executeImageGeneration(
 				dimensions: dims,
 				isEdit,
 				cwd,
+				signal,
 			});
 
-			const outPath = getMediaOutputPath("images", "png", mediaConfig.outputDir, cwd);
+			signal.throwIfAborted();
+			const extension = imageExtension(imageBuffer);
+			const outPath = getMediaOutputPath("images", extension, mediaConfig.outputDir, cwd);
 			writeFileSync(outPath, imageBuffer);
 
 			return {
@@ -409,6 +445,7 @@ export async function executeImageGeneration(
 				fileSize: imageBuffer.length,
 			};
 		} catch (err: any) {
+			signal.throwIfAborted();
 			attemptErrors.push({ model, error: err?.message || String(err) });
 			// Waterfall fallback: automatically advance to next model in sequence
 		}
@@ -426,12 +463,13 @@ async function callImageApi(options: {
 	dimensions: ResolvedDimensions;
 	isEdit: boolean;
 	cwd: string;
+	signal?: AbortSignal;
 }): Promise<Buffer> {
-	const { provider, model, prompt, imageInput, dimensions, isEdit, cwd } = options;
+	const { provider, model, prompt, imageInput, dimensions, isEdit, cwd, signal } = options;
 
 	// Branch 1: Image editing / Image-to-Image
 	if (isEdit && imageInput) {
-		const { buffer, mimeType } = await loadInputImage(imageInput, cwd);
+		const { buffer, mimeType } = await loadInputImage(imageInput, cwd, signal);
 
 		// Try OpenAI standard /images/edits endpoint
 		const formData = new FormData();
@@ -444,6 +482,7 @@ async function callImageApi(options: {
 
 		const editUrl = `${provider.baseUrl}/images/edits`;
 		const response = await fetch(editUrl, {
+			signal,
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${provider.apiKey}`,
@@ -456,16 +495,14 @@ async function callImageApi(options: {
 			const b64 = data?.data?.[0]?.b64_json;
 			if (b64) return Buffer.from(b64, "base64");
 			const url = data?.data?.[0]?.url;
-			if (url) {
-				const imgRes = await fetch(url);
-				return Buffer.from(await imgRes.arrayBuffer());
-			}
+			if (url) return downloadImage(url, signal);
 		}
 
 		// Fallback: Multimodal chat generation
 		const chatUrl = `${provider.baseUrl}/chat/completions`;
 		const base64DataUri = `data:${mimeType};base64,${buffer.toString("base64")}`;
 		const chatRes = await fetch(chatUrl, {
+			signal,
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${provider.apiKey}`,
@@ -488,7 +525,7 @@ async function callImageApi(options: {
 		if (chatRes.ok) {
 			const chatData = (await chatRes.json()) as any;
 			const msg = chatData?.choices?.[0]?.message;
-			const extracted = await extractImageFromChatMessage(msg);
+			const extracted = await extractImageFromChatMessage(msg, signal);
 			if (extracted) {
 				return extracted;
 			}
@@ -505,6 +542,7 @@ async function callImageApi(options: {
 	// Branch 2: Text-to-Image via /images/generations
 	const genUrl = `${provider.baseUrl}/images/generations`;
 	const res = await fetch(genUrl, {
+		signal,
 		method: "POST",
 		headers: {
 			Authorization: `Bearer ${provider.apiKey}`,
@@ -524,15 +562,13 @@ async function callImageApi(options: {
 		const b64 = data?.data?.[0]?.b64_json;
 		if (b64) return Buffer.from(b64, "base64");
 		const url = data?.data?.[0]?.url;
-		if (url) {
-			const imgRes = await fetch(url);
-			return Buffer.from(await imgRes.arrayBuffer());
-		}
+		if (url) return downloadImage(url, signal);
 	}
 
 	// Fallback: Multimodal chat/completions (for Gemini, Claude, Qwen, or proxy aggregators)
 	const chatUrl = `${provider.baseUrl}/chat/completions`;
 	const chatRes = await fetch(chatUrl, {
+		signal,
 		method: "POST",
 		headers: {
 			Authorization: `Bearer ${provider.apiKey}`,
@@ -547,7 +583,7 @@ async function callImageApi(options: {
 	if (chatRes.ok) {
 		const chatData = (await chatRes.json()) as any;
 		const msg = chatData?.choices?.[0]?.message;
-		const extracted = await extractImageFromChatMessage(msg);
+		const extracted = await extractImageFromChatMessage(msg, signal);
 		if (extracted) {
 			return extracted;
 		}
@@ -564,18 +600,17 @@ async function callImageApi(options: {
 /**
  * Resolves a direct image URL or base64 data URI into a Buffer.
  */
-export async function resolveUrlOrDataUriToBuffer(urlOrDataUri: string): Promise<Buffer | null> {
+export async function resolveUrlOrDataUriToBuffer(urlOrDataUri: string, signal?: AbortSignal): Promise<Buffer | null> {
+	signal?.throwIfAborted();
 	if (!urlOrDataUri || typeof urlOrDataUri !== "string") return null;
 	const match = urlOrDataUri.match(/^data:image\/[a-zA-Z0-9+.-]+;base64,(.+)$/);
 	if (match) {
-		return Buffer.from(match[1], "base64");
+		const buffer = Buffer.from(match[1], "base64");
+		imageExtension(buffer);
+		return buffer;
 	}
 	if (urlOrDataUri.startsWith("http://") || urlOrDataUri.startsWith("https://")) {
-		const res = await fetch(urlOrDataUri);
-		if (res.ok) {
-			const arr = await res.arrayBuffer();
-			return Buffer.from(arr);
-		}
+		return downloadImage(urlOrDataUri, signal);
 	}
 	return null;
 }
@@ -584,7 +619,7 @@ export async function resolveUrlOrDataUriToBuffer(urlOrDataUri: string): Promise
  * Extracts image buffer from various OpenAI-compatible /chat/completions multimodal responses
  * (such as Gemini, Claude, Qwen, or proxy aggregators that return images in message.images or message.content).
  */
-export async function extractImageFromChatMessage(msg: any): Promise<Buffer | null> {
+export async function extractImageFromChatMessage(msg: any, signal?: AbortSignal): Promise<Buffer | null> {
 	if (!msg) return null;
 
 	// Format 1: Direct images field (e.g., OneAPI/NewAPI/yqdcc OpenAI-compatible Gemini or Claude image format)
@@ -592,7 +627,7 @@ export async function extractImageFromChatMessage(msg: any): Promise<Buffer | nu
 		for (const imgItem of msg.images) {
 			const rawUrl = typeof imgItem === "string" ? imgItem : imgItem?.image_url?.url || imgItem?.url || "";
 			if (rawUrl) {
-				const buf = await resolveUrlOrDataUriToBuffer(rawUrl);
+				const buf = await resolveUrlOrDataUriToBuffer(rawUrl, signal);
 				if (buf) return buf;
 			}
 		}
@@ -603,11 +638,11 @@ export async function extractImageFromChatMessage(msg: any): Promise<Buffer | nu
 		for (const part of msg.content) {
 			const rawUrl = part?.image_url?.url || part?.url;
 			if (rawUrl) {
-				const buf = await resolveUrlOrDataUriToBuffer(rawUrl);
+				const buf = await resolveUrlOrDataUriToBuffer(rawUrl, signal);
 				if (buf) return buf;
 			}
 			if (typeof part?.text === "string") {
-				const buf = await extractImageFromString(part.text);
+				const buf = await extractImageFromString(part.text, signal);
 				if (buf) return buf;
 			}
 		}
@@ -615,32 +650,32 @@ export async function extractImageFromChatMessage(msg: any): Promise<Buffer | nu
 
 	// Format 3: String message.content
 	if (typeof msg.content === "string") {
-		return await extractImageFromString(msg.content);
+		return await extractImageFromString(msg.content, signal);
 	}
 
 	return null;
 }
 
-async function extractImageFromString(content: string): Promise<Buffer | null> {
+async function extractImageFromString(content: string, signal?: AbortSignal): Promise<Buffer | null> {
 	if (!content) return null;
 
 	// Markdown image syntax: ![...](url or data URI)
 	const mdMatch = content.match(/!\[.*?\]\((https?:\/\/[^\s)]+|data:image\/[a-zA-Z0-9+.-]+;base64,[A-Za-z0-9+/=]+)\)/);
 	if (mdMatch?.[1]) {
-		const buf = await resolveUrlOrDataUriToBuffer(mdMatch[1]);
+		const buf = await resolveUrlOrDataUriToBuffer(mdMatch[1], signal);
 		if (buf) return buf;
 	}
 
 	// Direct base64 data URI in text
 	const b64Match = content.match(/data:image\/[a-zA-Z0-9+.-]+;base64,([A-Za-z0-9+/=]+)/);
 	if (b64Match?.[1]) {
-		return Buffer.from(b64Match[1], "base64");
+		return resolveUrlOrDataUriToBuffer(b64Match[0], signal);
 	}
 
 	// Standalone image URL
-	const urlMatch = content.match(/(https?:\/\/[^\s)]+\.(?:png|jpe?g|webp|gif))/i);
+	const urlMatch = content.match(/(https?:\/\/[^\s)]+\.(?:png|jpe?g|webp|gif)(?:\?[^\s)]*)?)/i);
 	if (urlMatch?.[1]) {
-		const buf = await resolveUrlOrDataUriToBuffer(urlMatch[1]);
+		const buf = await resolveUrlOrDataUriToBuffer(urlMatch[1], signal);
 		if (buf) return buf;
 	}
 
@@ -662,7 +697,10 @@ export async function executeVideoGeneration(
 	mediaConfig: MediaToolConfig,
 	provider: ResolvedProviderInfo,
 	cwd: string = process.cwd(),
+	signal?: AbortSignal,
 ): Promise<VideoExecutionResult> {
+	signal = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(300_000)]);
+	signal.throwIfAborted();
 	if (!mediaConfig.primaryModel || mediaConfig.primaryModel.trim().length === 0) {
 		throw new Error(`video.primaryModel is not configured in media-gen.json.`);
 	}
@@ -688,17 +726,21 @@ export async function executeVideoGeneration(
 				imageInput: params.image,
 				dimensions: dims,
 				cwd,
+				signal,
 			});
 
+			signal.throwIfAborted();
 			const outPath = getMediaOutputPath("videos", "mp4", mediaConfig.outputDir, cwd);
 			if (Buffer.isBuffer(videoUrlOrBuffer)) {
 				writeFileSync(outPath, videoUrlOrBuffer);
 			} else {
-				const dlRes = await fetch(videoUrlOrBuffer);
+				const dlRes = await fetch(videoUrlOrBuffer, { signal });
 				if (!dlRes.ok) {
 					throw new Error(`Failed to download video from ${videoUrlOrBuffer}: ${dlRes.status}`);
 				}
-				writeFileSync(outPath, Buffer.from(await dlRes.arrayBuffer()));
+				const buffer = Buffer.from(await dlRes.arrayBuffer());
+				signal.throwIfAborted();
+				writeFileSync(outPath, buffer);
 			}
 
 			return {
@@ -707,6 +749,7 @@ export async function executeVideoGeneration(
 				dimensions: dims,
 			};
 		} catch (err: any) {
+			signal.throwIfAborted();
 			attemptErrors.push({ model, error: err?.message || String(err) });
 		}
 	}
@@ -722,12 +765,19 @@ async function callVideoApi(options: {
 	imageInput?: string;
 	dimensions: ResolvedDimensions;
 	cwd: string;
+	signal?: AbortSignal;
 }): Promise<string | Buffer> {
-	const { provider, model, prompt, imageInput, dimensions } = options;
+	const { provider, model, prompt, imageInput, dimensions, cwd, signal } = options;
+	let imageUrl = imageInput;
+	if (imageInput && !/^https?:\/\//i.test(imageInput)) {
+		const { buffer, mimeType } = await loadInputImage(imageInput, cwd, signal);
+		imageUrl = `data:${mimeType};base64,${buffer.toString("base64")}`;
+	}
 
 	// Standard video dispatch endpoint on CPA / Gateway
 	const endpoint = `${provider.baseUrl}/videos/generations`;
 	const res = await fetch(endpoint, {
+		signal,
 		method: "POST",
 		headers: {
 			Authorization: `Bearer ${provider.apiKey}`,
@@ -736,7 +786,7 @@ async function callVideoApi(options: {
 		body: JSON.stringify({
 			model,
 			prompt,
-			image_url: imageInput,
+			image_url: imageUrl,
 			aspect_ratio: dimensions.aspectRatio,
 			width: dimensions.alignedWidth,
 			height: dimensions.alignedHeight,
@@ -780,7 +830,7 @@ export function formatMissingModelReport(
 		lines.push("");
 	}
 
-	const globalConfigPath = join(homedir(), ".pi", "agent", "media-gen.json");
+	const globalConfigPath = join(agentDir(), "media-gen.json");
 	lines.push(`**Configuration Path**: \`${context?.configFilePath || globalConfigPath}\``);
 	lines.push("");
 
@@ -870,18 +920,20 @@ export default function mediaGenExtension(pi: ExtensionAPI): void {
 			if (!typedParams.prompt || typedParams.prompt.trim().length === 0) {
 				return {
 					content: [{ type: "text", text: "Error: Prompt cannot be empty." }],
+					isError: true,
 					details: { error: "Empty prompt" },
 				};
 			}
 
 			let context: ResolvedMediaGenContext | null = null;
 			try {
-				context = getMediaGenContext();
+				context = getMediaGenContext(ctx.cwd);
 			} catch (err: any) {
 				const report = formatMissingModelReport("image", null, err?.message || String(err));
 				ctx.ui?.notify?.("media-gen: Configuration missing or invalid", "warning");
 				return {
 					content: [{ type: "text", text: report }],
+					isError: true,
 					details: { error: err?.message || String(err) },
 				};
 			}
@@ -895,12 +947,13 @@ export default function mediaGenExtension(pi: ExtensionAPI): void {
 				ctx.ui?.notify?.("media-gen: image.primaryModel not configured", "warning");
 				return {
 					content: [{ type: "text", text: report }],
+					isError: true,
 					details: { error: "Missing image.primaryModel" },
 				};
 			}
 
 			try {
-				const result = await executeImageGeneration(typedParams, context.image, context.provider);
+				const result = await executeImageGeneration(typedParams, context.image, context.provider, ctx.cwd, _signal);
 				const fileUrl = formatLocalFileUrl(result.filePath);
 				const filename = basename(result.filePath);
 
@@ -932,6 +985,7 @@ export default function mediaGenExtension(pi: ExtensionAPI): void {
 							text: `Image generation failed: ${err?.message || String(err)}`,
 						},
 					],
+					isError: true,
 					details: { error: err?.message || String(err) },
 				};
 			}
@@ -953,18 +1007,20 @@ export default function mediaGenExtension(pi: ExtensionAPI): void {
 			if (!typedParams.prompt || typedParams.prompt.trim().length === 0) {
 				return {
 					content: [{ type: "text", text: "Error: Video prompt cannot be empty." }],
+					isError: true,
 					details: { error: "Empty prompt" },
 				};
 			}
 
 			let context: ResolvedMediaGenContext | null = null;
 			try {
-				context = getMediaGenContext();
+				context = getMediaGenContext(ctx.cwd);
 			} catch (err: any) {
 				const report = formatMissingModelReport("video", null, err?.message || String(err));
 				ctx.ui?.notify?.("media-gen: Configuration missing or invalid", "warning");
 				return {
 					content: [{ type: "text", text: report }],
+					isError: true,
 					details: { error: err?.message || String(err) },
 				};
 			}
@@ -978,12 +1034,13 @@ export default function mediaGenExtension(pi: ExtensionAPI): void {
 				ctx.ui?.notify?.("media-gen: video.primaryModel not configured", "warning");
 				return {
 					content: [{ type: "text", text: report }],
+					isError: true,
 					details: { error: "Missing video.primaryModel" },
 				};
 			}
 
 			try {
-				const result = await executeVideoGeneration(typedParams, context.video, context.provider);
+				const result = await executeVideoGeneration(typedParams, context.video, context.provider, ctx.cwd, _signal);
 				const fileUrl = formatLocalFileUrl(result.filePath);
 
 				return {
@@ -1014,6 +1071,7 @@ export default function mediaGenExtension(pi: ExtensionAPI): void {
 							text: `Video generation failed: ${err?.message || String(err)}`,
 						},
 					],
+					isError: true,
 					details: { error: err?.message || String(err) },
 				};
 			}

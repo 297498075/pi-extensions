@@ -1,8 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import { showStatusModal } from "./lib/status-modal.ts";
 
 export type AgentMessage = ContextEvent["messages"][number];
 
@@ -271,7 +273,14 @@ export function saveConfig(config: ImagePagerConfig, targetPath?: string): boole
  * 规范化文件物理路径（统一路径展示格式）
  */
 export function normalizeDisplayPath(rawPath: string, cwd?: string): string {
-	let p = rawPath.trim();
+	let p = rawPath.trim().replace(/^@/, "").replace(/[\u00a0\u2000-\u200a\u202f\u205f\u3000]/g, " ");
+	if (p.startsWith("file://")) p = fileURLToPath(p);
+	if (process.platform === "win32") {
+		const drive = p.match(/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i);
+		if (drive) p = `${drive[1].toUpperCase()}:/${drive[2] || ""}`;
+	}
+	if (p === "~") p = homedir();
+	else if (/^~[/\\]/.test(p)) p = join(homedir(), p.slice(2));
 	if (cwd && !isAbsolute(p)) {
 		p = resolve(cwd, p);
 	}
@@ -658,7 +667,7 @@ export function pageOutContextImages(
  * 命令行自动补全配置项
  */
 export const SUBCOMMAND_COMPLETIONS: AutocompleteItem[] = [
-	{ value: "status", label: "status", description: "查看当前换页状态与节省统计 (显示 10 秒)" },
+	{ value: "status", label: "status", description: "查看当前换页状态与节省统计（模态窗口）" },
 	{ value: "on", label: "on", description: "开启智能图片换页" },
 	{ value: "off", label: "off", description: "关闭智能图片换页" },
 	{ value: "strategy turn-boundary", label: "strategy turn-boundary", description: "Cache-Friendly 模式 (保护前缀缓存)" },
@@ -721,35 +730,6 @@ export function getPagerArgumentCompletions(argumentPrefix: string): Autocomplet
  */
 export default function (pi: ExtensionAPI) {
 	let currentConfig: ImagePagerConfig = loadConfig();
-	let statusWidgetTimer: NodeJS.Timeout | undefined;
-
-	// 显示状态卡片（10秒后自动消失，绝不长期占着屏幕）
-	const showStatusWidget = (lines: string[], ctx: ExtensionContext) => {
-		if (statusWidgetTimer) {
-			clearTimeout(statusWidgetTimer);
-			statusWidgetTimer = undefined;
-		}
-
-		if (ctx.ui?.setWidget) {
-			ctx.ui.setWidget("image-pager-status", lines, { placement: "aboveEditor" });
-			statusWidgetTimer = setTimeout(() => {
-				try {
-					ctx.ui?.setWidget?.("image-pager-status", undefined);
-				} catch {}
-				statusWidgetTimer = undefined;
-			}, 10000);
-		} else {
-			ctx.ui?.notify?.(lines.join("\n"), "info");
-		}
-	};
-
-	// 监听会话关闭，清理定时器
-	pi.on("session_shutdown", async () => {
-		if (statusWidgetTimer) {
-			clearTimeout(statusWidgetTimer);
-			statusWidgetTimer = undefined;
-		}
-	});
 
 	// 监听会话启动
 	pi.on("session_start", async (_event, ctx) => {
@@ -885,7 +865,7 @@ export default function (pi: ExtensionAPI) {
 						? "turn-boundary (Cache-Friendly 不可变前缀)"
 						: "fifo (数量滑动窗口)";
 
-				// 仅展示核心状态，不附带任何多余用法说明；卡片显示 10 秒后自动消失
+				// Read-only status stays in a modal instead of a muted notification or timed widget.
 				const lines = [
 					`[image-pager] 状态: ${statusText} · 策略: ${stratText} · 活跃保留: ${currentConfig.keepRecentImages} 张`,
 					`• 图像统计: 发现 ${stats.totalImagesSeen} 张 · 已换出 ${stats.pagedOutImagesCount} 张 · 活跃常驻 ${stats.hotImagesRetained} 张`,
@@ -898,7 +878,7 @@ export default function (pi: ExtensionAPI) {
 					lines.push(`• 最近换出: ${latest.fileName} (${formatBytes(latest.bytes)}) -> ${shortPath}`);
 				}
 
-				showStatusWidget(lines, ctx);
+				await showStatusModal(ctx, "Image Pager", lines);
 				break;
 			}
 		}

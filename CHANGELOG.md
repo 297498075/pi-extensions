@@ -4,6 +4,16 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- fix(review): preserve assistant reasoning/signatures while hiding only the rendered view; restore global/UI hooks on extension shutdown.
+- fix(state): deep-copy todo snapshots, clear missing branch state, apply batch replacement atomically, and restore rolling history from the active branch.
+- fix(todo-loop): continue from the post-retry `agent_before_settle` boundary using persisted context messages; honor UI clear/completed/disabled state and existing follow-up budgets.
+- fix(network): limit compression to known API hosts or explicit opt-ins; validate JSON and tear down fetch hooks without overwriting other wrappers.
+- fix(media-gen): honor session cwd/agent directory and environment interpolation; propagate cancellation with a five-minute total deadline, validate image downloads, encode local video references, and mark tool errors correctly.
+- fix(ui): width-safe cancellable questionnaires without JSON/RPC terminal bytes; shared modal status for rolling-tools, request-compress and image-pager.
+- fix(timer): chain bounded timeouts so delays over 24.9 days cannot execute immediately.
+- fix(voice): reject empty/error synthesis responses and clear UI timers; defer gateway isolation/physical completion redesign per user decision (see `docs/known-issues.md`).
+- test: isolate media tests from personal credentials; add real SessionManager/boundary, cross-extension hook, UI, cancellation and long-timer regressions.
+
 - fix(media-gen): support multimodal `/chat/completions` fallback for image generation and editing (Gemini, Claude, Qwen, OneAPI/NewAPI proxies).
   - Proxy services and native endpoints often reject models like `gemini-3.1-flash-image` with HTTP 400 on `/v1/images/generations`.
   - Added seamless fallback to `/v1/chat/completions`, supporting `message.images` (OpenAI-compatible image objects or data URIs), multimodal `message.content` parts (`image_url`), markdown image links (`![...](...)`), and embedded base64 data URIs.

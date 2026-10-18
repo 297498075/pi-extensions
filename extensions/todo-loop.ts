@@ -23,7 +23,8 @@ function remainingTodos(value: unknown): number | undefined {
 			item.done !== true &&
 			item.completed !== true &&
 			item.status !== "done" &&
-			item.status !== "completed"
+			item.status !== "completed" &&
+			item.status !== "cancelled"
 		);
 	}).length;
 }
@@ -37,6 +38,12 @@ function latestTodoState(ctx: ExtensionContext): TodoState | undefined {
 			const details = isRecord(entry.message.details) ? entry.message.details : undefined;
 			const remaining = remainingTodos(details?.tasks ?? details?.todos);
 			if (remaining !== undefined) state = { remaining };
+		}
+
+		if (entry.type === "custom" && entry.customType === "todo-tree-state") {
+			const data = isRecord(entry.data) ? entry.data : undefined;
+			const remaining = remainingTodos(data?.tasks);
+			if (remaining !== undefined) state = { remaining: data?.enabled === false ? 0 : remaining };
 		}
 
 		if (entry.type === "custom" && entry.customType === "plan-mode") {
@@ -72,7 +79,8 @@ function userText(message: unknown): string | undefined {
 
 function followupCount(ctx: ExtensionContext): number {
 	return [...ctx.sessionManager.getBranch()].filter(
-		(entry) => entry.type === "message" && userText(entry.message) === CONTINUE_PROMPT,
+		(entry) => (entry.type === "message" && userText(entry.message) === CONTINUE_PROMPT) ||
+			(entry.type === "custom_message" && entry.customType === "todo-loop-followup"),
 	).length;
 }
 
@@ -111,16 +119,18 @@ export default function todoLoop(pi: ExtensionAPI): void {
 
 	let limitNotified = false;
 
-	pi.on("agent_end", (event, ctx) => {
-		// Pi will handle its own retry or compaction retry; wait for that first.
-		if ((event as typeof event & { willRetry?: boolean }).willRetry) return;
-		if (ctx.hasPendingMessages()) return;
+	pi.on("session_start", () => { limitNotified = false; });
+
+	// This actionable boundary runs only AFTER core retries, compaction and
+	// queued work. agent_end's extension event does not contain willRetry.
+	pi.on("agent_before_settle", (event, ctx) => {
+		if (event.outcome !== "completed" || ctx.hasPendingMessages()) return;
 
 		const state = latestTodoState(ctx);
 		if (!state || state.remaining === 0) return;
 
-		const lastAssistant = [...event.messages].reverse().find((message) => assistantText(message) !== undefined);
-		if (operationAborted(lastAssistant)) return;
+		const lastAssistant = [...event.context.contextMessages].reverse().find((message) => assistantText(message) !== undefined);
+		if (operationAborted(lastAssistant) || (lastAssistant?.role === "assistant" && lastAssistant.stopReason === "error")) return;
 		if (explicitlyCannotContinue(lastAssistant)) return;
 
 		const used = followupCount(ctx);
@@ -133,6 +143,17 @@ export default function todoLoop(pi: ExtensionAPI): void {
 			return;
 		}
 
-		pi.sendUserMessage(CONTINUE_PROMPT, { deliverAs: "followUp" });
+		// Commit the prompt at the boundary, rather than fire-and-forget an async
+		// input pipeline. Adding a context message makes an assistant-ended
+		// transcript continuable (canContinue is normally false before this).
+		return {
+			entries: [...event.entries, {
+				type: "custom_message" as const,
+				customType: "todo-loop-followup",
+				content: CONTINUE_PROMPT,
+				display: true,
+			}],
+			continue: true,
+		};
 	});
 }

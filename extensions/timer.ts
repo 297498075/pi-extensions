@@ -360,6 +360,11 @@ export class TimerManager {
 		rawTime?: string,
 		ctx?: ExtensionContext,
 	): TimerTask {
+		if (!Number.isFinite(seconds) || seconds <= 0 || !Number.isSafeInteger(Math.round(seconds) * 1000) ||
+			Math.round(seconds) * 1000 > 8_640_000_000_000_000 - Date.now()) {
+			throw new Error("定时时长无效或超出支持范围");
+		}
+		if (!prompt.trim()) throw new Error("提示词不能为空");
 		if (ctx) this.attach(ctx);
 
 		const id = `t-${this.nextId++}`;
@@ -377,13 +382,8 @@ export class TimerManager {
 			rawTime: rawTime || formatDuration(delaySeconds),
 		};
 
-		// 安排执行定时器
-		const timerHandle = setTimeout(() => {
-			this.triggerTask(id);
-		}, delaySeconds * 1000);
-
-		task.timerHandle = timerHandle;
 		this.tasks.set(id, task);
+		this.armTask(task);
 
 		// 1. 在正文聊天记录中追加持久化卡片
 		try {
@@ -409,6 +409,18 @@ export class TimerManager {
 		);
 
 		return task;
+	}
+
+	private armTask(task: TimerTask): void {
+		// Node clamps delays beyond 2^31-1 ms to 1 ms. Chain bounded waits
+		// and recheck the target clock before delivering any message.
+		const remaining = task.targetTime - Date.now();
+		task.timerHandle = setTimeout(() => {
+			task.timerHandle = undefined;
+			if (task.status !== "pending") return;
+			if (Date.now() < task.targetTime) this.armTask(task);
+			else this.triggerTask(task.id);
+		}, Math.max(1, Math.min(2_147_483_647, remaining)));
 	}
 
 	/**
@@ -704,7 +716,7 @@ export class TimerStatusModalComponent implements Component {
 // ==========================================
 
 export function openTimerStatusModal(ctx: ExtensionContext, manager: TimerManager): void {
-	if (!ctx.hasUI || !ctx.ui?.custom) {
+	if (!ctx.hasUI || ctx.mode === "rpc" || !ctx.ui?.custom) {
 		const pending = manager.getPendingTasks();
 		const info = [
 			`[定时任务状态]`,
@@ -867,18 +879,9 @@ export async function handleTimerCommand(
 		return;
 	}
 
-	// 3. 子命令: list
+	// list is also a read-only status query: use the same visible modal.
 	if (firstToken === "list") {
-		const pending = manager.getPendingTasks();
-		if (pending.length === 0) {
-			ctx.ui.notify("当前没有等待执行的定时任务", "info");
-			return;
-		}
-		const lines = pending.map((t) => {
-			const rem = Math.max(0, Math.ceil((t.targetTime - Date.now()) / 1000));
-			return `#${t.id}: 剩余 ${formatClockTime(rem)} (预定 ${formatDateTime(t.targetTime)}) - "${t.prompt.slice(0, 30)}"`;
-		});
-		ctx.ui.notify(`等待中定时任务 (${pending.length}个):\n${lines.join("\n")}`, "info");
+		openTimerStatusModal(ctx, manager);
 		return;
 	}
 
@@ -1081,6 +1084,7 @@ export default function timerExtension(pi: ExtensionAPI): void {
 				if (!parsed.success) {
 					return {
 						content: [{ type: "text" as const, text: `时间表达式解析失败: ${parsed.error}` }],
+						isError: true,
 						details: { error: parsed.error },
 					};
 				}
@@ -1097,6 +1101,7 @@ export default function timerExtension(pi: ExtensionAPI): void {
 			if (totalSeconds <= 0) {
 				return {
 					content: [{ type: "text" as const, text: "定时时间必须大于 0 秒" }],
+					isError: true,
 					details: { error: "Invalid duration" },
 				};
 			}

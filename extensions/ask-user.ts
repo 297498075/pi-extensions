@@ -4,6 +4,7 @@ import {
 	Key,
 	matchesKey,
 	visibleWidth,
+	truncateToWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
@@ -71,6 +72,10 @@ interface QuestionnaireResult {
 	cancelled: boolean;
 }
 
+function cancelledResult() {
+	return { content: [{ type: "text" as const, text: "User cancelled the questionnaire" }], details: { answers: [], cancelled: true } };
+}
+
 // ==========================================
 // 辅助函数
 // ==========================================
@@ -80,6 +85,7 @@ interface QuestionnaireResult {
  */
 function notifyPrompt(title: string, ctx: ExtensionContext): void {
 	try {
+		if (ctx.mode !== "tui") return;
 		// 1. 终端提示音
 		process.stdout.write("\x07");
 		// 2. OSC 9 终端原生弹窗通知 (Windows Terminal / WezTerm / iTerm2 原生支持)
@@ -120,10 +126,6 @@ Guidelines:
 				};
 			}
 
-			// 触发通知提醒
-			const firstQuestion = typedParams.questions[0].question;
-			notifyPrompt(firstQuestion, ctx);
-
 			// 非交互或无 UI 模式降级
 			if (!ctx.hasUI) {
 				return {
@@ -132,23 +134,56 @@ Guidelines:
 				};
 			}
 
+			if (_signal?.aborted) return cancelledResult();
+			notifyPrompt(typedParams.questions[0].question, ctx);
+
 			// RPC 模式 (如 VSCode 插件端 / Zed) 降级交互
 			if (ctx.mode === "rpc") {
 				const answers: QuestionAnswer[] = [];
 				for (const q of typedParams.questions) {
+					if (q.multiSelect) {
+						const selected = new Set<number>();
+						let customText: string | undefined;
+						const finish = "✓ Done selecting";
+						const custom = "✎ Type something (custom answer)...";
+						for (;;) {
+							const choices = q.options.map((option, index) =>
+								`${selected.has(index) ? "[x]" : "[ ]"} ${index + 1}. ${option.label}${option.description ? ` - ${option.description}` : ""}`);
+							const choice = await ctx.ui.select(q.question, [...choices, custom, finish], { signal: _signal });
+							if (choice === undefined || _signal?.aborted) return cancelledResult();
+							if (choice === finish) break;
+							if (choice === custom) {
+								const text = await ctx.ui.input("Enter your custom answer:", customText || "", { signal: _signal });
+								if (text === undefined || _signal?.aborted) return cancelledResult();
+								customText = text.trim() || undefined;
+							} else {
+								const index = choices.indexOf(choice);
+								if (index >= 0) {
+									if (selected.has(index)) selected.delete(index);
+									else selected.add(index);
+								}
+							}
+						}
+						answers.push({ question: q.question, header: q.header,
+							selected: [...q.options.filter((_option, index) => selected.has(index)).map(option => option.label), ...(customText ? [customText] : [])],
+							customText });
+						continue;
+					}
 					const optionLabels = q.options.map((o) => (o.description ? `${o.label} - ${o.description}` : o.label));
-					optionLabels.push("Type something (custom answer)...");
+					const customChoice = "Type something (custom answer)...";
+					optionLabels.push(customChoice);
 
-					const choice = await ctx.ui.select(q.question, optionLabels);
-					if (choice === undefined) {
+					const choice = await ctx.ui.select(q.question, optionLabels, { signal: _signal });
+					if (choice === undefined || _signal?.aborted) {
 						return {
 							content: [{ type: "text", text: "User cancelled the questionnaire" }],
 							details: { answers: [], cancelled: true },
 						};
 					}
 
-					if (choice.startsWith("Type something")) {
-						const customVal = await ctx.ui.input("Enter your custom answer:", "");
+					if (choice === customChoice) {
+						const customVal = await ctx.ui.input("Enter your custom answer:", "", { signal: _signal });
+						if (customVal === undefined || _signal?.aborted) return cancelledResult();
 						answers.push({
 							question: q.question,
 							header: q.header,
@@ -185,8 +220,13 @@ Guidelines:
 			const reviewTabIndex = totalQuestions;
 			const totalTabs = totalQuestions + 1;
 
+			let cancelDialog: (() => void) | undefined;
+			const onAbort = () => cancelDialog?.();
+			_signal?.addEventListener("abort", onAbort, { once: true });
 			const result = await ctx.ui.custom<QuestionnaireResult>(
 				(tui, theme, _kb, done) => {
+					cancelDialog = () => done({ answers: [], cancelled: true });
+					if (_signal?.aborted) cancelDialog();
 					let currentTab = 0;
 					let isMinimized = false;
 					let cachedLines: string[] | undefined;
@@ -502,7 +542,7 @@ Guidelines:
 					function render(width: number): string[] {
 						if (cachedLines) return cachedLines;
 
-						const renderWidth = Math.max(20, width);
+						const renderWidth = Math.max(2, width);
 						const lines: string[] = [];
 
 						// 1. 最小化呈现
@@ -672,14 +712,21 @@ Guidelines:
 					}
 
 					return {
-						render,
+						render(width: number) {
+							// Reflow every textual line, including question, labels and
+							// review answers. Never hand an overwide line to Pi's TUI.
+							cachedLines = undefined;
+							return render(width).flatMap(line => wrapTextWithAnsi(line, Math.max(1, width)))
+								.map(line => truncateToWidth(line, Math.max(1, width)));
+						},
+						dispose() { _signal?.removeEventListener("abort", onAbort); },
 						invalidate: () => {
 							cachedLines = undefined;
 						},
 						handleInput,
 					};
 				},
-			);
+			).finally(() => _signal?.removeEventListener("abort", onAbort));
 
 			if (!result || result.cancelled || result.answers.length === 0) {
 				return {
