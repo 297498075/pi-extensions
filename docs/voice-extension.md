@@ -48,11 +48,15 @@ pi --extension ./extensions/voice.ts
 | `/voice voices` | 显示缓存目录，无缓存时尝试获取 |
 | `/voice status` | 显示开关、配置及发音兼容性限制；不主动探测设备 |
 
+`/voice status` 使用共享的自适应模态窗：长 URL、音色 ID 和模式说明完整换行，窄屏/短屏可用 ↑/↓、PgUp/PgDn 或鼠标滚轮翻阅，Enter/Esc 或点击关闭；状态查询不主动访问网关。
+
 stop/off 不等待网络清理，使用 AbortSignal 中止 HTTP 请求和本地等待、清除 UI 定时器并作废迟到结果。**若当前为 speak，适配器仍发送全局停播请求**；旧请求迟到可能影响新任务/其他客户端。扩展的本地互斥不能代替网关端设备隔离。
 
 会话切换、fork、重载及退出均取消旧任务并关闭入口。新会话重新读取 `defaultEnabled`，Live 不继承。
 
 ## 工具契约
+
+真正失败的结果（`status: "error"` 或目录 `success: false`）同时设置 `isError: true`，让 Pi 与程序调用方识别失败。用户取消、无有效收音的 timeout 与失败分别保留结构化状态；刷新失败但旧缓存仍可用时返回成功并附 warning，不误标为失败。这些结果标记不改变 VOICE-001 的网关控制行为。
 
 ### `voice_listen`
 

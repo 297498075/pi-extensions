@@ -48,6 +48,8 @@ function latestTodoState(ctx: ExtensionContext): TodoState | undefined {
 
 		if (entry.type === "custom" && entry.customType === "plan-mode") {
 			const data = isRecord(entry.data) ? entry.data : undefined;
+			// An explicit stop/reset is authoritative too; do not resurrect an older plan.
+			if (data?.executing === false) { state = { remaining: 0 }; continue; }
 			if (data?.executing !== true) continue;
 			const remaining = remainingTodos(data.todos);
 			if (remaining !== undefined) state = { remaining };

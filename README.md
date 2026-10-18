@@ -52,7 +52,7 @@ pi --extension ./extensions/example.ts
 
 **已知风险（本次按用户决定暂不修复）**：`voice_speak` 当前仍向 TtsGateway 发送 `concurrency: "preempt"`，取消时调用全局停播；网关缺少任务级取消和扬声器物理播放完成确认，可能打断其他终端或在尚未播完时恢复收音。不要将其视为多客户端安全。Live 为分段输入，并非无缝音频流。扩展会访问配置的网关并写入 `~/.pi/agent/voice.json`，录音及云端 ASR 风险取决于后端配置。详见 [已知问题](docs/known-issues.md)。
 
-加载、操作、限制和测试详见 [`docs/voice-extension.md`](docs/voice-extension.md)。
+失败的语音工具结果会设置 `isError: true`；可用旧缓存的刷新 warning 与用户取消保持独立状态。`/voice status` 支持窄屏换行和滚动。加载、操作、限制和测试详见 [`docs/voice-extension.md`](docs/voice-extension.md)。
 
 ## Stream Read Retry
 
@@ -85,7 +85,7 @@ Keep agent-level retry enabled in `settings.json` (the default), and configure i
 
 `extensions/todo-loop.ts` continues the agent when the latest structured todo state still contains unfinished items. It requires Pi's `agent_before_settle` boundary API (verified with Pi 1.2/1.3). It reads `details.tasks` from `@juicesharp/rpiv-todo` and also accepts the `details.todos` format used by Pi's example todo extension. It also understands the `plan-mode` execution state used by Pi's example extension.
 
-After core retries, compaction, and queued work finish, the extension uses `agent_before_settle` to append a `todo-loop-followup` context message and request one continuation. It also reads `todo-tree-state`, so UI completion, `/todo clear`, and `/todo off` override stale tool state. It stops when all todos are complete, the final assistant text explicitly says it cannot continue, the operation was aborted by the user, or the follow-up limit is reached. The default limit is 20 automatic follow-ups; configure it with a CLI flag:
+After core retries, compaction, and queued work finish, the extension uses `agent_before_settle` to append a `todo-loop-followup` context message and request one continuation. It also reads `todo-tree-state`, so UI completion, `/todo clear`, and `/todo off` override stale tool state. An explicit `plan-mode` snapshot with `executing: false` clears the old execution state instead of reviving an abandoned plan. It stops when all todos are complete, the final assistant text explicitly says it cannot continue, the operation was aborted by the user, or the follow-up limit is reached. The default limit is 20 automatic follow-ups; configure it with a CLI flag:
 
 ```bash
 pi --todo-loop-max-followups 50
@@ -103,6 +103,7 @@ The extension has no network, file, command, or external state side effects. The
 - **All tools silenced by default**: Every tool (built-ins, `edit`, `write`, `codemode`, MCP proxies, SoL-Pi `recall`, Trellis `subagent`, and arbitrary third-party tools) is hidden from the transcript by default and rolled into the widget. Tune with `silencedTools` / `widgetTools` (supports `*` wildcards).
 - **Non-intrusive transcript**: Managed tools occupy 0 lines when collapsed, preventing terminal scroll floods. Press `Ctrl+O` to expand if full outputs are needed.
 - **History overlay dialog (`➕`)**: A persistent header row sits above the tool list and carries a `➕` button on its right edge. Clicking it opens a large bordered two-pane overlay dialog showing the full history on the left and the selected tool's complete content on the right — including `edit` diffs, `write` file bodies, full commands, and outputs. The overlay updates live while the agent is still running.
+- **Responsive history details**: ANSI/grapheme-aware wrapping runs in one pass. Detail layout is cached by selected item, content revision, width and theme invalidation; unchanged 100ms refreshes do not rewrap the entire output.
 - **View mode toggle button (`🔽` / `⏏️`)**: Positioned directly to the left of `➕`, this button toggles the widget between two display modes:
   1. **Running tasks only (`running` - `⏏️`)**: Active running tasks are merged directly into the header status line alongside a live elapsed timer (`(19ms)`, `(2.4s)`). The widget remains strictly 1-line high to eliminate any vertical height flicker.
   2. **Fixed recent rows (`fixed` - `🔽`)**: Displays the most recent `maxRecentTools` executions (default 3 rows, customizable via config). Running tasks in this list also display live ticking durations.
@@ -111,13 +112,16 @@ The extension has no network, file, command, or external state side effects. The
 - **Sticky history across `/reload`**: The widget, view mode, and its `➕` dialog keep working after `/reload`; history and view state are re-read from the current session's persisted entries because a reload constructs a fresh extension instance.
 - **Lazy loading with wheel scroll**: The overlay supports native mouse-wheel scrolling. Scrolling up past the top of the list lazily loads the next `lazyLoadStep` (default 10) older entries, so long histories stay responsive without loading everything at once.
 - **Persistent across turns and sessions**: The rolling block no longer resets on each new task. History is kept in memory across turns and persisted to the session via `pi.appendEntry()` (custom type `rolling-tools-history`), so it is restored on `reload`, `resume`, and `fork` when `persistAcrossSessions` is enabled.
+- **Bounded snapshots**: Stored input, command, output and detail previews are capped at 20,000 characters. Complete top-level inputs are recovered from the original tool-call entries in the active branch; nested calls without transcript entries keep an explicitly truncated preview. Original call arguments and result entries are not rewritten.
+- **Renderer reuse**: Call/result decorators unwrap `context.lastComponent` before invoking the native or third-party renderer, preserving component reuse. Header stripping follows on/off and unload changes even for existing rows.
 - **Universal tool & MCP support**: Uses dynamic in-place decoration on `ToolExecutionComponent`, supporting built-ins, MCP proxies (`mcp`, `mcp__*`), Rider MCP tools (`rider_execute_tool`), SoL-Pi tools, and arbitrary third-party tools with generic parameter heuristics.
-- **Unified tips handling**: Plugin tips (`ui.notify`) are suppressed from the transcript. `ui.setStatus` tips stay in the footer and are colorized, but are only auto-cleared when their rule sets `durationMs`; persistent keys (`persistentKeys`, default `["blackhole", "mcp"]`) pass through untouched so long-lived gauges such as pi-blackhole's footer bar and the MCP server status keep working. `error` / `warning` messages and any message containing a `notificationKeywords` word always pass through. Plugin headers such as SoL-Pi's `⚡ SoL-Pi · …` / `Money saved · …` are stripped from tool rows.
+- **Unified tips handling**: Plugin tips (`ui.notify`) are suppressed from the transcript. `ui.setStatus` tips stay in the footer and are colorized, but are only auto-cleared when their rule sets `durationMs`. Each key has an independent deadline; off, config reload and shutdown clean up transient effects without erasing persistent keys. Persistent keys (`persistentKeys`, default `["blackhole", "mcp"]`) pass through untouched so long-lived gauges such as pi-blackhole's footer bar and the MCP server status keep working. `error` / `warning` messages and any message containing a `notificationKeywords` word always pass through. Plugin headers such as SoL-Pi's `⚡ SoL-Pi · …` / `Money saved · …` are stripped from tool rows.
 - **Configuration file support**: Supports global configuration (`~/.pi/agent/extensions/rolling-tools/config.json`) and local project overrides (`./.pi/rolling-tools.json`).
 - **Active-call retention**: Genuine preparing/running calls are not evicted by newer completed history. Snapshots retain the recent history tail plus active calls; reload reconciles old orphan spinners against actual results.
 - **Fixed-dock rolling widget**: Shows the latest running/completed tools in a fixed dock above the editor with status (`⏳`/`✓`/`✗`), duration, and arguments summary.
 - **Click-to-expand details**: Click any tool item to toggle details (`▸` / `▾`) such as full paths, multiline commands, and execution outputs without mouse hover flickering. Click details to copy to clipboard, or `Ctrl+Left-click` on paths to open existing local files.
 - **Desktop action safety**: File paths are passed as literal data, never concatenated into `cmd`. Windows uses a fixed Windows PowerShell script with the path in an environment variable; macOS/Linux use `open`/`xdg-open` argv. Clipboard helpers are `clip.exe`/`pbcopy`/`xclip`. Missing programs, pipe errors, nonzero exits and five-second timeouts show local failure feedback instead of terminating Pi; success is shown only after the helper succeeds. Shutdown cancels in-flight helpers. Opening files still invokes their OS associations, so only open trusted files.
+- **File path metadata**: Display/copy/open paths follow Pi conventions, including `~`, `@`, file URLs, Unicode spaces and Windows shell drive paths. Old metadata is repaired in memory on restore when its original arguments are available.
 - **Strict display widths**: Fixed mode wraps complete tool names and command/path summaries; running/error/status/feedback rows are bounded by visible terminal columns, including Chinese, emoji, ANSI styles and narrow panes.
 - **Commands**:
   - `/rolling-tools`: Toggle widget and transcript silencing on/off.
@@ -357,11 +361,12 @@ pi --extension ./extensions/image-pager.ts
 
 `extensions/todo-tree.ts` 为复杂开发任务提供层次化任务拆解（Hierarchy / Parent-Child Subtasks）、主窗体极简状态条与全功能居中弹出窗口（Modal Overlay with Scrollbar）：
 
-- **分支与批次一致性**：快照深拷贝，空分支恢复为空；`batch_create` 整批验证成功后再提交，包括自动清理已完成旧计划，失败不留下半棵树。
+- **分支与批次一致性**：快照深拷贝，空分支恢复为空；`batch_create` 整批验证成功后再提交，包括自动清理全部已完成/取消的旧计划（也支持全部取消）；仍有未完成父项时不会清理，失败不留下半棵树。
 - **分层级任务模型与动态演进**：支持多层级树状结构（如 `#1` $\rightarrow$ `#1.1` $\rightarrow$ `#1.1.1`），支持任务随进度中途追加小项或放弃取消（`cancelled`），取消项自动从进度有效项剔除，绝不阻塞整体推进。
 - **主窗体聚焦（仅展示进行中小项）**：输入栏上方仅展示总体进度、字符进度条（`[████░░░░░]`）以及当前所有正在执行的叶子小项（带父级面包屑，如 `[数据层] > 编写测试`）；多并行任务全行展开，不限死组件高度。
 - **右侧固定交互按钮 `[📋 ]`**：主行右端常驻 `[📋 ]` 按钮，支持鼠标直接点击以及键盘快捷键（默认 `Ctrl+Shift+T`）呼出任务树弹窗。
 - **全功能居中弹窗（内置字符滚动条）**：采用 `ctx.ui.custom({ overlay: true })` 居中悬浮绘制，清晰呈现树形分支图；支持键盘上下移动/翻页、`Space` 折叠展开父节点、鼠标滚轮平滑滚动、边框外部点击自动关闭。
+- **只读状态窗**：`/todo status` 按实际终端宽高换行并支持滚动，长配置值不会被固定最小宽度裁掉；↑/↓、PgUp/PgDn 翻阅，Enter/Esc 或点击关闭。
 - **零破坏 Prompt Cache 的批注体系**：
   - **本地便签 (Local Note)**：弹窗按 `n` 键就地添加备注，数据仅在扩展内部与分支快照保存，**0 Token 消耗，0 缓存破坏**；
   - **主动提醒 (Steer Hint)**：按需将提示作为标准 User 消息追加在**对话最末尾**，100% 保持此前所有对话的前缀缓存命中！
@@ -406,7 +411,7 @@ Ctrl+Shift+T      # 快速呼出/关闭任务树弹窗
 - **无缝衔接 Agent 忙碌状态**：
   - 倒计时到达时，若 Agent 处于空闲状态则立即启动新一轮任务；若 Agent 正在流式输出或执行中，则自动作为 `followUp` 排队，确保不丢失、不中断。
 - **规范模态窗口与工具集成**：
-  - `/timer status` 遵循规范采用 `ctx.ui.custom()` 居中悬浮模态弹窗呈现任务详情，支持按键或鼠标点击关闭；
+  - `/timer status` 和 `/timer list` 使用自适应宽高的 `ctx.ui.custom()` 模态窗，完整提示词可换行、用 ↑/↓、PgUp/PgDn 或鼠标滚轮浏览，Enter/Esc 或点击关闭；
   - 注册 `timer_schedule`、`timer_cancel`、`timer_list` 工具，Agent 自身亦可灵活安排延迟计划任务。
 
 ```bash
@@ -429,7 +434,7 @@ Ctrl+Shift+T      # 快速呼出/关闭任务树弹窗
 - **自动模型降级（Fallback）**：必须配置 `primaryModel`，后备模型按 `fallbackModels` 顺序尝试，没有硬编码默认模型。总等待上限 5 分钟，取消或超时不继续 fallback，也不写入迟到结果。
 - **图视联动（Image-to-Video）**：`generate_image` 生成的图片路径可直接作为 `generate_video` 的首帧或参考输入（`image`），极大提升视频主体的一致性与稳定性。
 - **视频接口**：调用配置 provider 的 `/videos/generations`；本地参考图读取为 data URI，不将本机路径直接发送给远程服务。当前没有 ComfyUI 驱动或异步视频任务轮询。
-- **本地落盘管理**：默认写入会话工作区 `.pi/media/`，可设置 `outputDir`。图片下载检查 HTTP 状态及 PNG/JPEG/GIF/WebP 文件头；失败返回真正的 tool error，不把错误网页当成图片。
+- **本地落盘管理**：默认写入会话工作区 `.pi/media/`，可设置 `outputDir`。图片下载检查 HTTP 状态及 PNG/JPEG/GIF/WebP 文件头；视频的下载和 Base64 返回均检查 MP4/WebM 容器签名，校验失败会尝试后备模型，不把 HTML、空数据或错误对象写成成功媒体。文件头检查不代替完整解码验证，全部模型失败返回真正的 tool error。
 - **安全影响**：提示词、参考图会发送给配置的网关及其返回的下载地址，文件写入 `outputDir`；仅使用可信服务。
 
 最小配置示例（模型 ID 请填写网关实际支持的值）：

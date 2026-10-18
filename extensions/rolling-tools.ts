@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AssistantMessageComponent, InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem, Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
@@ -144,6 +145,9 @@ interface ToolItem {
 	fullPath?: string;
 	fullCommand?: string;
 	rawInput?: any;
+	rawInputTruncated?: boolean;
+	/** In-memory detail-layout revision; not persisted. */
+	detailVersion?: number;
 	output?: string;
 	/** 完整可展示内容（如 edit/write 的 diff 或写入正文），用于 overlay 大窗体 */
 	detailContent?: string;
@@ -559,9 +563,20 @@ function shouldIncludeInWidget(toolName: string, config: RollingToolsConfig): bo
 	return isManagedTool(toolName, rules);
 }
 
-/**
- * 通用属性启发式推导
- */
+/** Mirror Pi file-tool paths without depending on a private host export. */
+function resolveToolPath(rawPath: string, cwd: string): string {
+	let path = rawPath.replace(/[\u00a0\u2000-\u200a\u202f\u205f\u3000]/g, " ").replace(/^@/, "");
+	if (process.platform === "win32" && !path.startsWith("//") && !path.includes("\\")) {
+		const drive = path.match(/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i);
+		if (drive) path = `${drive[1].toUpperCase()}:/${drive[2] || ""}`;
+	}
+	if (path === "~") path = homedir();
+	else if (path.startsWith("~/") || (process.platform === "win32" && path.startsWith("~\\"))) path = join(homedir(), path.slice(2));
+	if (path.startsWith("file://")) path = fileURLToPath(path);
+	return resolve(cwd, path);
+}
+
+/** 通用属性启发式推导 */
 function extractGenericParameters(
 	input: any,
 	cwd: string,
@@ -584,7 +599,7 @@ function extractGenericParameters(
 			if (!trimmed) continue;
 
 			if (prop === "path" || prop === "file" || prop === "filePath") {
-				fullPath = resolve(cwd, trimmed);
+				fullPath = resolveToolPath(trimmed, cwd);
 				summary = `${prop}: ${trimmed}`;
 			} else if (prop === "command" || prop === "cmd") {
 				fullCommand = trimmed;
@@ -601,7 +616,7 @@ function extractGenericParameters(
 	}
 
 	if (!fullPath && typeof input.path === "string" && input.path.trim()) {
-		fullPath = resolve(cwd, input.path.trim());
+		fullPath = resolveToolPath(input.path.trim(), cwd);
 	}
 	if (!fullCommand && typeof input.command === "string" && input.command.trim()) {
 		fullCommand = input.command.trim();
@@ -671,7 +686,7 @@ function extractSummaryAndMetadata(
 	if (name === "read" || name === "edit" || name === "write") {
 		const rawPath = typeof input.path === "string" ? input.path : "";
 		if (!rawPath) return { summaryDisplay: "" };
-		const absPath = resolve(cwd, rawPath);
+		const absPath = resolveToolPath(rawPath, cwd);
 		// write：正文即待写入内容，可在 overlay 中完整展示
 		if (name === "write" && typeof input.content === "string") {
 			const lineCount = input.content.split("\n").length;
@@ -691,7 +706,7 @@ function extractSummaryAndMetadata(
 
 	// 3. 内置搜索：grep
 	if (name === "grep") {
-		const scope = input.path ? resolve(cwd, input.path) : cwd;
+		const scope = input.path ? resolveToolPath(input.path, cwd) : cwd;
 		const display = `"${input.pattern || ""}" in ${input.path || "."}`;
 		return { summaryDisplay: display, fullPath: scope };
 	}
@@ -703,7 +718,7 @@ function extractSummaryAndMetadata(
 
 	// 5. 内置目录列表：ls
 	if (name === "ls") {
-		const dirPath = input.path ? resolve(cwd, input.path) : cwd;
+		const dirPath = input.path ? resolveToolPath(input.path, cwd) : cwd;
 		return { summaryDisplay: input.path || ".", fullPath: dirPath };
 	}
 
@@ -862,7 +877,7 @@ function tryParseJson(str: string): any {
 	return undefined;
 }
 
-function backfillInputsFromSession(entries: any[], items: ToolItem[]): void {
+function backfillInputsFromSession(entries: any[], items: ToolItem[], cwd: string, config: RollingToolsConfig): void {
 	if (!Array.isArray(entries) || !Array.isArray(items)) return;
 	const callInputs = new Map<string, any>();
 	const toolResults = new Map<string, { isError: boolean; output?: string; durationMs?: number }>();
@@ -908,9 +923,15 @@ function backfillInputsFromSession(entries: any[], items: ToolItem[]): void {
 	}
 
 	for (const item of items) {
-		if ((item.rawInput === undefined || item.rawInput === null) && callInputs.has(item.id)) {
+		if ((item.rawInputTruncated || item.rawInput === undefined || item.rawInput === null) && callInputs.has(item.id)) {
 			item.rawInput = callInputs.get(item.id);
+			item.rawInputTruncated = undefined;
 		}
+		// Repair legacy path metadata in memory, without rewriting original session entries.
+		try {
+			const { fullPath } = extractSummaryAndMetadata(item.name, item.rawInput, cwd, config);
+			if (fullPath) item.fullPath = fullPath;
+		} catch { /* Malformed legacy arguments must not prevent history restoration. */ }
 
 		// 回填会话中真实的工具执行结果与状态（对齐 toolResult 与中途终止的 context_edit）
 		const res = toolResults.get(item.id);
@@ -927,6 +948,22 @@ function backfillInputsFromSession(entries: any[], items: ToolItem[]): void {
 		}
 	}
 }
+/** Bound and copy inputs; complete top-level arguments remain recoverable by toolCallId. */
+function serializeHistoryInput(item: ToolItem): { rawInput?: unknown; rawInputTruncated?: boolean } {
+	if (item.rawInputTruncated && typeof item.rawInput === "string") {
+		return { rawInput: item.rawInput.slice(0, PERSIST_MAX_FIELD), rawInputTruncated: true };
+	}
+	try {
+		const json = JSON.stringify(item.rawInput);
+		if (json === undefined) return {};
+		if (json.length <= PERSIST_MAX_FIELD) return { rawInput: JSON.parse(json) };
+		const notice = "\n… [History input truncated; inspect the original tool call for complete arguments.]";
+		return { rawInput: json.slice(0, PERSIST_MAX_FIELD - notice.length) + notice, rawInputTruncated: true };
+	} catch {
+		return { rawInput: "[Input unavailable for history serialization]", rawInputTruncated: true };
+	}
+}
+
 function serializeHistory(
 	items: ToolItem[],
 	total: number,
@@ -941,7 +978,7 @@ function serializeHistory(
 		summaryDisplay: t.summaryDisplay,
 		fullPath: t.fullPath,
 		fullCommand: t.fullCommand ? t.fullCommand.slice(0, PERSIST_MAX_FIELD) : undefined,
-		rawInput: t.rawInput,
+		...serializeHistoryInput(t),
 		output: t.output ? t.output.slice(0, PERSIST_MAX_FIELD) : undefined,
 		detailContent: t.detailContent ? t.detailContent.slice(0, PERSIST_MAX_FIELD) : undefined,
 		detailKind: t.detailKind,
@@ -963,6 +1000,7 @@ function deserializeHistory(data: any): { items: ToolItem[]; total: number; view
 		fullPath: raw.fullPath,
 		fullCommand: raw.fullCommand,
 		rawInput: raw.rawInput,
+		rawInputTruncated: raw.rawInputTruncated === true || undefined,
 		output: raw.output,
 		detailContent: raw.detailContent,
 		detailKind: raw.detailKind,
@@ -1497,6 +1535,7 @@ class ToolHistoryOverlayComponent implements Component {
 	private detailLineCount = 0;
 	private detailViewportHeight = 1;
 	private lastWidth = 80;
+	private detailCache?: { item: ToolItem; width: number; version: number; lines: string[] };
 	/** 是否自动跟随最新条目（用户手动选择后关闭） */
 	private followTail = true;
 	/** 复制反馈（就地显示在底部提示行） */
@@ -1715,8 +1754,11 @@ class ToolHistoryOverlayComponent implements Component {
 	private buildDetailLines(width: number): string[] {
 		const theme = this.theme;
 		const t = this.selectedItem;
+		const version = t?.detailVersion ?? 0;
+		if (t && this.detailCache?.item === t && this.detailCache.width === width && this.detailCache.version === version) return this.detailCache.lines;
 		const out: string[] = [];
 		if (!t) {
+			this.detailCache = undefined;
 			out.push(theme.fg("muted", "(无选中条目)"));
 			return out;
 		}
@@ -1777,6 +1819,7 @@ class ToolHistoryOverlayComponent implements Component {
 		}
 
 		if (out.length === 0) out.push(theme.fg("muted", "(无详情)"));
+		this.detailCache = { item: t, width, version, lines: out };
 		return out;
 	}
 
@@ -1791,27 +1834,10 @@ class ToolHistoryOverlayComponent implements Component {
 		return line;
 	}
 
-	/** 按显示宽度硬换行（保留 ANSI 无关的纯文本换行） */
+	/** 按可见列宽线性换行，保留 ANSI 与完整字素簇。 */
 	private wrapLine(raw: string, width: number, style: (line: string) => string): string[] {
-		if (visibleWidth(raw) <= width) return [style(raw)];
-		const out: string[] = [];
-		let remaining = raw;
-		while (visibleWidth(remaining) > width) {
-			// 简化处理：按可见宽度切片（不处理 ANSI，因为源文本通常无 ANSI）
-			let cut = 0;
-			let w = 0;
-			for (const ch of remaining) {
-				const cw = visibleWidth(ch);
-				if (w + cw > width) break;
-				w += cw;
-				cut += ch.length;
-			}
-			if (cut === 0) break;
-			out.push(style(remaining.slice(0, cut)));
-			remaining = remaining.slice(cut);
-		}
-		if (remaining.length > 0) out.push(style(remaining));
-		return out;
+		// One ANSI/grapheme-aware pass, not repeated scans of every remaining suffix.
+		return wrapTextWithAnsi(raw, Math.max(1, width)).map(style);
 	}
 
 	handleInput(data: string): void {
@@ -1960,7 +1986,7 @@ class ToolHistoryOverlayComponent implements Component {
 		return undefined;
 	}
 
-	invalidate(): void {}
+	invalidate(): void { this.detailCache = undefined; }
 }
 
 /**
@@ -2014,10 +2040,6 @@ function autoColorizeStatusText(text: string): string {
 	);
 }
 
-let activeStatusInterval: any = null;
-let activeStatusStartTime = 0;
-let lastActiveStatusRawText = "";
-
 /**
  * 匹配插件在工具行里重复插入的提示头（如 SoL-Pi 的 “⚡ SoL-Pi · X” / “Money saved · Y”）。
  * 带上 `·` 分隔符以尽量避免误伤工具自身的输出。
@@ -2029,20 +2051,32 @@ const TOOL_NOTIFICATION_HEADER_RE = /(SoL-Pi\s*·|Money saved\s*·)/;
  * 对任意三方插件通用，不依赖具体插件名或内部组件结构。
  */
 class NotificationHeaderStripper implements Component {
-	private inner: Component;
+	readonly inner: Component;
+	private readonly isEnabled: () => boolean;
+	private mouseRows: number[] = [];
 
-	constructor(inner: Component) {
+	constructor(inner: Component, isEnabled: () => boolean) {
 		this.inner = inner;
+		this.isEnabled = isEnabled;
 	}
 
 	render(width: number): string[] {
 		const lines = this.inner.render(width);
-		const filtered = lines.filter((line) => !TOOL_NOTIFICATION_HEADER_RE.test(line));
-		return filtered;
+		this.mouseRows = [];
+		const filter = this.isEnabled();
+		return lines.filter((line, index) => {
+			if (filter && TOOL_NOTIFICATION_HEADER_RE.test(line)) return false;
+			this.mouseRows.push(index);
+			return true;
+		});
 	}
 
+	handleInput(data: string): void { this.inner.handleInput?.(data); }
+	get wantsKeyRelease(): boolean | undefined { return this.inner.wantsKeyRelease; }
+
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-		return this.inner.handleMouse?.(event);
+		const row = this.mouseRows[event.y];
+		return this.inner.handleMouse?.(row === undefined || row === event.y ? event : { ...event, y: row });
 	}
 
 	invalidate(): void {
@@ -2063,20 +2097,26 @@ function installToolNotificationStripper(
 
 	register.call(pi, (toolName: string, next: () => any) => {
 		const base = next();
-		if (!base || !isEnabled()) return base;
+		if (!base) return base;
 
-		const wrap = (fn: any) => {
+		const wrap = (fn: any, contextIndex: number) => {
 			if (typeof fn !== "function") return fn;
 			return (...args: any[]) => {
+				const context = args[contextIndex];
+				const previous = context?.lastComponent;
+				// Let the renderer reuse its own component, not our wrapper.
+				if (previous instanceof NotificationHeaderStripper) args[contextIndex] = { ...context, lastComponent: previous.inner };
 				const component = fn(...args);
-				return component ? new NotificationHeaderStripper(component) : component;
+				if (!component) return component;
+				if (previous instanceof NotificationHeaderStripper && previous.inner === component) return previous;
+				return new NotificationHeaderStripper(component, isEnabled);
 			};
 		};
 
 		return {
 			...base,
-			renderCall: wrap(base.renderCall),
-			renderResult: wrap(base.renderResult),
+			renderCall: wrap(base.renderCall, 2),
+			renderResult: wrap(base.renderResult, 3),
 		};
 	});
 }
@@ -2175,6 +2215,17 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	let statusTimer: any = null;
 	let lastCtx: any = null;
 	let hooksActive = true;
+	const activeStatuses = new Map<string, {
+		startTime: number; rawText: string; timer?: ReturnType<typeof setInterval>; clear: () => void;
+	}>();
+	function clearTransientStatuses(): void {
+		const statuses = [...activeStatuses.values()];
+		activeStatuses.clear();
+		for (const status of statuses) {
+			if (status.timer) clearInterval(status.timer);
+			try { status.clear(); } catch { /* UI may already be shutting down */ }
+		}
+	}
 	const desktopActions = new AbortController();
 	const streamedDrafts = new Set<string>();
 	const uiHookCleanups: Array<() => void> = [];
@@ -2202,7 +2253,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	ensureGlobalPrototypeHooksInstalled();
 
 	// 1.5 注册工具渲染器：剥掉插件在工具行里重复画的提示头（通道 C）
-	installToolNotificationStripper(pi, () => currentConfig.enabled && currentConfig.stripToolNotificationHeaders !== false);
+	installToolNotificationStripper(pi, () => hooksActive && currentConfig.enabled && currentConfig.stripToolNotificationHeaders !== false);
 
 	// Filter only the component's view, never agent messages or persisted signatures.
 	dynamicHooks.handleAssistantContent = (target, message, isStreaming, original) => {
@@ -2254,65 +2305,45 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		origFn: Function,
 	) => {
 		if (!currentConfig.enabled) return origFn.call(target, key, text);
-		// 常驻状态（如 blackhole 仪表盘、MCP 服务器状态）：完全放行。
-		// 不倒计时，也不拦截它们自己的清除调用，否则会卡住不消失。
-		if (isPersistentStatusKey(key, currentConfig.statusEnhancements)) {
-			return origFn.call(target, key, text);
-		}
-
+		if (isPersistentStatusKey(key, currentConfig.statusEnhancements)) return origFn.call(target, key, text);
 		const rule = findStatusEnhancementRule(key, currentConfig.statusEnhancements);
-
-		// 只有显式配置了 durationMs 的规则才做“自动消失”。
-		// 默认（durationMs 不设）仅做着色，不接管生命周期。
-		if (rule && rule.durationMs && rule.durationMs > 0) {
+		const duration = rule?.durationMs;
+		const previous = activeStatuses.get(key);
+		if (duration && Number.isFinite(duration) && duration > 0) {
 			if (text) {
-				if (activeStatusInterval) {
-					clearInterval(activeStatusInterval);
-					activeStatusInterval = null;
-				}
-				lastActiveStatusRawText = text;
-				activeStatusStartTime = Date.now();
-				const targetDuration = rule.durationMs;
-
+				if (previous?.timer) clearInterval(previous.timer);
+				const status = {
+					startTime: Date.now(), rawText: text,
+					timer: undefined as ReturnType<typeof setInterval> | undefined,
+					clear: () => origFn.call(target, key, undefined),
+				};
+				activeStatuses.set(key, status);
 				const updateStatus = () => {
-					const elapsedSec = Math.floor((Date.now() - activeStatusStartTime) / 1000);
-					if (elapsedSec >= Math.floor(targetDuration / 1000)) {
-						if (activeStatusInterval) {
-							clearInterval(activeStatusInterval);
-							activeStatusInterval = null;
-						}
-						lastActiveStatusRawText = "";
-						origFn.call(target, key, undefined);
+					if (activeStatuses.get(key) !== status) return;
+					const elapsed = Math.max(0, Date.now() - status.startTime);
+					if (elapsed >= duration) {
+						if (status.timer) clearInterval(status.timer);
+						activeStatuses.delete(key);
+						status.clear();
 						return;
 					}
-					let formattedText = rule.colorize ? autoColorizeStatusText(lastActiveStatusRawText) : lastActiveStatusRawText;
-					if (rule.showRelativeTime) {
-						formattedText += ` \x1b[90m(${elapsedSec}s ago)\x1b[39m`;
-					}
-					origFn.call(target, key, formattedText);
+					let formatted = rule.colorize ? autoColorizeStatusText(status.rawText) : status.rawText;
+					if (rule.showRelativeTime) formatted += ` \x1b[90m(${Math.floor(elapsed / 1000)}s ago)\x1b[39m`;
+					origFn.call(target, key, formatted);
 				};
-
+				status.timer = setInterval(updateStatus, Math.max(1, Math.min(1000, duration)));
+				status.timer.unref?.();
 				updateStatus();
-				activeStatusInterval = setInterval(updateStatus, 1000);
-				if (typeof activeStatusInterval === "object" && "unref" in activeStatusInterval) {
-					activeStatusInterval.unref();
-				}
 				return;
-			} else {
-				// 外部（插件）主动清除：若仍在倒计时窗口内，交给我们的定时器统一收尾；
-				// 否则直接放行。
-				const remaining = activeStatusStartTime + rule.durationMs - Date.now();
-				if (remaining > 0 && lastActiveStatusRawText) {
-					return;
-				}
 			}
+			// Retain the configured minimum display time for THIS key only.
+			if (previous && Date.now() - previous.startTime < duration) return;
 		}
-
-		// 未配 durationMs，或规则未命中：仅做着色（如果有 colorize），不接管生命周期。
-		if (rule?.colorize && typeof text === "string" && text.length > 0) {
-			return origFn.call(target, key, autoColorizeStatusText(text));
+		if (previous) {
+			if (previous.timer) clearInterval(previous.timer);
+			activeStatuses.delete(key);
 		}
-		return origFn.call(target, key, text);
+		return origFn.call(target, key, rule?.colorize && text ? autoColorizeStatusText(text) : text);
 	};
 
 	function stopStatusTimer(): void {
@@ -2347,7 +2378,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				if (entry?.type === "custom" && entry?.customType === HISTORY_ENTRY_TYPE) {
 					const res = deserializeHistory(entry.data);
 					if (res && res.items) {
-						backfillInputsFromSession(entries, res.items);
+						backfillInputsFromSession(entries, res.items, ctx.cwd || process.cwd(), currentConfig);
 					}
 					return res;
 				}
@@ -2630,6 +2661,8 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 					if (existing) {
 						existing.rawInput = c.arguments ?? existing.rawInput;
+						existing.rawInputTruncated = undefined;
+						existing.detailVersion = (existing.detailVersion ?? 0) + 1;
 						if (
 							existing.summaryDisplay !== summaryDisplay ||
 							existing.fullPath !== fullPath ||
@@ -2696,6 +2729,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		const content = Array.isArray(event.content) ? event.content : [];
 		const text = content.find((block: any) => block?.type === "text" && typeof block.text === "string")?.text;
 		if (item) {
+			item.detailVersion = (item.detailVersion ?? 0) + 1;
 			const previous = item.status;
 			item.status = event.isError ? "error" : "done";
 			if (authoritativeDuration || event.durationMs !== undefined) {
@@ -2726,15 +2760,14 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	}
 
 	function refreshToolActivity(ctx: ExtensionContext): void {
-		if (state.recentTools.some(isPendingTool)) {
-			if (!statusTimer) startStatusTimer(ctx);
-		} else if (state.headerStatus.type !== "thinking" && state.headerStatus.type !== "waiting_server") {
-			stopStatusTimer();
-		}
+		const active = state.recentTools.some(isPendingTool) || state.headerStatus.type === "thinking" || state.headerStatus.type === "waiting_server";
+		if (!currentConfig.enabled || !hooksActive || !active) stopStatusTimer();
+		else if (!statusTimer) startStatusTimer(ctx);
 		syncWidget(ctx);
 	}
 
 	function interruptTool(item: ToolItem, reason: string): void {
+		item.detailVersion = (item.detailVersion ?? 0) + 1;
 		const wasRunning = item.status === "running";
 		item.status = "error";
 		item.durationMs = wasRunning ? Math.max(0, Date.now() - item.startTime) : undefined;
@@ -2814,6 +2847,8 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		const existing = state.recentTools.find(tool => tool.id === toolCallId);
 		if (existing) {
 			existing.rawInput = input ?? existing.rawInput;
+			existing.rawInputTruncated = undefined;
+			existing.detailVersion = (existing.detailVersion ?? 0) + 1;
 			existing.summaryDisplay = metadata.summaryDisplay || existing.summaryDisplay;
 			if (metadata.fullPath) existing.fullPath = metadata.fullPath;
 			if (metadata.fullCommand) existing.fullCommand = metadata.fullCommand;
@@ -2898,10 +2933,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		if (dynamicHooks.handleSetExtensionStatus === ownedHooks.status) dynamicHooks.handleSetExtensionStatus = undefined;
 		if (legacyNoticeTimer) clearTimeout(legacyNoticeTimer);
 		stopStatusTimer();
-		if (activeStatusInterval) {
-			clearInterval(activeStatusInterval);
-			activeStatusInterval = null;
-		}
+		clearTransientStatuses();
 	});
 
 	// 10. 管理控制命令
@@ -2911,9 +2943,10 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			const action = (args || "").trim();
 			if (action === "reload") {
+				clearTransientStatuses();
 				const loaded = loadConfig(ctx?.cwd || process.cwd());
 				currentConfig = loaded.config;
-				syncWidget(ctx);
+				refreshToolActivity(ctx);
 				if (loaded.legacyDetected) {
 					ctx.ui?.notify?.(buildLegacyNotice(loaded.legacyPath, loaded.legacyVersion), "warning");
 				} else {
@@ -2922,8 +2955,9 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			} else if (action === "migrate") {
 				const result = migrateConfigToLatest(ctx?.cwd || process.cwd());
 				if (result.ok) {
+					clearTransientStatuses();
 					currentConfig = result.config!;
-					syncWidget(ctx);
+					refreshToolActivity(ctx);
 					ctx.ui?.notify?.(
 						`✓ rolling-tools: 已升级到全工具语义（v${CONFIG_VERSION}）\n• 静音/收录规则已设为 ["*"]\n• 已写入: ${result.path}`,
 						"info",
@@ -2934,15 +2968,12 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			} else if (action === "off") {
 				currentConfig.enabled = false;
 				stopStatusTimer();
-				if (activeStatusInterval) {
-					clearInterval(activeStatusInterval);
-					activeStatusInterval = null;
-				}
+				clearTransientStatuses();
 				syncWidget(ctx);
 				ctx.ui?.notify?.("rolling-tools: 已禁用正文静音与滚动条", "info");
 			} else if (action === "on") {
 				currentConfig.enabled = true;
-				syncWidget(ctx);
+				refreshToolActivity(ctx);
 				ctx.ui?.notify?.("rolling-tools: 已启用正文静音与滚动条", "info");
 			} else if (action === "status") {
 				const info = [
@@ -2992,7 +3023,8 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				openHistoryOverlay(ctx);
 			} else {
 				currentConfig.enabled = !currentConfig.enabled;
-				syncWidget(ctx);
+				if (!currentConfig.enabled) clearTransientStatuses();
+				refreshToolActivity(ctx);
 				ctx.ui?.notify?.(`rolling-tools: ${currentConfig.enabled ? "已开启" : "已关闭"}`, "info");
 			}
 		},

@@ -5,6 +5,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { AutocompleteItem, Component, KeyId, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { Key, matchesKey, sliceByColumn, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
+import { StatusModalComponent } from "./lib/status-modal.ts";
 
 // ============================================================================
 // 1. Data Models & Constants
@@ -1678,117 +1679,23 @@ export interface TodoTreeStatusInfo {
 }
 
 export class TodoTreeStatusModalComponent implements Component {
-	private tui: any;
-	private theme: any;
-	private info: TodoTreeStatusInfo;
-	private onClose: () => void;
-
-	private boxLeft = 0;
-	private boxTop = 0;
-	private boxWidth = 0;
-	private boxHeight = 0;
+	private readonly modal: StatusModalComponent;
 
 	constructor(tui: any, theme: any, info: TodoTreeStatusInfo, onClose: () => void) {
-		this.tui = tui;
-		this.theme = theme;
-		this.info = info;
-		this.onClose = onClose;
+		const stats = info.stats;
+		this.modal = new StatusModalComponent(tui, theme, "Todo Tree Status", [
+			`• Extension State : ${info.enabled ? "ENABLED" : "DISABLED (default)"}`,
+			`• Active in Model : ${info.isToolActive ? "YES (declared to LLM)" : "NO (hidden from LLM)"}`,
+			`• Modal Shortcut  : ${info.shortcut}`,
+			`• Total Tasks     : ${stats.total + stats.cancelled} (${stats.completed} done, ${stats.inProgress} active, ${stats.pending} pending, ${stats.cancelled} cancelled)`,
+			`• Progress        : ${stats.percent}% ${renderProgressBar(stats.percent, 14)}`,
+		], onClose, { maxWidth: 68, maxHeight: 12, center: true });
 	}
 
-	invalidate(): void {}
-
-	render(width: number): string[] {
-		const totalLines = this.tui?.terminal?.rows || 24;
-
-		this.boxWidth = Math.min(68, Math.max(46, Math.floor(width * 0.7)));
-		this.boxHeight = 12;
-		this.boxLeft = Math.max(0, Math.floor((width - this.boxWidth) / 2));
-		this.boxTop = Math.max(0, Math.floor((totalLines - this.boxHeight) / 2));
-
-		const innerWidth = this.boxWidth - 2;
-		const lines: string[] = [];
-
-		// Top padding
-		for (let i = 0; i < this.boxTop; i++) {
-			lines.push("");
-		}
-
-		// 1. Top border with title
-		const title = " Todo Tree Status ";
-		const topDashTotal = Math.max(0, innerWidth - visibleWidth(title));
-		const leftDash = Math.floor(topDashTotal / 2);
-		const rightDash = topDashTotal - leftDash;
-		lines.push(
-			`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "┌" + "─".repeat(leftDash))}${this.theme.style(title, { bold: true, fg: "accent" })}${this.theme.fg("accent", "─".repeat(rightDash) + "┐")}`,
-		);
-
-		// Helper to format an inner line with borders
-		const pushRow = (contentStr: string, rawLen: number) => {
-			const pad = Math.max(0, innerWidth - 2 - rawLen);
-			lines.push(
-				`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "│ ")}${contentStr}${" ".repeat(pad)} ${this.theme.fg("accent", "│")}`,
-			);
-		};
-
-		// 2. Status items
-		const stateText = this.info.enabled ? "ENABLED" : "DISABLED (default)";
-		const stateColored = this.info.enabled
-			? this.theme.fg("success", "ENABLED")
-			: this.theme.fg("muted", "DISABLED (default)");
-		pushRow(`• Extension State : ${stateColored}`, `• Extension State : ${stateText}`.length);
-
-		const activeText = this.info.isToolActive
-			? "YES (declared to LLM)"
-			: "NO (hidden from LLM)";
-		const activeColored = this.info.isToolActive
-			? this.theme.fg("success", "YES (declared to LLM)")
-			: this.theme.fg("muted", "NO (hidden from LLM)");
-		pushRow(`• Active in Model : ${activeColored}`, `• Active in Model : ${activeText}`.length);
-
-		const shortcutText = `• Modal Shortcut  : ${this.info.shortcut}`;
-		pushRow(this.theme.fg("text", shortcutText), shortcutText.length);
-
-		const stats = this.info.stats;
-		const tasksSummary = `• Total Tasks     : ${stats.total + stats.cancelled} (${stats.completed} done, ${stats.inProgress} active, ${stats.pending} pending, ${stats.cancelled} cancelled)`;
-		const truncTasks = truncateToWidth(tasksSummary, innerWidth - 2);
-		pushRow(this.theme.fg("text", truncTasks), visibleWidth(truncTasks));
-
-		// Progress bar
-		const barWidth = 14;
-		const filled = Math.min(barWidth, Math.round((stats.percent / 100) * barWidth));
-		const barStr = `[${"█".repeat(filled)}${"░".repeat(barWidth - filled)}]`;
-		const progText = `• Progress        : ${stats.percent}% ${barStr}`;
-		pushRow(this.theme.fg("accent", progText), progText.length);
-
-		// Blank line
-		pushRow("", 0);
-
-		// 3. Hint / actions row
-		const hint = "Press [Esc], [Enter] or any key to close";
-		const hintTrunc = truncateToWidth(hint, innerWidth - 2);
-		const hintPad = Math.max(0, innerWidth - 2 - visibleWidth(hintTrunc));
-		lines.push(
-			`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "│ ")}${this.theme.fg("muted", hintTrunc)}${" ".repeat(hintPad)} ${this.theme.fg("accent", "│")}`,
-		);
-
-		// 4. Bottom border
-		lines.push(`${" ".repeat(this.boxLeft)}${this.theme.fg("accent", "└" + "─".repeat(innerWidth) + "┘")}`);
-
-		return lines;
-	}
-
-	handleInput(_data: string): void {
-		// Any key closes the lightweight status dialog
-		this.onClose();
-	}
-
-	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-		if (event.type === "click") {
-			this.onClose();
-			return { handled: true };
-		}
-		return undefined;
-	}
+	invalidate(): void { this.modal.invalidate(); }
+	render(width: number): string[] { return this.modal.render(width); }
+	handleInput(data: string): void { this.modal.handleInput(data); }
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined { return this.modal.handleMouse(event); }
 }
 
 // ============================================================================
@@ -2136,12 +2043,8 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 						const existingTasks = store.getAllTasks();
 						let autoCleared = false;
 						if (existingTasks.length > 0) {
-							const stats = store.getProgressStats();
-							const allFinished =
-								stats.total > 0 &&
-								stats.completed === stats.total &&
-								stats.inProgress === 0 &&
-								stats.pending === 0;
+							const allFinished = existingTasks.every(task =>
+								task.status === "completed" || task.status === "cancelled");
 
 							// Also ensure new batch has at least one top-level task (initiating a new plan)
 							const hasNewRoot = params.tasks.some((t) => !t.parentId);

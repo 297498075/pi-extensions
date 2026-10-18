@@ -370,6 +370,16 @@ function imageExtension(buffer: Buffer): string {
 	throw new Error("API returned an empty or unsupported image payload (expected PNG/JPEG/GIF/WebP).");
 }
 
+/** Container-signature validation, not a claim that a decoder has verified playback. */
+function videoExtension(buffer: Buffer): "mp4" | "webm" {
+	if (buffer.length >= 16 && buffer.subarray(4, 8).toString("ascii") === "ftyp") {
+		const boxSize = buffer.readUInt32BE(0);
+		if (boxSize >= 16 && boxSize <= buffer.length) return "mp4";
+	}
+	if (buffer.length >= 8 && buffer.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]))) return "webm";
+	throw new Error("API returned an empty or unsupported video payload (expected MP4/WebM).");
+}
+
 async function downloadImage(url: string, signal?: AbortSignal): Promise<Buffer> {
 	const response = await fetch(url, { signal });
 	if (!response.ok) throw new Error(`Image download returned HTTP ${response.status}`);
@@ -730,18 +740,20 @@ export async function executeVideoGeneration(
 			});
 
 			signal.throwIfAborted();
-			const outPath = getMediaOutputPath("videos", "mp4", mediaConfig.outputDir, cwd);
+			let buffer: Buffer;
 			if (Buffer.isBuffer(videoUrlOrBuffer)) {
-				writeFileSync(outPath, videoUrlOrBuffer);
+				buffer = videoUrlOrBuffer;
 			} else {
 				const dlRes = await fetch(videoUrlOrBuffer, { signal });
 				if (!dlRes.ok) {
 					throw new Error(`Failed to download video from ${videoUrlOrBuffer}: ${dlRes.status}`);
 				}
-				const buffer = Buffer.from(await dlRes.arrayBuffer());
-				signal.throwIfAborted();
-				writeFileSync(outPath, buffer);
+				buffer = Buffer.from(await dlRes.arrayBuffer());
 			}
+			signal.throwIfAborted();
+			const extension = videoExtension(buffer);
+			const outPath = getMediaOutputPath("videos", extension, mediaConfig.outputDir, cwd);
+			writeFileSync(outPath, buffer);
 
 			return {
 				filePath: outPath,

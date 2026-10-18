@@ -4,6 +4,18 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- fix(rolling-tools): preserve native/third-party call and result component reuse by unwrapping `lastComponent`; existing decorators follow off/unload changes and preserve input/mouse hit targets.
+- fix(rolling-tools): use linear ANSI/grapheme-aware wrapping and content/width/theme-aware detail caching instead of repeated suffix-width scans.
+- fix(rolling-tools): give transient status keys independent deadlines and clean them up on off, config reload and shutdown without touching persistent keys.
+- fix(rolling-tools): bound and deep-copy serialized raw inputs, recover full top-level inputs from canonical calls, and mark unrecoverable nested previews as truncated.
+- fix(rolling-tools): normalize home, @, file URL, Unicode-space and Windows-shell paths consistently with Pi; repair legacy display metadata in memory.
+- fix(todo-loop): treat explicit stopped/reset plan-mode snapshots as authoritative, preventing abandoned plans from triggering follow-ups.
+- fix(todo-tree): replace fully cancelled trees as well as completed ones, while preserving unfinished parents and atomic failure behavior.
+- fix(media-gen): validate downloaded/base64 video container signatures before writing, reject error pages/empty bytes, preserve fallback and cancellation, and use the matching MP4/WebM extension.
+- fix(voice): mark genuine tool failures with `isError`, preserving usable cache warnings and cancellation semantics; deferred VOICE-001 gateway behavior is unchanged.
+- fix(ui): share a width/height-bounded, scrollable status component across timer, voice and todo; retain complete values on narrow or short terminals.
+- test: cover all ten review edge cases with bounded hermetic fixtures, native renderer reuse, in-memory session recovery, fake status clocks and responsive layouts.
+
 - fix(rolling-tools): separate streamed parameter drafts from dispatched executions; failed/aborted provider streams can no longer leave phantom `read` timers running through retries.
 - fix(rolling-tools): consume native execution start/end and finalized result messages, prefer core-measured duration, and close orphan records at run/settlement/shutdown boundaries.
 - fix(rolling-tools): retain genuine active calls across history-window trimming and clear live overlay history in place; never expire calls by elapsed time or index.

@@ -21,6 +21,8 @@ process.env.PI_MEDIA_TEST_KEY = "test-only-not-a-real-key";
 const pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 const png = Buffer.from(pngBase64, "base64");
 const dataUri = `data:image/png;base64,${pngBase64}`;
+// MP4 container-signature fixture (not a decoder/playback test).
+const mp4 = Buffer.from("000000186674797069736f6d0000020069736f6d69736f32", "hex");
 const provider = { providerName: "fixture", baseUrl: "https://api.example/v1", apiKey: "test-key", availableModels: ["image-primary", "image-fallback", "video-primary"] };
 const config = { primaryModel: "image-primary", fallbackModels: ["image-fallback"], outputDir: output };
 const modelsPath = join(agent, "models.json");
@@ -138,10 +140,10 @@ try {
 
 	const imagePath = join(cwd, "reference.png"); writeFileSync(imagePath, png);
 	let videoBody;
-	globalThis.fetch = async (_url, init) => { videoBody = JSON.parse(init.body); return Response.json({ data: [{ b64_json: Buffer.from("video-fixture").toString("base64") }] }); };
+	globalThis.fetch = async (_url, init) => { videoBody = JSON.parse(init.body); return Response.json({ data: [{ b64_json: mp4.toString("base64") }] }); };
 	const video = await executeVideoGeneration({ prompt: "animate", image: basename(imagePath) }, { ...config, primaryModel: "video-primary" }, provider, cwd);
 	assert.equal(videoBody.image_url, dataUri, "local reference images must be sent as bytes, not workstation paths");
-	assert.equal(readFileSync(video.filePath, "utf8"), "video-fixture");
+	assert.deepEqual(readFileSync(video.filePath), mp4);
 	globalThis.fetch = async () => new Response("not authorized", { status: 401 });
 	for (const name of ["generate_image", "generate_video"]) {
 		const error = await tools.get(name).execute("failure", { prompt: "test" }, undefined, undefined, ctx);

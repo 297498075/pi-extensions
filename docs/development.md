@@ -29,7 +29,7 @@ When adding a Pi package dependency that must ship with this package, follow Pi'
 
 ## Shared UI helpers
 
-`extensions/lib/status-modal.ts` is an imported helper, not an extension entry (no `index.ts`). Read-only status commands use it to avoid muted notifications. TUI gets a scrollable, width-bounded overlay; RPC/print/JSON fall back to notifications. Local `.ts` imports are checked via `allowImportingTsExtensions` and run directly in Pi/Node without emitted build files.
+`extensions/lib/status-modal.ts` is an imported helper, not an extension entry (no `index.ts`). Read-only status commands use it to avoid muted notifications. TUI gets a scrollable, width/height-bounded overlay; RPC/print/JSON fall back to notifications. Its reusable `StatusModalComponent` also drives timer/voice/todo status dialogs. It wraps complete values, has no viewport-exceeding minimum width, and supports keyboard/wheel paging plus Enter/Esc/click close. Local `.ts` imports are checked via `allowImportingTsExtensions` and run directly in Pi/Node without emitted build files.
 
 `extensions/lib/desktop-actions.ts` is also import-only. Fixed executable/script definitions keep user paths out of command text; every helper process handles `error`, stdin failure, exit status, cancellation and a bounded deadline. Windows file-open uses `ProcessStartInfo.UseShellExecute` via a fixed `-EncodedCommand` script and a literal environment value, not `cmd /c start`. OS file associations may still execute trusted files by design.
 
@@ -47,14 +47,24 @@ At `agent_end`, first reconcile final tool results, then close remaining orphan 
 
 `test-rolling-tool-lifecycle.mjs` exercises overload/abort→retry, elapsed-clock reset, validation rejection, missing terminal hooks, clear/reload/shutdown and a long task across a 600-call history window. It also runs a real in-memory Agent-core stream/parallel batch to verify native event ordering without user session data, file tools or network access.
 
+## Renderer and history contracts
+
+Tool-renderer decorators must pass the underlying component back as `context.lastComponent` for both call and result slots, without mutating the host context. A live enable predicate also lets existing wrappers become inert on off/unload. History detail layout uses Pi-provided ANSI/grapheme-aware wrapping and a content-revision cache. Invalidate on stream/input/result/status changes, selection/width changes, and theme invalidation; idle refreshes must not reprocess large text.
+
+History snapshots bound raw input previews to 20,000 characters and copy small inputs rather than retaining mutable argument references. On restore, canonical tool calls in the active branch can replace truncated previews with complete inputs; nested calls without transcript entries retain an explicit, stable truncation notice. Legacy file-path metadata is recomputed in memory using Pi-compatible path conventions. These transformations do not rewrite original call/result entries. Transient footer statuses own per-key timers; clear them on off/reload/shutdown while leaving persistent keys alone.
+
 ## Mutation test isolation
 
 `scripts/test-mutation-todo-tree.mjs` copies extensions and the focused test suite into a temporary workspace (dereferencing source symlinks), links installed `node_modules` for resolution, and uses an isolated agent/home directory. Mutations and test execution occur only in that copy. It never backs up/restores checkout files, so concurrent editing is safe and an interrupt cannot leave mutants in production source. A hard kill may leave a disposable temp directory; normal completion/failure cleans it up. Timeouts or unexpected failures do not count as killed mutants.
 
 ## Validation
 
+Run agent-driven tests under an independent parent-process/process-tree deadline of 30–60 seconds; a timer in the tested process cannot interrupt a busy microtask or synchronous loop. Tool `timeout` values are **seconds**, whereas Node timer/child-process options use milliseconds. Mock streams and UI traversal loops must have finite response/iteration budgets and respect cancellation.
+
 `npm run check` validates TypeScript sources. `npm run validate` checks that every manifest path exists and that JSON themes are parseable. Use `npm pack --dry-run` to inspect the publishable file set.
 
 `npm test` includes `scripts/test-extension-regressions.mjs`: real in-memory SessionManager snapshot isolation and boundary projection, branch navigation, global hook unload/off behavior, notification/status interactions, reasoning preservation, bounded timer chaining, compression isolation and strict voice response validation. Media generation uses temporary agent/project directories and mocked fetch only, with no personal provider or credentials required. Questionnaire tests validate schemas and exercise narrow widths, cancellation and non-TUI stdout.
+
+`scripts/test-extension-edge-cases.mjs` covers native call/result renderer reuse, independent fake-clock status keys, bounded snapshots with real in-memory SessionManager recovery, Pi-compatible and legacy metadata paths, linear/cached Unicode detail rendering, URL/base64 video rejection/fallback/cancellation, stopped plans, fully cancelled tree replacement, voice error flags, and scrollable status dialogs at 1–140 columns and short heights. Its 16K-CJK fixture reports timings but asserts cache reuse/invalidation rather than a machine-dependent speed threshold. Media fixtures verify signatures, not decoder playback.
 
 `test-rolling-tools-safety.mjs` checks literal path transport, mocked Ctrl-click/copy routes, helper spawn/stdin/exit/timeout failures, shutdown cancellation and 1–140-column layouts. It never touches the real clipboard or opens GUI applications. `test-mutation-isolation.mjs` uses disposable repository fixtures to interrupt a mutation runner and simulate concurrent edits, proving that neither success nor interruption rewrites checkout source. See `docs/known-issues.md` for deliberately deferred behavior; mocks do not certify physical audio playback.

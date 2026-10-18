@@ -12,9 +12,9 @@ import {
 	Text,
 	type TuiMouseEvent,
 	type TuiMouseEventResult,
-	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
+import { StatusModalComponent } from "./lib/status-modal.ts";
 
 // ==========================================
 // 常量与类型定义
@@ -602,113 +602,29 @@ export class TimerManager {
 // ==========================================
 
 export class TimerStatusModalComponent implements Component {
-	private readonly tui: any;
-	private readonly theme: any;
-	private readonly manager: TimerManager;
-	private readonly onClose: () => void;
+	private readonly modal: StatusModalComponent;
 
 	constructor(tui: any, theme: any, manager: TimerManager, onClose: () => void) {
-		this.tui = tui;
-		this.theme = theme;
-		this.manager = manager;
-		this.onClose = onClose;
+		this.modal = new StatusModalComponent(tui, theme, "⏱️ 定时任务管理器 (Scheduled Tasks)", () => {
+			const pending = manager.getPendingTasks();
+			const all = manager.getAllTasks();
+			return [
+				`活跃中: ${pending.length} 个 | 已触发: ${all.filter(t => t.status === "completed").length} 个 | 已取消: ${all.filter(t => t.status === "cancelled").length} 个`,
+				...(pending.length ? pending.flatMap(task => [
+					`[#${task.id}] 倒计时 ${formatClockTime(Math.max(0, Math.ceil((task.targetTime - Date.now()) / 1000)))} (预定 ${formatDateTime(task.targetTime)})`,
+					`提示词: ${task.prompt}`,
+				]) : ["(当前暂无等待执行的定时任务)"]),
+				"",
+				"创建: /timer [秒] [分] [时] <提示词>",
+				"取消: /timer cancel <id> 或 /timer cancel all",
+			];
+		}, onClose, { maxWidth: 76, maxHeight: 16, center: true });
 	}
 
-	invalidate(): void {}
-
-	render(width: number): string[] {
-		const totalLines = this.tui?.terminal?.rows || 24;
-		const boxWidth = Math.min(76, Math.max(54, Math.floor(width * 0.8)));
-		const boxHeight = Math.min(totalLines - 2, 16);
-		const boxLeft = Math.max(0, Math.floor((width - boxWidth) / 2));
-		const boxTop = Math.max(0, Math.floor((totalLines - boxHeight) / 2));
-
-		const innerWidth = boxWidth - 2;
-		const lines: string[] = [];
-
-		for (let i = 0; i < boxTop; i++) lines.push("");
-
-		const title = " ⏱️ 定时任务管理器 (Scheduled Tasks) ";
-		const topDashTotal = Math.max(0, innerWidth - visibleWidth(title));
-		const leftDash = Math.floor(topDashTotal / 2);
-		const rightDash = topDashTotal - leftDash;
-
-		lines.push(
-			`${" ".repeat(boxLeft)}${safeFg(this.theme, "accent", "┌" + "─".repeat(leftDash))}${safeFg(this.theme, "accent", title)}${safeFg(this.theme, "accent", "─".repeat(rightDash) + "┐")}`,
-		);
-
-		const pushRow = (contentStr: string, rawLen: number) => {
-			const pad = Math.max(0, innerWidth - 2 - rawLen);
-			lines.push(
-				`${" ".repeat(boxLeft)}${safeFg(this.theme, "accent", "│ ")}${contentStr}${" ".repeat(pad)} ${safeFg(this.theme, "accent", "│")}`,
-			);
-		};
-
-		const pending = this.manager.getPendingTasks();
-		const all = this.manager.getAllTasks();
-		const triggeredCount = all.filter((t) => t.status === "completed").length;
-		const cancelledCount = all.filter((t) => t.status === "cancelled").length;
-
-		// 统计摘要
-		const summaryText = `活跃中: ${pending.length} 个  |  已触发: ${triggeredCount} 个  |  已取消: ${cancelledCount} 个`;
-		pushRow(safeFg(this.theme, "accent", summaryText), visibleWidth(summaryText));
-		pushRow(
-			safeFg(this.theme, "dim", "─".repeat(innerWidth - 2)),
-			visibleWidth("─".repeat(innerWidth - 2)),
-		);
-
-		// 活跃列表
-		if (pending.length === 0) {
-			const emptyText = "(当前暂无等待执行的定时任务)";
-			pushRow(safeFg(this.theme, "dim", emptyText), visibleWidth(emptyText));
-		} else {
-			const maxItems = Math.min(5, pending.length);
-			for (let i = 0; i < maxItems; i++) {
-				const t = pending[i];
-				const rem = Math.max(0, Math.ceil((t.targetTime - Date.now()) / 1000));
-				const promptPreview = t.prompt.length > 20 ? `${t.prompt.slice(0, 20)}...` : t.prompt;
-				const rowStr = `[#${t.id}] 倒计时 ${formatClockTime(rem)} (预定 ${formatDateTime(t.targetTime)}) - "${promptPreview}"`;
-				pushRow(safeFg(this.theme, "warning", rowStr), visibleWidth(rowStr));
-			}
-			if (pending.length > maxItems) {
-				const moreText = `... 以及其他 ${pending.length - maxItems} 个任务等待中`;
-				pushRow(safeFg(this.theme, "dim", moreText), visibleWidth(moreText));
-			}
-		}
-
-		pushRow(
-			safeFg(this.theme, "dim", "─".repeat(innerWidth - 2)),
-			visibleWidth("─".repeat(innerWidth - 2)),
-		);
-
-		// 提示帮助
-		const help1 = "快捷命令: /timer [秒] [分] [时] <提示词> 创建定时任务";
-		const help2 = "取消命令: /timer cancel <id> 或 /timer cancel all";
-		const help3 = "[按 Esc / 任意键 / 点击鼠标] 关闭此窗口";
-
-		pushRow(safeFg(this.theme, "muted", help1), visibleWidth(help1));
-		pushRow(safeFg(this.theme, "muted", help2), visibleWidth(help2));
-		pushRow(safeFg(this.theme, "dim", help3), visibleWidth(help3));
-
-		// 底边框
-		lines.push(
-			`${" ".repeat(boxLeft)}${safeFg(this.theme, "accent", "└" + "─".repeat(innerWidth) + "┘")}`,
-		);
-
-		return lines;
-	}
-
-	handleInput(_data: string): void {
-		this.onClose();
-	}
-
-	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-		if (event.type === "click") {
-			this.onClose();
-			return { handled: true };
-		}
-		return undefined;
-	}
+	invalidate(): void { this.modal.invalidate(); }
+	render(width: number): string[] { return this.modal.render(width); }
+	handleInput(data: string): void { this.modal.handleInput(data); }
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined { return this.modal.handleMouse(event); }
 }
 
 // ==========================================
