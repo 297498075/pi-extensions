@@ -443,6 +443,8 @@ export function setupFetchHook(): boolean {
 
 	const wrappedFetch: typeof fetch = async function (input: any, init: RequestInit = {}) {
 		if (!(globalThis as any)[FETCH_ACTIVE_SYMBOL]) return originalFetch(input, init);
+		// Fetch treats a null Web IDL dictionary exactly like omitted options.
+		init ??= {};
 		const liveConfig: RequestCompressConfig = (globalThis as any)[CONFIG_REF_SYMBOL] || DEFAULT_CONFIG;
 		const liveEnvCtx: PiEnvironmentContext = (globalThis as any)[ENV_REF_SYMBOL] || {
 			defaultProvider: undefined,

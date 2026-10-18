@@ -2,10 +2,11 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { stripVTControlCharacters } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AssistantMessageComponent, InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem, Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { isFocusable, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { showStatusModal } from "./lib/status-modal.ts";
 import { copyToClipboard, openLocalFile } from "./lib/desktop-actions.ts";
 
@@ -564,16 +565,21 @@ function shouldIncludeInWidget(toolName: string, config: RollingToolsConfig): bo
 }
 
 /** Mirror Pi file-tool paths without depending on a private host export. */
-function resolveToolPath(rawPath: string, cwd: string): string {
-	let path = rawPath.replace(/[\u00a0\u2000-\u200a\u202f\u205f\u3000]/g, " ").replace(/^@/, "");
-	if (process.platform === "win32" && !path.startsWith("//") && !path.includes("\\")) {
-		const drive = path.match(/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i);
-		if (drive) path = `${drive[1].toUpperCase()}:/${drive[2] || ""}`;
+function resolveToolPath(rawPath: string, cwd: string): string | undefined {
+	try {
+		let path = rawPath.replace(/[\u00a0\u2000-\u200a\u202f\u205f\u3000]/g, " ").replace(/^@/, "");
+		if (process.platform === "win32" && !path.startsWith("//") && !path.includes("\\")) {
+			const drive = path.match(/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i);
+			if (drive) path = `${drive[1].toUpperCase()}:/${drive[2] || ""}`;
+		}
+		if (path === "~") path = homedir();
+		else if (path.startsWith("~/") || (process.platform === "win32" && path.startsWith("~\\"))) path = join(homedir(), path.slice(2));
+		if (path.startsWith("file://")) path = fileURLToPath(path);
+		return resolve(cwd, path);
+	} catch {
+		// Metadata is best-effort; malformed/partial paths must never block a tool.
+		return undefined;
 	}
-	if (path === "~") path = homedir();
-	else if (path.startsWith("~/") || (process.platform === "win32" && path.startsWith("~\\"))) path = join(homedir(), path.slice(2));
-	if (path.startsWith("file://")) path = fileURLToPath(path);
-	return resolve(cwd, path);
 }
 
 /** 通用属性启发式推导 */
@@ -1532,6 +1538,7 @@ class ToolHistoryOverlayComponent implements Component {
 	/** 渲染缓存：用于鼠标命中检测 */
 	private listRowMap: Array<{ row: number; index: number }> = [];
 	private listViewportHeight = 1;
+	private listColumnWidth = 0;
 	private detailLineCount = 0;
 	private detailViewportHeight = 1;
 	private lastWidth = 80;
@@ -1577,7 +1584,7 @@ class ToolHistoryOverlayComponent implements Component {
 	refresh(): void {
 		const total = this.allItems.length;
 		if (total === 0) return;
-		if (this.followTail) {
+		if (this.followTail && this.selectedIndex !== total - 1) {
 			this.selectedIndex = total - 1;
 			this.detailScrollTop = 0;
 		}
@@ -1633,54 +1640,59 @@ class ToolHistoryOverlayComponent implements Component {
 
 	render(width: number): string[] {
 		this.lastWidth = width;
-		const theme = this.theme;
 		this.listRowMap = [];
+		this.listColumnWidth = 0;
+		if (width < 1) return [];
+		const theme = this.theme;
+		const termRows = Math.max(1, Math.floor(this.tui?.terminal?.rows ?? 30));
+		const termCols = Math.max(1, Math.floor(width));
 
-		const termRows = Math.max(10, this.tui?.terminal?.rows ?? 30);
-		const termCols = Math.max(30, width);
-
-		// 方框尺寸：占终端 90% 宽 / 80% 高（与 overlayOptions 一致），并居中
-		const boxW = Math.max(30, Math.min(termCols - 2, Math.floor(termCols * 0.9)));
-		const boxH = Math.max(8, Math.min(termRows - 2, Math.floor(termRows * 0.8)));
-		const boxTop = Math.max(0, Math.floor((termRows - boxH) / 2));
-		const boxLeft = Math.max(0, Math.floor((termCols - boxW) / 2));
+		// Keep the familiar centered frame, without viewport-exceeding minima.
+		const boxW = Math.max(1, Math.floor(termCols * 0.9));
+		const boxH = Math.max(1, Math.floor(termRows * 0.8));
+		const boxTop = Math.floor((termRows - boxH) / 2);
+		const boxLeft = Math.floor((termCols - boxW) / 2);
 		this.boxTop = boxTop;
 		this.boxLeft = boxLeft;
 		this.boxWidth = boxW;
 		this.boxHeight = boxH;
 
+		const framed = boxW >= 5 && boxH >= 6;
+		const inner = Math.max(1, boxW - (framed ? 4 : 0));
+		// A narrow/short viewport uses one detail column; arrows still select every tool.
+		const split = framed && inner >= 45;
+		const listWidth = split ? Math.floor(inner * 0.45) : 0;
+		const detailWidth = split ? inner - listWidth - 3 : inner;
+		this.listColumnWidth = listWidth;
 		const borderColor = (s: string) => theme.fg("accent", s);
-		const inner = Math.max(20, boxW - 4);
-		const listWidth = Math.max(20, Math.floor(inner * 0.45));
-		const detailWidth = Math.max(20, inner - listWidth - 3);
+		const frameLine = (left: string, text: string, right: string) => {
+			const content = truncateToWidth(text, boxW - 2);
+			return `${borderColor(left)}${content}${" ".repeat(Math.max(0, boxW - 2 - visibleWidth(content)))}${borderColor(right)}`;
+		};
+		const divider = (left: string, right: string) =>
+			`${borderColor(left)}${theme.fg("dim", "─".repeat(boxW - 2))}${borderColor(right)}`;
 
 		const total = this.allItems.length;
 		const loaded = this.loadedCount;
-		const canLoadMore = loaded < total;
-		const titleHint = canLoadMore
+		const titleHint = loaded < total
 			? theme.fg("dim", `↑ 上滑到顶加载更多 (${loaded}/${total})`)
 			: theme.fg("dim", `已全部加载 (${total})`);
-
-		// 方框内部行（不含外框）
 		const boxLines: string[] = [];
-		const titleText = ` ${theme.bold(theme.fg("toolTitle", "工具历史"))}  ${titleHint}   ${theme.fg("muted", "[Esc/点击外部 关闭] · 点击左侧行复制详情")}`;
-		const titlePad = Math.max(0, boxW - 2 - visibleWidth(titleText));
-		boxLines.push(`${borderColor("┌")}${titleText}${' '.repeat(titlePad)}${borderColor("┐")}`);
-		boxLines.push(`${borderColor("├")}${theme.fg("dim", "─".repeat(boxW - 2))}${borderColor("┤")}`);
+		if (framed) {
+			const titleText = ` ${theme.bold(theme.fg("toolTitle", "工具历史"))}  ${titleHint}   ${theme.fg("muted", "[Esc/点击外部 关闭] · 点击左侧行复制详情")}`;
+			boxLines.push(frameLine("┌", titleText, "┐"), divider("├", "┤"));
+		}
 
-		// 内容区高度 = 方框高 - 标题(1) - 标题分隔(1) - 底部分隔(1) - 提示(1) - 底边(1)
-		const viewportHeight = Math.max(3, boxH - 5);
+		const viewportHeight = Math.max(1, boxH - (framed ? 5 : 0));
 		this.listViewportHeight = viewportHeight;
 		this.detailViewportHeight = viewportHeight;
 
-		// 左栏：已加载的工具列表（带滚动偏移）
 		const loadedItems = this.loadedItems;
 		const listStart = Math.min(this.listScrollTop, Math.max(0, loadedItems.length - viewportHeight));
 		this.listScrollTop = listStart;
 		const listEnd = Math.min(loadedItems.length, listStart + viewportHeight);
-
 		const listRows: string[] = [];
-		for (let i = listStart; i < listEnd; i++) {
+		for (let i = listStart; split && i < listEnd; i++) {
 			const t = loadedItems[i];
 			const absIndex = this.loadedStart + i;
 			const isSel = absIndex === this.selectedIndex;
@@ -1691,16 +1703,11 @@ class ToolHistoryOverlayComponent implements Component {
 				: theme.fg("toolTitle", toolDisplayLabel(t));
 			const fixedWidth = visibleWidth(`${marker}${this.statusIcon(t)} ${badge} ${name} `);
 			const summaryMaxCols = Math.max(0, listWidth - fixedWidth);
-			const summary = summaryMaxCols > 0
-				? theme.fg("dim", truncateToWidth(t.summaryDisplay, summaryMaxCols))
-				: "";
-			const row = `${marker}${this.statusIcon(t)} ${badge} ${name}${summary ? ` ${summary}` : ""}`;
-			// 行号：标题(0) + 分隔(1) + 内容起始(2)
-			this.listRowMap.push({ row: 2 + listRows.length, index: absIndex });
-			listRows.push(row);
+			const summary = summaryMaxCols > 0 ? theme.fg("dim", truncateToWidth(t.summaryDisplay, summaryMaxCols)) : "";
+			listRows.push(`${marker}${this.statusIcon(t)} ${badge} ${name}${summary ? ` ${summary}` : ""}`);
+			this.listRowMap.push({ row: 2 + listRows.length - 1, index: absIndex });
 		}
 
-		// 右栏：选中条目详情
 		const detailLines = this.buildDetailLines(detailWidth);
 		this.detailLineCount = detailLines.length;
 		const detailStart = Math.min(this.detailScrollTop, Math.max(0, detailLines.length - viewportHeight));
@@ -1708,48 +1715,38 @@ class ToolHistoryOverlayComponent implements Component {
 		const detailEnd = Math.min(detailLines.length, detailStart + viewportHeight);
 
 		for (let row = 0; row < viewportHeight; row++) {
-			const left = listRows[row] ?? "";
 			const right = detailLines[detailStart + row] ?? "";
-			// 严格按可见终端列宽进行左侧对齐截断/补齐，保证无论包含何种字符都不会溢出冲撞分隔线
-			const leftColWidth = visibleWidth(left);
-			const leftPadded = leftColWidth <= listWidth
-				? left + " ".repeat(listWidth - leftColWidth)
-				: truncateToWidth(left, listWidth);
-			const sep = theme.fg("dim", " │ ");
-			const content = `${leftPadded}${sep}${right}`;
-			const pad = Math.max(0, boxW - 2 - visibleWidth(content));
-			boxLines.push(`${borderColor("│")}${content}${' '.repeat(pad)}${borderColor("│")}`);
+			let content = right;
+			if (split) {
+				const left = truncateToWidth(listRows[row] ?? "", listWidth);
+				const leftPadded = left + " ".repeat(Math.max(0, listWidth - visibleWidth(left)));
+				content = `${leftPadded}${theme.fg("dim", " │ ")}${right}`;
+			}
+			boxLines.push(framed ? frameLine("│", content, "│") : truncateToWidth(content, boxW));
 		}
 
-		// 底部提示（优先显示复制反馈）
-		boxLines.push(`${borderColor("├")}${theme.fg("dim", "─".repeat(boxW - 2))}${borderColor("┤")}`);
-		let hintText: string;
-		if (this.copyFeedback) {
-			hintText = theme.fg(this.copyFeedback.startsWith("✗") ? "error" : "success", this.copyFeedback);
-		} else if (this.detailLineCount > viewportHeight) {
-			hintText = theme.fg("muted", `详情 ${detailStart + 1}-${detailEnd}/${this.detailLineCount} · 滚轮滚动 · ↑↓ 选择 · Esc 关闭`);
-		} else {
-			hintText = theme.fg("muted", "滚轮滚动 · ↑↓ 选择 · 点击左侧行复制详情 · Esc 关闭");
+		if (framed) {
+			let hintText: string;
+			if (this.copyFeedback) {
+				hintText = theme.fg(this.copyFeedback.startsWith("✗") ? "error" : "success", this.copyFeedback);
+			} else if (this.detailLineCount > viewportHeight) {
+				hintText = theme.fg("muted", `详情 ${detailStart + 1}-${detailEnd}/${this.detailLineCount} · 滚轮/PgUp/PgDn · ↑↓ 选择 · Esc 关闭`);
+			} else {
+				hintText = theme.fg("muted", split ? "滚轮滚动 · ↑↓ 选择 · 点击左侧行复制详情 · Esc 关闭" : "↑↓ 选择工具 · 滚轮/PgUp/PgDn 详情 · Esc 关闭");
+			}
+			boxLines.push(divider("├", "┤"), frameLine("│", ` ${hintText}`, "│"), divider("└", "┘"));
 		}
-		const hintPad = Math.max(0, boxW - 2 - visibleWidth(hintText) - 1);
-		boxLines.push(`${borderColor("│")} ${hintText}${' '.repeat(hintPad)}${borderColor("│")}`);
-		boxLines.push(`${borderColor("└")}${theme.fg("dim", "─".repeat(boxW - 2))}${borderColor("┘")}`);
 
-		// 把方框合成到全屏画布上（框外为空白），从而能接收框外点击以关闭
+		// Full-screen canvas retains outside-click closing, but every line/row is bounded.
 		const blank = " ".repeat(termCols);
-		const lines: string[] = [];
-		for (let r = 0; r < boxTop; r++) lines.push(blank);
-		for (const bl of boxLines) {
-			const leftPad = " ".repeat(boxLeft);
-			const rightPad = " ".repeat(Math.max(0, termCols - boxLeft - visibleWidth(bl)));
-			lines.push(`${leftPad}${bl}${rightPad}`);
+		const lines = Array.from({ length: boxTop }, () => blank);
+		for (const line of boxLines) {
+			const padded = " ".repeat(boxLeft) + line;
+			lines.push(padded + " ".repeat(Math.max(0, termCols - visibleWidth(padded))));
 		}
-		const used = boxTop + boxLines.length;
-		for (let r = used; r < termRows; r++) lines.push(blank);
-
+		while (lines.length < termRows) lines.push(blank);
 		return lines;
 	}
-
 	/** 构建右侧详情行（已按宽度换行/截断） */
 	private buildDetailLines(width: number): string[] {
 		const theme = this.theme;
@@ -1757,17 +1754,18 @@ class ToolHistoryOverlayComponent implements Component {
 		const version = t?.detailVersion ?? 0;
 		if (t && this.detailCache?.item === t && this.detailCache.width === width && this.detailCache.version === version) return this.detailCache.lines;
 		const out: string[] = [];
+		const pushLine = (line: string) => out.push(...this.wrapLine(line, width, value => value));
 		if (!t) {
 			this.detailCache = undefined;
-			out.push(theme.fg("muted", "(无选中条目)"));
+			pushLine(theme.fg("muted", "(无选中条目)"));
 			return out;
 		}
 
-		out.push(theme.bold(theme.fg("toolTitle", `${toolDisplayLabel(t)}  [${t.index}]`)));
+		pushLine(theme.bold(theme.fg("toolTitle", `${toolDisplayLabel(t)}  [${t.index}]`)));
 		if (t.durationMs !== undefined) {
-			out.push(theme.fg("muted", `耗时 ${t.durationMs}ms · 状态 ${t.status}`));
+			pushLine(theme.fg("muted", `耗时 ${t.durationMs}ms · 状态 ${t.status}`));
 		}
-		if (t.fullPath) out.push(theme.fg("accent", `路径: ${t.fullPath}`));
+		if (t.fullPath) pushLine(theme.fg("accent", `路径: ${t.fullPath}`));
 		out.push("");
 
 		// 优先展示 detailContent（edit diff / write 正文 / 三方工具长文本）
@@ -1781,13 +1779,13 @@ class ToolHistoryOverlayComponent implements Component {
 						: t.detailKind === "command"
 							? "命令"
 							: "详情";
-			out.push(theme.fg("accent", `── ${kindLabel} ──`));
+			pushLine(theme.fg("accent", `── ${kindLabel} ──`));
 			for (const raw of detail.split("\n")) {
 				out.push(...this.wrapLine(raw, width, (line) => this.colorizeDetailLine(line, t.detailKind)));
 			}
 			out.push("");
 		} else if (t.fullCommand) {
-			out.push(theme.fg("accent", "── 命令 ──"));
+			pushLine(theme.fg("accent", "── 命令 ──"));
 			for (const raw of t.fullCommand.split("\n")) {
 				out.push(...this.wrapLine(raw, width, (line) => theme.fg("accent", line)));
 			}
@@ -1800,7 +1798,7 @@ class ToolHistoryOverlayComponent implements Component {
 			inputToShow = tryParseJson(t.summaryDisplay);
 		}
 		if (inputToShow !== undefined && inputToShow !== null) {
-			out.push(theme.fg("accent", "── 输入参数 ──"));
+			pushLine(theme.fg("accent", "── 输入参数 ──"));
 			const formattedInput = typeof inputToShow === "string"
 				? inputToShow
 				: JSON.stringify(inputToShow, null, 2);
@@ -1812,13 +1810,13 @@ class ToolHistoryOverlayComponent implements Component {
 
 		// 输出内容
 		if (t.output && t.output.trim().length > 0) {
-			out.push(theme.fg("accent", "── 输出 ──"));
+			pushLine(theme.fg("accent", "── 输出 ──"));
 			for (const raw of t.output.replace(/\r\n/g, "\n").split("\n")) {
 				out.push(...this.wrapLine(raw, width, (line) => theme.fg("muted", line)));
 			}
 		}
 
-		if (out.length === 0) out.push(theme.fg("muted", "(无详情)"));
+		if (out.length === 0) pushLine(theme.fg("muted", "(无详情)"));
 		this.detailCache = { item: t, width, version, lines: out };
 		return out;
 	}
@@ -1837,7 +1835,7 @@ class ToolHistoryOverlayComponent implements Component {
 	/** 按可见列宽线性换行，保留 ANSI 与完整字素簇。 */
 	private wrapLine(raw: string, width: number, style: (line: string) => string): string[] {
 		// One ANSI/grapheme-aware pass, not repeated scans of every remaining suffix.
-		return wrapTextWithAnsi(raw, Math.max(1, width)).map(style);
+		return wrapTextWithAnsi(raw, Math.max(1, width)).map(line => style(truncateToWidth(line, Math.max(1, width))));
 	}
 
 	handleInput(data: string): void {
@@ -1857,11 +1855,13 @@ class ToolHistoryOverlayComponent implements Component {
 		}
 		// PageUp/PageDown 滚动详情
 		if (matchesKey(data, "pageUp")) {
+			this.followTail = false;
 			this.detailScrollTop = Math.max(0, this.detailScrollTop - this.detailViewportHeight);
 			this.requestRender();
 			return;
 		}
 		if (matchesKey(data, "pageDown")) {
+			this.followTail = false;
 			this.detailScrollTop = Math.min(
 				Math.max(0, this.detailLineCount - this.detailViewportHeight),
 				this.detailScrollTop + this.detailViewportHeight,
@@ -1941,9 +1941,7 @@ class ToolHistoryOverlayComponent implements Component {
 		if (event.type === "wheel") {
 			const delta = event.wheelDelta ?? 0;
 			// 判断鼠标位于左栏还是右栏（内容区从边框内开始，x 偏移 1）
-			const inner = Math.max(20, this.boxWidth - 4);
-			const listWidth = Math.max(20, Math.floor(inner * 0.45));
-			const inList = event.x <= this.boxLeft + listWidth + 3;
+			const inList = this.listColumnWidth > 0 && event.x > this.boxLeft && event.x < this.boxLeft + 1 + this.listColumnWidth;
 
 			if (inList) {
 				const loadedItems = this.loadedItems;
@@ -1961,6 +1959,7 @@ class ToolHistoryOverlayComponent implements Component {
 					this.listScrollTop = Math.min(maxScroll, next);
 				}
 			} else {
+				if (delta !== 0) this.followTail = false;
 				const maxScroll = Math.max(0, this.detailLineCount - this.detailViewportHeight);
 				this.detailScrollTop = Math.max(0, Math.min(maxScroll, this.detailScrollTop + delta));
 			}
@@ -1968,8 +1967,9 @@ class ToolHistoryOverlayComponent implements Component {
 			return { handled: true };
 		}
 
-		if (event.type === "click") {
-			// 列表行命中：选中并复制该行详情
+		if (event.type === "click" && event.button === "left" && this.listColumnWidth > 0 &&
+			event.x > this.boxLeft && event.x < this.boxLeft + 1 + this.listColumnWidth) {
+			// Only primary clicks in the rendered list select/copy; detail clicks are inert.
 			const hit = this.listRowMap.find((m) => m.row === event.y - this.boxTop);
 			if (hit) {
 				this.selectedIndex = hit.index;
@@ -2044,7 +2044,7 @@ function autoColorizeStatusText(text: string): string {
  * 匹配插件在工具行里重复插入的提示头（如 SoL-Pi 的 “⚡ SoL-Pi · X” / “Money saved · Y”）。
  * 带上 `·` 分隔符以尽量避免误伤工具自身的输出。
  */
-const TOOL_NOTIFICATION_HEADER_RE = /(SoL-Pi\s*·|Money saved\s*·)/;
+const TOOL_NOTIFICATION_HEADER_RE = /^(?:⚡\s*)?(?:SoL-Pi|Money saved)\s*·(?:\s|$)/;
 
 /**
  * 包装组件：渲染后过滤掉插件插入的提示头行。
@@ -2058,14 +2058,24 @@ class NotificationHeaderStripper implements Component {
 	constructor(inner: Component, isEnabled: () => boolean) {
 		this.inner = inner;
 		this.isEnabled = isEnabled;
+		// Pi's focus guard checks property presence, not its value. Expose it only
+		// for a focusable child, and forward both focus and blur to that child.
+		if (isFocusable(inner)) Object.defineProperty(this, "focused", {
+			get: () => inner.focused,
+			set: (value: boolean) => { inner.focused = value; },
+			enumerable: true,
+		});
 	}
 
 	render(width: number): string[] {
 		const lines = this.inner.render(width);
 		this.mouseRows = [];
 		const filter = this.isEnabled();
+		let inHeader = true;
 		return lines.filter((line, index) => {
-			if (filter && TOOL_NOTIFICATION_HEADER_RE.test(line)) return false;
+			const plain = stripVTControlCharacters(line).trimStart();
+			if (filter && inHeader && TOOL_NOTIFICATION_HEADER_RE.test(plain)) return false;
+			if (plain.trim()) inHeader = false;
 			this.mouseRows.push(index);
 			return true;
 		});

@@ -4,6 +4,16 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- fix(timer): stop interpreting English prompt prefixes as time units; parse tool/dialog time fields independently from numeric or English prompts.
+- fix(stream-read-retry): leave explicit permanent HTTP client failures (including 413/422) untouched while preserving potentially transient statuses and transport retries.
+- fix(paths): isolate invalid/partial file URL metadata per field so rolling-tools cannot block tool dispatch and image-pager still processes unrelated images.
+- fix(rolling-tools): filter only recognized leading header prefixes, preserving quoted/source/body text, ANSI handling and filtered mouse coordinates.
+- fix(rolling-tools): forward focus/blur for focusable renderer children only, retaining native cursor/IME placement and plain-text focus behavior.
+- fix(rolling-tools): retain manual detail scroll positions during live refresh; restrict selection/copy to primary clicks in the actual left list.
+- fix(rolling-tools): bound history frames/canvases and wrap detail headers/paths; use a navigable detail-only layout on narrow/short screens.
+- fix(request-compress): preserve native nullable fetch options with compression enabled or disabled.
+- test: add bounded, hermetic extension-boundary regressions for all nine follow-up review issues; deferred VOICE-001 behavior remains unchanged.
+
 - fix(rolling-tools): preserve native/third-party call and result component reuse by unwrapping `lastComponent`; existing decorators follow off/unload changes and preserve input/mouse hit targets.
 - fix(rolling-tools): use linear ANSI/grapheme-aware wrapping and content/width/theme-aware detail caching instead of repeated suffix-width scans.
 - fix(rolling-tools): give transient status keys independent deadlines and clean them up on off, config reload and shutdown without touching persistent keys.

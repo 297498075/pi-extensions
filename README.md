@@ -58,7 +58,7 @@ pi --extension ./extensions/example.ts
 
 `extensions/stream-read-retry.ts` fixes a gap in Pi's built-in retry classification. Pi already has agent-level retry with exponential backoff, but its transient-error matcher (`isRetryableAssistantError` in `pi-ai/dist/utils/retry.js`) does not cover every premature stream ending. In particular, a stream that closes before its terminal completion event — for example `stream error: stream disconnected before completion: stream closed before response.completed` — is not recognized, so the run ends immediately instead of retrying.
 
-This extension matches a set of transport-level premature-stream-end signatures (stream/connection resets, unexpected end of stream, `closed before response.completed`, ...) and rewrites only those assistant errors to include `Network error`, which lets Pi's existing retry flow handle them. Messages that Pi already classifies as retryable, and deterministic errors such as quota/billing or invalid-request failures, are left untouched. The original error text is preserved after the prefix.
+This extension matches a set of transport-level premature-stream-end signatures (stream/connection resets, unexpected end of stream, `closed before response.completed`, ...) and rewrites only those assistant errors to include `Network error`, which lets Pi's existing retry flow handle them. Existing retryable transport markers are not prefixed twice. Deterministic quota/billing/invalid-request failures and explicit permanent HTTP client statuses (including 413/422) are left untouched; potentially transient 408/409/425/429 statuses retain the existing transport-retry behavior. The original error text is preserved after the prefix.
 
 Load the package or the extension directly:
 
@@ -102,8 +102,8 @@ The extension has no network, file, command, or external state side effects. The
 - **Reasoning display only**: Thinking blocks are hidden by the assistant component renderer; persisted messages and provider reasoning signatures remain intact. `/rolling-tools off` restores the normal view and notifications. Shutdown releases runtime-owned hooks.
 - **All tools silenced by default**: Every tool (built-ins, `edit`, `write`, `codemode`, MCP proxies, SoL-Pi `recall`, Trellis `subagent`, and arbitrary third-party tools) is hidden from the transcript by default and rolled into the widget. Tune with `silencedTools` / `widgetTools` (supports `*` wildcards).
 - **Non-intrusive transcript**: Managed tools occupy 0 lines when collapsed, preventing terminal scroll floods. Press `Ctrl+O` to expand if full outputs are needed.
-- **History overlay dialog (`➕`)**: A persistent header row sits above the tool list and carries a `➕` button on its right edge. Clicking it opens a large bordered two-pane overlay dialog showing the full history on the left and the selected tool's complete content on the right — including `edit` diffs, `write` file bodies, full commands, and outputs. The overlay updates live while the agent is still running.
-- **Responsive history details**: ANSI/grapheme-aware wrapping runs in one pass. Detail layout is cached by selected item, content revision, width and theme invalidation; unchanged 100ms refreshes do not rewrap the entire output.
+- **History overlay dialog (`➕`)**: A persistent header row sits above the tool list and carries a `➕` button on its right edge. Clicking it opens a large bordered two-pane overlay dialog showing the full history on the left and the selected tool's complete content on the right — including `edit` diffs, `write` file bodies, full commands, and outputs. The overlay updates live while the agent is still running. Narrow or short viewports use a single detail column instead of clipping the right pane; ↑/↓ still selects every tool, and PgUp/PgDn or the wheel scrolls details.
+- **Responsive history details**: ANSI/grapheme-aware wrapping runs in one pass. Detail layout is cached by selected item, content revision, width and theme invalidation; unchanged 100ms refreshes do not rewrap the entire output or reset manual scrolling. Keyboard/wheel detail scrolling suspends tail following; clicking the latest list item restores it. Only primary clicks inside the visible left list select/copy; clicks in the detail pane do not.
 - **View mode toggle button (`🔽` / `⏏️`)**: Positioned directly to the left of `➕`, this button toggles the widget between two display modes:
   1. **Running tasks only (`running` - `⏏️`)**: Active running tasks are merged directly into the header status line alongside a live elapsed timer (`(19ms)`, `(2.4s)`). The widget remains strictly 1-line high to eliminate any vertical height flicker.
   2. **Fixed recent rows (`fixed` - `🔽`)**: Displays the most recent `maxRecentTools` executions (default 3 rows, customizable via config). Running tasks in this list also display live ticking durations.
@@ -113,7 +113,7 @@ The extension has no network, file, command, or external state side effects. The
 - **Lazy loading with wheel scroll**: The overlay supports native mouse-wheel scrolling. Scrolling up past the top of the list lazily loads the next `lazyLoadStep` (default 10) older entries, so long histories stay responsive without loading everything at once.
 - **Persistent across turns and sessions**: The rolling block no longer resets on each new task. History is kept in memory across turns and persisted to the session via `pi.appendEntry()` (custom type `rolling-tools-history`), so it is restored on `reload`, `resume`, and `fork` when `persistAcrossSessions` is enabled.
 - **Bounded snapshots**: Stored input, command, output and detail previews are capped at 20,000 characters. Complete top-level inputs are recovered from the original tool-call entries in the active branch; nested calls without transcript entries keep an explicitly truncated preview. Original call arguments and result entries are not rewritten.
-- **Renderer reuse**: Call/result decorators unwrap `context.lastComponent` before invoking the native or third-party renderer, preserving component reuse. Header stripping follows on/off and unload changes even for existing rows.
+- **Renderer reuse**: Call/result decorators unwrap `context.lastComponent` before invoking the native or third-party renderer, preserving component reuse. Focus/blur is forwarded only for focusable children, preserving native input cursors and IME placement without making plain text focusable. Header stripping follows on/off and unload changes even for existing rows.
 - **Universal tool & MCP support**: Uses dynamic in-place decoration on `ToolExecutionComponent`, supporting built-ins, MCP proxies (`mcp`, `mcp__*`), Rider MCP tools (`rider_execute_tool`), SoL-Pi tools, and arbitrary third-party tools with generic parameter heuristics.
 - **Unified tips handling**: Plugin tips (`ui.notify`) are suppressed from the transcript. `ui.setStatus` tips stay in the footer and are colorized, but are only auto-cleared when their rule sets `durationMs`. Each key has an independent deadline; off, config reload and shutdown clean up transient effects without erasing persistent keys. Persistent keys (`persistentKeys`, default `["blackhole", "mcp"]`) pass through untouched so long-lived gauges such as pi-blackhole's footer bar and the MCP server status keep working. `error` / `warning` messages and any message containing a `notificationKeywords` word always pass through. Plugin headers such as SoL-Pi's `⚡ SoL-Pi · …` / `Money saved · …` are stripped from tool rows.
 - **Configuration file support**: Supports global configuration (`~/.pi/agent/extensions/rolling-tools/config.json`) and local project overrides (`./.pi/rolling-tools.json`).
@@ -121,7 +121,7 @@ The extension has no network, file, command, or external state side effects. The
 - **Fixed-dock rolling widget**: Shows the latest running/completed tools in a fixed dock above the editor with status (`⏳`/`✓`/`✗`), duration, and arguments summary.
 - **Click-to-expand details**: Click any tool item to toggle details (`▸` / `▾`) such as full paths, multiline commands, and execution outputs without mouse hover flickering. Click details to copy to clipboard, or `Ctrl+Left-click` on paths to open existing local files.
 - **Desktop action safety**: File paths are passed as literal data, never concatenated into `cmd`. Windows uses a fixed Windows PowerShell script with the path in an environment variable; macOS/Linux use `open`/`xdg-open` argv. Clipboard helpers are `clip.exe`/`pbcopy`/`xclip`. Missing programs, pipe errors, nonzero exits and five-second timeouts show local failure feedback instead of terminating Pi; success is shown only after the helper succeeds. Shutdown cancels in-flight helpers. Opening files still invokes their OS associations, so only open trusted files.
-- **File path metadata**: Display/copy/open paths follow Pi conventions, including `~`, `@`, file URLs, Unicode spaces and Windows shell drive paths. Old metadata is repaired in memory on restore when its original arguments are available.
+- **File path metadata**: Display/copy/open paths follow Pi conventions, including `~`, `@`, file URLs, Unicode spaces and Windows shell drive paths. Old metadata is repaired in memory on restore when its original arguments are available. Invalid or incomplete file URLs are omitted from actionable path metadata without blocking tool execution; original argument text remains available.
 - **Strict display widths**: Fixed mode wraps complete tool names and command/path summaries; running/error/status/feedback rows are bounded by visible terminal columns, including Chinese, emoji, ANSI styles and narrow panes.
 - **Commands**:
   - `/rolling-tools`: Toggle widget and transcript silencing on/off.
@@ -222,7 +222,7 @@ Two escape hatches keep important messages visible:
 1. **Type-based** — `error` and `warning` notifications always pass through (Pi routes them to `showError` / `showWarning`).
 2. **Keyword-based** — any `info` message containing a word from `notificationKeywords` (default: `error`, `failed`, `failure`, `warning`, `错误`, `失败`, `警告`, `⚠`, `❌`, `🔴`) also passes through.
 
-Additionally, `stripToolNotificationHeaders` (default `true`) removes plugin-inserted headers such as SoL-Pi's `⚡ SoL-Pi · Action Fusion` / `Money saved · …` lines from tool rows, so the same information is not repeated next to the tool. This uses `pi.registerToolRenderer` and degrades silently on Pi versions that lack it.
+Additionally, `stripToolNotificationHeaders` (default `true`) removes plugin-inserted headers such as SoL-Pi's `⚡ SoL-Pi · Action Fusion` / `Money saved · …` lines from tool rows, so the same information is not repeated next to the tool. Only known prefixes in the leading header block are removed, ignoring ANSI decoration; quoted/source-code matches and later body rows remain visible. This uses `pi.registerToolRenderer` and degrades silently on Pi versions that lack it.
 
 > **Note on widget vs. overlay scrolling**: Pi's dock does not forward mouse-wheel events to widgets, so the small rolling widget itself is not scrollable. Mouse-wheel scrolling and top-edge lazy loading are provided inside the `[⤢]` overlay dialog, where the TUI dispatches wheel events directly to the overlay component.
 
@@ -322,6 +322,7 @@ pi --extension ./extensions/image-pager.ts
   - 内置大小阈值（`minBytesThreshold`，默认 1KB），小请求自动忽略，避免小包负收益。
 - **TUI 状态命令**: 提供 `/request-compress [status|on|off|reload]`，状态使用模态窗口，避免被通知静音吞掉；非 TUI 模式降级通知。
 - **生命周期**: fetch hook 在 `session_start` 安装，关闭/卸载时恢复或变为透传，不覆盖其他扩展后来安装的 wrapper。
+- **透明参数兼容**: 保留原生 `fetch(url, null)` 的空选项语义；压缩开关打开或关闭时均适用于字符串、URL 和 Request 输入。
 
 ### 配置文件
 
@@ -401,6 +402,7 @@ Ctrl+Shift+T      # 快速呼出/关闭任务树弹窗
 - **全格式智能时间解析**：
   - 用户指定「秒 分 时」格式：`/timer 30 2 0 检查并修复单元测试`（表示 30秒 2分 0时 = 150秒）；
   - 自然时间语法：`/timer 5m 执行代码重构`、`/timer 30s 提醒我提交代码`、`/timer 1h 30m 发布版本`、`/timer 1小时30分钟 测试`；
+  - 裸数字按秒解析：`/timer 5 help me`、`/timer 5 merge branches` 均为 5 秒，不会吞掉英文提示词开头的 h/m/s；工具 `timeExpression` 和交互弹窗的时间字段与提示词独立解析；
   - 标准冒号时钟：`/timer 00:05:00 运行检查` 或 `/timer 02:30 启动构建`；
   - 无参数交互式创建：直接运行 `/timer`，弹出输入框引导输入时间与提示词。
 - **长时长安全**：超过 Node 单次计时上限（约 24.9 天）时分段等待，到期前重新检查目标时间，避免大数溢出后立即执行。定时器只在当前进程/扩展运行时内有效，退出或 reload 不自动恢复待执行任务。

@@ -255,9 +255,10 @@ export function parseTimerArgs(
 		};
 	}
 
-	// 4. 自然时间单位 (英文/中文)
+	// 4. 自然时间单位 (英文/中文)。Do not consume h/m/s from help/merge/send.
+	// Digits still permit adjacent tokens such as 1h30m; Chinese text may follow a unit.
 	const unitPattern =
-		/^(\d+(?:\.\d+)?)\s*(hours?|小时|时|h|minutes?|分钟|分|min|m|seconds?|秒钟|秒|sec|s)/i;
+		/^(\d+(?:\.\d+)?)\s*((?:hours?|h|minutes?|min|m|seconds?|sec|s)(?![a-z_])|小时|时|分钟|分|秒钟|秒)/i;
 	let remaining = trimmed;
 	let accumulatedSeconds = 0;
 	const matchedTokens: string[] = [];
@@ -771,12 +772,12 @@ export async function handleTimerCommand(
 				ctx.ui.notify("已取消创建定时任务（未提供提示词）", "info");
 				return;
 			}
-			const parsed = parseTimerArgs(`${timeStr.trim()} ${promptStr.trim()}`);
+			const parsed = parseTimerArgs(timeStr.trim());
 			if (!parsed.success) {
 				ctx.ui.notify(parsed.error, "warning");
 				return;
 			}
-			manager.createTask(parsed.data.seconds, parsed.data.prompt, parsed.data.rawTime, ctx);
+			manager.createTask(parsed.data.seconds, stripOuterQuotes(promptStr), parsed.data.rawTime, ctx);
 			return;
 		}
 
@@ -996,7 +997,8 @@ export default function timerExtension(pi: ExtensionAPI): void {
 			let rawTime = "";
 
 			if (typedParams.timeExpression) {
-				const parsed = parseTimerArgs(`${typedParams.timeExpression} ${typedParams.prompt}`);
+				// Time and prompt are separate fields: a numeric/English prompt is never part of the duration.
+				const parsed = parseTimerArgs(typedParams.timeExpression);
 				if (!parsed.success) {
 					return {
 						content: [{ type: "text" as const, text: `时间表达式解析失败: ${parsed.error}` }],

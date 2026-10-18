@@ -287,6 +287,12 @@ export function normalizeDisplayPath(rawPath: string, cwd?: string): string {
 	return normalize(p).replace(/\\/g, "/");
 }
 
+/** A bad/partial tool path must not disable paging for unrelated images. */
+function tryNormalizeDisplayPath(rawPath: string, cwd?: string): string | undefined {
+	try { return normalizeDisplayPath(rawPath, cwd); }
+	catch { return undefined; }
+}
+
 /**
  * 构建智能指针自愈占位符文本
  */
@@ -394,7 +400,7 @@ export function pageOutContextImages(
 					if (args && typeof args === "object") {
 						const candidate = args.path || args.file_path || args.filePath || args.target;
 						if (typeof candidate === "string" && candidate.trim()) {
-							filePath = normalizeDisplayPath(candidate, cwd);
+							filePath = tryNormalizeDisplayPath(candidate, cwd);
 						}
 					}
 					toolCallMap.set(block.id, { toolName, filePath });
@@ -416,7 +422,7 @@ export function pageOutContextImages(
 			if (!filePath && msg.details && typeof msg.details === "object") {
 				const dPath = (msg.details as any).path || (msg.details as any).filePath;
 				if (typeof dPath === "string" && dPath.trim()) {
-					filePath = normalizeDisplayPath(dPath, cwd);
+					filePath = tryNormalizeDisplayPath(dPath, cwd);
 				}
 			}
 

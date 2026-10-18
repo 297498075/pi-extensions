@@ -56,6 +56,18 @@ function includesAny(haystack: string, needles: readonly string[]): boolean {
 	return needles.some((needle) => haystack.includes(needle));
 }
 
+/** Only explicit HTTP/status codes or a leading status are interpreted as client errors. */
+function hasPermanentClientStatus(text: string): boolean {
+	// Preserve the existing treatment of potentially transient client statuses.
+	const transient = new Set([408, 409, 425, 429]);
+	const codes = text.matchAll(/\b(?:http(?:\/\d(?:\.\d)?)?(?:\s+(?:status(?:\s+code)?|error))?|status(?:[_ -]?code)?|error[_ -]?code)["\']?\s*[:=]?\s*["\']?(4\d{2})\b/g);
+	for (const match of codes) {
+		if (!transient.has(Number(match[1]))) return true;
+	}
+	const leading = text.match(/^\s*(?:error:\s*)?(4\d{2})\b/);
+	return Boolean(leading && !transient.has(Number(leading[1])));
+}
+
 /**
  * Reclassify a provider stream read failure so Pi's built-in retry loop handles it.
  * The original error is kept in the message for diagnostics.
@@ -71,6 +83,7 @@ export default function streamReadRetry(pi: ExtensionAPI): void {
 		// A deterministic provider rejection may be wrapped in a stream error.
 		// Transport wording must never override authentication, schema or limits.
 		if (/invalid[_ -]?request|unsupported|invalid[_ -]?parameter|authentication|unauthorized|forbidden|api[_ -]?key|quota|billing|budget|usage[_ -]?limit|content[_ -]?policy|safety|\b40[0134]\b/.test(normalized)) return;
+		if (hasPermanentClientStatus(normalized)) return;
 		if (!includesAny(normalized, PREMATURE_STREAM_END_SIGNATURES)) return;
 		// Already retryable (or already rewritten by us): nothing to do.
 		if (includesAny(normalized, ALREADY_RETRYABLE_SIGNATURES)) return;
