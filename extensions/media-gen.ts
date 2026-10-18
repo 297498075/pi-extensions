@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, extname, isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -333,32 +333,25 @@ export function formatLocalFileUrl(filePath: string): string {
  */
 async function loadInputImage(input: string, cwd: string = process.cwd(), signal?: AbortSignal): Promise<{ buffer: Buffer; mimeType: string }> {
 	signal?.throwIfAborted();
+	let buffer: Buffer;
 	if (input.startsWith("http://") || input.startsWith("https://")) {
 		const res = await fetch(input, { signal });
 		if (!res.ok) {
 			throw new Error(`Failed to download input image from URL (${res.status} ${res.statusText})`);
 		}
-		const arrayBuf = await res.arrayBuffer();
-		const mime = res.headers.get("content-type") || "image/png";
-		const buffer = Buffer.from(arrayBuf);
-		imageExtension(buffer);
-		return { buffer, mimeType: mime };
+		buffer = Buffer.from(await res.arrayBuffer());
+	} else {
+		const resolvedPath = isAbsolute(input) ? input : resolve(cwd, input);
+		if (!existsSync(resolvedPath)) {
+			throw new Error(`Input image file not found at path: ${resolvedPath}`);
+		}
+		buffer = readFileSync(resolvedPath);
 	}
 
-	const resolvedPath = isAbsolute(input) ? input : resolve(cwd, input);
-	if (!existsSync(resolvedPath)) {
-		throw new Error(`Input image file not found at path: ${resolvedPath}`);
-	}
-
-	const buffer = readFileSync(resolvedPath);
-	const ext = extname(resolvedPath).toLowerCase();
-	let mimeType = "image/png";
-	if (ext === ".jpg" || ext === ".jpeg") mimeType = "image/jpeg";
-	else if (ext === ".webp") mimeType = "image/webp";
-	else if (ext === ".gif") mimeType = "image/gif";
-
-	imageExtension(buffer);
-	return { buffer, mimeType };
+	// Validated bytes, not an object-store header or a misleading file suffix,
+	// determine both multipart and data-URI MIME types.
+	const extension = imageExtension(buffer);
+	return { buffer, mimeType: extension === "jpg" ? "image/jpeg" : `image/${extension}` };
 }
 
 /** Reject error pages/empty payloads, and keep file extensions consistent with the bytes. */
@@ -484,7 +477,7 @@ async function callImageApi(options: {
 		// Try OpenAI standard /images/edits endpoint
 		const formData = new FormData();
 		const blob = new Blob([new Uint8Array(buffer)], { type: mimeType });
-		formData.append("image", blob, "image.png");
+		formData.append("image", blob, `image.${imageExtension(buffer)}`);
 		formData.append("model", model);
 		formData.append("prompt", prompt);
 		formData.append("size", dimensions.openAiSize);

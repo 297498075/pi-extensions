@@ -223,7 +223,7 @@ export function loadConfig(cwd: string = process.cwd()): RequestCompressConfig {
 
 export interface PiEnvironmentContext {
 	defaultProvider?: string;
-	providerBaseUrls: Map<string, string>; // baseUrl -> providerId
+	providerBaseUrls: Map<string, string | string[]>; // Full API base URL -> provider(s); shared endpoints stay ambiguous
 	modelToProvider: Map<string, string>;  // modelId -> providerId
 }
 
@@ -253,11 +253,14 @@ export function resolvePiEnvironment(): PiEnvironmentContext {
 			for (const [providerId, providerObj] of Object.entries<any>(providers)) {
 				if (providerObj?.baseUrl && typeof providerObj.baseUrl === "string") {
 					try {
-						const normalizedUrl = new URL(providerObj.baseUrl).host.toLowerCase();
-						ctx.providerBaseUrls.set(normalizedUrl, providerId);
-					} catch {
-						ctx.providerBaseUrls.set(providerObj.baseUrl.toLowerCase(), providerId);
-					}
+						const url = new URL(providerObj.baseUrl);
+						if (url.protocol === "http:" || url.protocol === "https:") {
+							const normalizedUrl = url.origin + url.pathname.replace(/\/+$/, "");
+							const previous = ctx.providerBaseUrls.get(normalizedUrl);
+							ctx.providerBaseUrls.set(normalizedUrl, previous === undefined ? providerId :
+								[...new Set([...(Array.isArray(previous) ? previous : [previous]), providerId])]);
+						}
+					} catch { /* Invalid base URLs cannot establish request ownership. */ }
 				}
 				if (Array.isArray(providerObj?.models)) {
 					for (const modelItem of providerObj.models) {
@@ -272,6 +275,32 @@ export function resolvePiEnvironment(): PiEnvironmentContext {
 	} catch {}
 
 	return ctx;
+}
+
+/** Match origin and case-sensitive path boundaries, preferring the most specific API prefix. */
+function requestProvider(url: URL | undefined, envCtx: PiEnvironmentContext): { providerId?: string; ambiguous: boolean } {
+	let longestPrefix = -1;
+	const providers = new Set<string>();
+	if (!url) return { ambiguous: false };
+	for (const [baseUrl, ids] of envCtx.providerBaseUrls) {
+		let prefixLength: number;
+		if (baseUrl.includes("://")) {
+			try {
+				const base = new URL(baseUrl);
+				const prefix = base.pathname.replace(/\/+$/, "");
+				if (base.origin !== url.origin || (url.pathname !== prefix && !url.pathname.startsWith(`${prefix}/`))) continue;
+				prefixLength = prefix.length;
+			} catch { continue; }
+		} else {
+			// Retain the exported helper's legacy host-only environment contract.
+			if (baseUrl.toLowerCase() !== url.host.toLowerCase()) continue;
+			prefixLength = 0;
+		}
+		if (prefixLength < longestPrefix) continue;
+		if (prefixLength > longestPrefix) { providers.clear(); longestPrefix = prefixLength; }
+		for (const id of Array.isArray(ids) ? ids : [ids]) providers.add(id);
+	}
+	return { providerId: providers.size === 1 ? providers.values().next().value : undefined, ambiguous: providers.size > 1 };
 }
 
 export function compressPayload(
@@ -368,10 +397,13 @@ export function shouldCompressRequest(
 	}
 
 	// A model name alone is not proof of ownership: unrelated services can use
-	// the same JSON fields. Unknown hosts are opt-in only via targetHosts.
-	const knownProvider = urlObj && envCtx.providerBaseUrls.get(urlObj.host.toLowerCase());
+	// the same JSON fields. Unknown API addresses require explicit targetHosts opt-in.
+	const { providerId: knownProvider, ambiguous } = requestProvider(urlObj, envCtx);
+	if (ambiguous) {
+		return { shouldCompress: false, reason: "Ambiguous provider API base URL; leaving request uncompressed" };
+	}
 	if (!knownProvider && config.targetHosts.length === 0) {
-		return { shouldCompress: false, reason: "Unknown API host (not in provider base URLs or targetHosts)" };
+		return { shouldCompress: false, reason: "Unknown API URL (outside provider base URLs or targetHosts)" };
 	}
 	if (!modelId && config.targetHosts.length === 0) {
 		return { shouldCompress: false, reason: "Request has no model; explicit targetHosts opt-in required" };

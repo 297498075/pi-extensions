@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem, Component, KeyId, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { Key, matchesKey, sliceByColumn, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Key, matchesKey, sliceByColumn, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import { StatusModalComponent } from "./lib/status-modal.ts";
 
@@ -810,45 +810,21 @@ function wrapWithPrefix(
 	firstPrefix: string,
 	restPrefix: string,
 ): string[] {
-	if (maxWidth <= 4) return [truncateToWidth(`${firstPrefix}${text}`, Math.max(1, maxWidth))];
-	const firstW = visibleWidth(firstPrefix);
-	const restW = visibleWidth(restPrefix);
-	const lines: string[] = [];
-	const rawParagraphs = text.split(/\r?\n/);
+	const width = Math.max(1, maxWidth);
+	const prefixWidth = Math.max(visibleWidth(firstPrefix), visibleWidth(restPrefix));
+	// Keep enough room for wide graphemes/content; omit decorative prefixes on tiny viewports.
+	if (width - prefixWidth < Math.min(8, width)) return wrapTextWithAnsi(text, width);
+	return wrapTextWithAnsi(text, width - prefixWidth).map((line, index) =>
+		truncateToWidth(`${index === 0 ? firstPrefix : restPrefix}${line}`, width));
+}
 
-	for (let pIdx = 0; pIdx < rawParagraphs.length; pIdx++) {
-		const raw = rawParagraphs[pIdx];
-		let remaining = raw;
-		let isFirstLineOfBlock = lines.length === 0;
-
-		if (!remaining) {
-			lines.push(isFirstLineOfBlock ? firstPrefix.trimEnd() : restPrefix.trimEnd());
-			continue;
-		}
-
-		while (remaining.length > 0) {
-			const currentPrefix = isFirstLineOfBlock ? firstPrefix : restPrefix;
-			const currentPrefixW = isFirstLineOfBlock ? firstW : restW;
-			const maxContentW = Math.max(8, maxWidth - currentPrefixW);
-
-			if (visibleWidth(remaining) <= maxContentW) {
-				lines.push(`${currentPrefix}${remaining}`);
-				break;
-			}
-
-			let take = maxContentW;
-			let chunk = sliceByColumn(remaining, 0, take);
-			while (visibleWidth(chunk) > maxContentW && take > 1) {
-				take--;
-				chunk = sliceByColumn(remaining, 0, take);
-			}
-
-			lines.push(`${currentPrefix}${chunk}`);
-			remaining = remaining.slice(chunk.length).trimStart();
-			isFirstLineOfBlock = false;
-		}
-	}
-	return lines;
+function treePrefixFor(node: TreeNode, maxWidth: number): string {
+	let prefix = "";
+	for (let depth = 0; depth < node.depth; depth++) prefix += node.ancestorHasNextSibling[depth] ? "│  " : "   ";
+	prefix += node.depth === 0 ? "" : node.isLastChild ? "└─ " : "├─ ";
+	const width = visibleWidth(prefix);
+	if (width <= maxWidth) return prefix;
+	return maxWidth > 0 ? `…${sliceByColumn(prefix, width - maxWidth + 1, maxWidth - 1)}` : "";
 }
 
 function getStatusGlyph(status: TodoStatus): { glyph: string; colorKey: string } {
@@ -1067,6 +1043,13 @@ export class TodoTreeOverlayComponent implements Component {
 	private listHeight = 10;
 	private detailHeight = 5;
 	private totalDetailLines = 0;
+	private compact = false;
+	private treePrefixWidth = 0;
+	private detailCache?: {
+		taskId?: string;
+		width: number;
+		lines: Array<{ text: string; colorKey?: string; bold?: boolean }>;
+	};
 
 	constructor(
 		tui: any,
@@ -1084,6 +1067,7 @@ export class TodoTreeOverlayComponent implements Component {
 		this.onPersist = onPersist;
 
 		this.unsubscribeStore = this.store.subscribe(() => {
+			this.detailCache = undefined;
 			this.tui?.requestRender?.();
 		});
 
@@ -1094,32 +1078,100 @@ export class TodoTreeOverlayComponent implements Component {
 		}
 	}
 
-	private close(): void {
+	dispose(): void {
 		this.unsubscribeStore?.();
+		this.unsubscribeStore = undefined;
+		this.detailCache = undefined;
+	}
+
+	private close(): void {
+		this.dispose();
 		this.onClose();
 	}
 
-	invalidate(): void {
-		// Stateless render pass
+	private promptUserNote(taskId: string): void {
+		if (!this.onPromptUserNote) return;
+		// This completion path bypasses close(); release the subscription BEFORE
+		// handing control to the next dialog. Native custom() disposal is idempotent.
+		this.dispose();
+		this.onPromptUserNote(taskId);
+	}
+
+	invalidate(): void { this.detailCache = undefined; }
+
+	private getDetailLines(selectedTask: TodoItem | undefined, width: number): Array<{ text: string; colorKey?: string; bold?: boolean }> {
+		const taskId = selectedTask?.id ?? null;
+		if (taskId !== this.lastSelectedTaskId) {
+			this.lastSelectedTaskId = taskId;
+			this.detailScrollTop = 0;
+		}
+		if (this.detailCache?.taskId === selectedTask?.id && this.detailCache?.width === width) return this.detailCache.lines;
+		const lines: Array<{ text: string; colorKey?: string; bold?: boolean }> = [];
+		const append = (text: string, colorKey: string, bold = false) => {
+			for (const line of wrapTextWithAnsi(text, width)) lines.push({ text: line, colorKey, bold });
+		};
+		if (selectedTask) {
+			const { glyph } = getStatusGlyph(selectedTask.status);
+			append(`ℹ #${selectedTask.id} ${selectedTask.subject} [${selectedTask.status.toUpperCase()}] ${glyph}`, "accent", true);
+			if (selectedTask.description?.trim()) {
+				for (const text of wrapWithPrefix(selectedTask.description.trim(), width, "  Desc : ", "         ")) lines.push({ text, colorKey: "text" });
+			}
+			const notes = selectedTask.notes ?? [];
+			if (notes.length) {
+				append(`💬 Notes (${notes.length}):`, "warning", true);
+				for (const note of notes) {
+					const prefix = `  • ${note.author === "agent" ? "[Agent]" : "[User]"}: `;
+					for (const text of wrapWithPrefix(note.text, width, prefix, " ".repeat(visibleWidth(prefix)))) {
+						lines.push({ text, colorKey: note.author === "agent" ? "accent" : "text" });
+					}
+				}
+			} else append("💬 Notes (0): (Press [n] to add note)", "muted");
+		} else append("No task selected", "muted");
+		this.detailCache = { taskId: selectedTask?.id, width, lines };
+		return lines;
+	}
+
+	private renderCompact(width: number, rows: number, flat: Array<{ node: TreeNode; hasChildren: boolean }>): string[] {
+		this.boxLeft = this.boxTop = 0;
+		this.boxWidth = width;
+		this.boxHeight = rows;
+		this.listHeight = 0;
+		const headerRows = rows >= 3 ? 1 : 0;
+		const footerRows = rows >= 4 ? 1 : 0;
+		this.detailHeight = Math.max(1, rows - headerRows - footerRows);
+		const details = this.getDetailLines(flat[this.selectedIndex]?.node.item, width);
+		this.totalDetailLines = details.length;
+		this.detailScrollTop = Math.max(0, Math.min(this.detailScrollTop, details.length - this.detailHeight));
+		const lines: string[] = [];
+		if (headerRows) lines.push(this.theme.fg("accent", `Todo ${flat.length ? this.selectedIndex + 1 : 0}/${flat.length} · ↑/↓ select`));
+		for (let row = 0; row < this.detailHeight; row++) {
+			const detail = details[this.detailScrollTop + row];
+			lines.push(!detail ? "" : detail.bold
+				? this.theme.style(detail.text, { bold: true, fg: detail.colorKey || "text" })
+				: this.theme.fg(detail.colorKey || "text", detail.text));
+		}
+		if (footerRows) lines.push(this.theme.fg("muted", "↑/↓ task · PgUp/Dn details · n note · c/x status · Esc close"));
+		return lines.map(line => truncateToWidth(line, width));
 	}
 
 	render(width: number): string[] {
-		const totalLines = this.tui?.terminal?.rows || 24;
-
-		this.boxWidth = Math.min(100, Math.max(50, Math.floor(width * 0.88)));
-		this.boxHeight = Math.min(36, Math.max(16, Math.floor(totalLines * 0.86)));
-		this.boxLeft = Math.max(0, Math.floor((width - this.boxWidth) / 2));
-		this.boxTop = Math.max(0, Math.floor((totalLines - this.boxHeight) / 2));
-
+		const columns = Math.floor(width);
+		if (columns < 1) return [];
+		const totalLines = Math.max(1, Math.floor(this.tui?.terminal?.rows ?? 24));
 		const flat = this.store.getFlattenedTree();
+		this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, flat.length - 1));
+		this.compact = columns < 50 || totalLines < 16;
+		if (this.compact) return this.renderCompact(columns, totalLines, flat);
+
+		this.boxWidth = Math.min(columns, 100, Math.max(50, Math.floor(columns * 0.88)));
+		this.boxHeight = Math.min(totalLines, 36, Math.max(16, Math.floor(totalLines * 0.86)));
+		this.boxLeft = Math.max(0, Math.floor((columns - this.boxWidth) / 2));
+		this.boxTop = Math.max(0, Math.floor((totalLines - this.boxHeight) / 2));
 		const stats = this.store.getProgressStats();
 
-		// Bottom fixed rows: TopBorder(1) + Stats(1) + Divider(1) + [TreeList] + Divider(1) + [Detail(6)] + Actions(1) + BottomBorder(1) = 12 fixed
+		// Twelve frame/stats/detail/action rows, plus a navigable tree list.
 		this.detailHeight = 6;
 		this.listHeight = Math.max(4, this.boxHeight - 12);
-
-		if (this.selectedIndex >= flat.length) this.selectedIndex = Math.max(0, flat.length - 1);
-		if (this.selectedIndex < 0) this.selectedIndex = 0;
 
 		if (this.selectedIndex < this.scrollTop) {
 			this.scrollTop = this.selectedIndex;
@@ -1141,16 +1193,10 @@ export class TodoTreeOverlayComponent implements Component {
 		// 1. Top border
 		const titleStr = " 📋 Todo Tree ";
 		const hintStr = " [Esc/q: Close · ↑/↓: Move] ";
-		const topBorderDash = Math.max(
-			2,
-			innerWidth - visibleWidth(titleStr) - visibleWidth(hintStr) - 2,
-		);
-		const topBorder =
-			this.theme.fg("accent", "┌─") +
-			this.theme.style(titleStr, { bold: true, fg: "accent" }) +
-			this.theme.fg("accent", "─".repeat(topBorderDash)) +
-			this.theme.fg("muted", hintStr) +
-			this.theme.fg("accent", "─┐");
+		const topContent = truncateToWidth(this.theme.style(titleStr, { bold: true, fg: "accent" }) +
+			this.theme.fg("muted", hintStr), innerWidth);
+		const topBorder = this.theme.fg("accent", "┌") + topContent +
+			this.theme.fg("accent", "─".repeat(Math.max(0, innerWidth - visibleWidth(topContent))) + "┐");
 
 		lines.push(`${" ".repeat(this.boxLeft)}${topBorder}`);
 
@@ -1187,6 +1233,7 @@ export class TodoTreeOverlayComponent implements Component {
 			: 0;
 
 		const rowInteriorWidth = innerWidth - (scrollbarActive ? 1 : 0);
+		this.treePrefixWidth = Math.floor(rowInteriorWidth / 4);
 
 		for (let row = 0; row < this.listHeight; row++) {
 			let lineContent = "";
@@ -1197,11 +1244,7 @@ export class TodoTreeOverlayComponent implements Component {
 				const { node, hasChildren } = visibleRows[row];
 				const item = node.item;
 
-				let treePrefix = "";
-				for (let d = 0; d < node.depth; d++) {
-					treePrefix += node.ancestorHasNextSibling[d] ? "│  " : "   ";
-				}
-				treePrefix += node.depth === 0 ? "" : node.isLastChild ? "└─ " : "├─ ";
+				const treePrefix = treePrefixFor(node, this.treePrefixWidth);
 
 				const foldIcon = hasChildren
 					? this.store.isCollapsed(item.id)
@@ -1216,27 +1259,16 @@ export class TodoTreeOverlayComponent implements Component {
 					item.notes && item.notes.length > 0
 						? this.theme.fg("warning", ` 💬(${item.notes.length})`)
 						: "";
-				const noteBadgeWidth = visibleWidth(noteBadge);
-
 				const depthCapWarning = node.isDepthCapped
 					? this.theme.fg("warning", " ⚠[depth limit 32 reached]")
 					: "";
-				const depthCapWidth = visibleWidth(depthCapWarning);
-
-				const idStr = `#${item.id} `;
+				const idStr = truncateToWidth(`#${item.id} `, Math.max(1, Math.min(16, Math.floor(rowInteriorWidth / 4))));
 				const pointerPrefix = isSelected ? "> " : "  ";
-
-				const fixedWidth =
-					visibleWidth(pointerPrefix) +
-					visibleWidth(treePrefix) +
-					visibleWidth(foldIcon) +
-					visibleWidth(glyph) +
-					1 +
-					visibleWidth(idStr) +
-					noteBadgeWidth +
-					depthCapWidth;
-
-				const availableSubjectWidth = Math.max(4, rowInteriorWidth - fixedWidth - 1);
+				const prefixWidth = visibleWidth(pointerPrefix + treePrefix + foldIcon + glyph + " " + idStr);
+				const remainingWidth = Math.max(0, rowInteriorWidth - prefixWidth);
+				const badges = truncateToWidth(noteBadge + depthCapWarning, Math.max(0, remainingWidth - Math.min(12, remainingWidth)), "");
+				const fixedWidth = prefixWidth + visibleWidth(badges);
+				const availableSubjectWidth = Math.max(0, rowInteriorWidth - fixedWidth);
 				const truncatedSubject = truncateToWidth(item.subject, availableSubjectWidth);
 
 				let styledSubject = "";
@@ -1260,8 +1292,7 @@ export class TodoTreeOverlayComponent implements Component {
 					" " +
 					this.theme.fg("accent", idStr) +
 					styledSubject +
-					noteBadge +
-					depthCapWarning;
+					badges;
 
 				const actualVisible =
 					fixedWidth + visibleWidth(truncatedSubject);
@@ -1289,56 +1320,7 @@ export class TodoTreeOverlayComponent implements Component {
 
 		// 6. Selected task details & notes pane (up to 6 lines with scrollbar support)
 		const selectedTask = flat[this.selectedIndex]?.node.item;
-		if (selectedTask?.id !== this.lastSelectedTaskId) {
-			this.lastSelectedTaskId = selectedTask ? selectedTask.id : null;
-			this.detailScrollTop = 0;
-		}
-
-		const detailContentLines: Array<{ text: string; colorKey?: string; bold?: boolean }> = [];
-		const maxContentWidth = Math.max(16, innerWidth - 4);
-
-		if (selectedTask) {
-			const { glyph, colorKey: statusColor } = getStatusGlyph(selectedTask.status);
-			const titleStr = `#${selectedTask.id} ${selectedTask.subject} [${selectedTask.status.toUpperCase()}] ${glyph}`;
-			detailContentLines.push({
-				text: truncateToWidth(`ℹ ${titleStr}`, maxContentWidth),
-				colorKey: "accent",
-				bold: true,
-			});
-
-			if (selectedTask.description && selectedTask.description.trim()) {
-				const descLines = wrapWithPrefix(
-					selectedTask.description.trim(),
-					maxContentWidth,
-					"  Desc : ",
-					"         ",
-				);
-				for (const dLine of descLines) {
-					detailContentLines.push({ text: dLine, colorKey: "text" });
-				}
-			}
-
-			const notes = selectedTask.notes || [];
-			if (notes.length > 0) {
-				detailContentLines.push({ text: `💬 Notes (${notes.length}):`, colorKey: "warning", bold: true });
-				for (const note of notes) {
-					const authorTag = note.author === "agent" ? "[Agent]" : "[User]";
-					const firstPfx = `  • ${authorTag}: `;
-					const restPfx = " ".repeat(visibleWidth(firstPfx));
-					const noteLines = wrapWithPrefix(note.text, maxContentWidth, firstPfx, restPfx);
-					for (const nLine of noteLines) {
-						detailContentLines.push({
-							text: nLine,
-							colorKey: note.author === "agent" ? "accent" : "text",
-						});
-					}
-				}
-			} else {
-				detailContentLines.push({ text: "💬 Notes (0): (Press [n] to add note)", colorKey: "muted" });
-			}
-		} else {
-			detailContentLines.push({ text: "No task selected", colorKey: "muted" });
-		}
+		const detailContentLines = this.getDetailLines(selectedTask, Math.max(1, innerWidth - 4));
 
 		this.totalDetailLines = detailContentLines.length;
 		const maxDetailScroll = Math.max(0, this.totalDetailLines - this.detailHeight);
@@ -1401,7 +1383,7 @@ export class TodoTreeOverlayComponent implements Component {
 			lines.push("");
 		}
 
-		return lines;
+		return lines.slice(0, totalLines).map(line => truncateToWidth(line, columns));
 	}
 
 	handleInput(data: string): void {
@@ -1444,7 +1426,7 @@ export class TodoTreeOverlayComponent implements Component {
 			if (this.detailScrollTop > 0) {
 				this.detailScrollTop = Math.max(0, this.detailScrollTop - 2);
 			} else {
-				this.selectedIndex = Math.max(0, this.selectedIndex - this.listHeight);
+				this.selectedIndex = Math.max(0, this.selectedIndex - Math.max(1, this.listHeight));
 			}
 			this.tui?.requestRender?.();
 			return;
@@ -1455,7 +1437,7 @@ export class TodoTreeOverlayComponent implements Component {
 			if (this.detailScrollTop < maxDetail) {
 				this.detailScrollTop = Math.min(maxDetail, this.detailScrollTop + 2);
 			} else {
-				this.selectedIndex = Math.min(flat.length - 1, this.selectedIndex + this.listHeight);
+				this.selectedIndex = Math.min(flat.length - 1, this.selectedIndex + Math.max(1, this.listHeight));
 			}
 			this.tui?.requestRender?.();
 			return;
@@ -1507,14 +1489,25 @@ export class TodoTreeOverlayComponent implements Component {
 
 		if (data === "n" || data === "N") {
 			const current = flat[this.selectedIndex];
-			if (current && this.onPromptUserNote) {
-				this.onPromptUserNote(current.node.item.id);
-			}
+			if (current) this.promptUserNote(current.node.item.id);
 			return;
 		}
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (this.compact) {
+			if (event.type === "wheel") {
+				this.detailScrollTop = Math.max(0, Math.min(Math.max(0, this.totalDetailLines - this.detailHeight),
+					this.detailScrollTop + Math.sign(event.wheelDelta ?? (event as any).deltaY ?? 0)));
+				this.tui?.requestRender?.();
+				return { handled: true };
+			}
+			if (event.type === "click") {
+				if (event.x < 0 || event.x >= this.boxWidth || event.y < 0 || event.y >= this.boxHeight) this.close();
+				return { handled: true };
+			}
+			return undefined;
+		}
 		if (event.type === "click") {
 			const isInside =
 				event.x >= this.boxLeft &&
@@ -1548,13 +1541,7 @@ export class TodoTreeOverlayComponent implements Component {
 					const { node, hasChildren } = itemEntry;
 
 					if (hasChildren) {
-						let prefixWidth = 0;
-						for (let d = 0; d < node.depth; d++) {
-							prefixWidth += 3;
-						}
-						if (node.depth > 0) {
-							prefixWidth += 3; // "├─ " or "└─ "
-						}
+						const prefixWidth = visibleWidth(treePrefixFor(node, this.treePrefixWidth));
 
 						// Fold icon column range on screen:
 						const foldColStart = this.boxLeft + 1 + 2 + prefixWidth;
@@ -1596,9 +1583,7 @@ export class TodoTreeOverlayComponent implements Component {
 					}
 				} else if (relX >= 17 && relX <= 26) {
 					// [n] Note
-					if (current && this.onPromptUserNote) {
-						this.onPromptUserNote(current.node.item.id);
-					}
+					if (current) this.promptUserNote(current.node.item.id);
 				} else if (relX >= 27 && relX <= 36) {
 					// [c] Done
 					if (current) {

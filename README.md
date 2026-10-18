@@ -316,8 +316,9 @@ pi --extension ./extensions/image-pager.ts
 - **算法支持**: 默认使用 **`zstd`**（高性能且为官方 Codex 网关原生接受标准），同时支持 `gzip`、`deflate` 和 `br`。
 - **开箱即用**: 基于 Node.js 内置 `node:zlib`，零第三方运行时依赖，零 C++ 原生编译。
 - **智能策略**:
-  - 根据 `models.json` 的 provider 地址识别请求；默认仅处理已知 host 且 JSON 含 `model` 的请求，不再把未知目标归为默认 provider；
-  - 未知 host 或不含 `model` 的接口必须通过 `targetHosts` 显式允许，仍需确保服务器支持所选 `Content-Encoding`；
+  - 按 `models.json` 中 API 地址的 origin 和路径边界识别请求，优先匹配最长路径前缀；同域名不同路径的 provider 独立识别，黑白名单不会互相覆盖；
+  - 多个 provider 共用同一 API 前缀时保守透传，不使用模型名或默认 provider 猜测归属，`targetHosts` 也不会解除此歧义；
+  - 未知 API 地址（包括同域名下前缀之外的接口）或不含 `model` 的接口必须通过 `targetHosts` 显式允许，仍需确保服务器支持所选 `Content-Encoding`；
   - 支持通配符匹配（`yqdcc-*`, `gemini-*`）与黑白名单过滤；
   - 内置大小阈值（`minBytesThreshold`，默认 1KB），小请求自动忽略，避免小包负收益。
 - **TUI 状态命令**: 提供 `/request-compress [status|on|off|reload]`，状态使用模态窗口，避免被通知静音吞掉；非 TUI 模式降级通知。
@@ -366,7 +367,8 @@ pi --extension ./extensions/image-pager.ts
 - **分层级任务模型与动态演进**：支持多层级树状结构（如 `#1` $\rightarrow$ `#1.1` $\rightarrow$ `#1.1.1`），支持任务随进度中途追加小项或放弃取消（`cancelled`），取消项自动从进度有效项剔除，绝不阻塞整体推进。
 - **主窗体聚焦（仅展示进行中小项）**：输入栏上方仅展示总体进度、字符进度条（`[████░░░░░]`）以及当前所有正在执行的叶子小项（带父级面包屑，如 `[数据层] > 编写测试`）；多并行任务全行展开，不限死组件高度。
 - **右侧固定交互按钮 `[📋 ]`**：主行右端常驻 `[📋 ]` 按钮，支持鼠标直接点击以及键盘快捷键（默认 `Ctrl+Shift+T`）呼出任务树弹窗。
-- **全功能居中弹窗（内置字符滚动条）**：采用 `ctx.ui.custom({ overlay: true })` 居中悬浮绘制，清晰呈现树形分支图；支持键盘上下移动/翻页、`Space` 折叠展开父节点、鼠标滚轮平滑滚动、边框外部点击自动关闭。
+- **全功能居中弹窗（内置字符滚动条）**：采用 `ctx.ui.custom({ overlay: true })` 居中悬浮绘制；深层树压缩缩进与 ID 预览，保留任务标题。少于 50 列或 16 行时改用单列详情，仍可用 ↑/↓ 选择任务、PgUp/PgDn 或滚轮翻阅完整标题/描述/备注，以及 `Space` 折叠、`n` 备注、`c` 完成、`x` 取消、Esc 关闭；所有输出按实际终端宽高约束。
+- **长文本与窗口清理**：描述、备注使用线性分行和内容/选中项/宽度/主题感知的详情缓存；重复重绘不重新排版、不重置滚动。普通关闭、进入备注输入和原生 `dispose()` 均释放 Store 订阅，避免旧弹窗累计刷新回调。
 - **只读状态窗**：`/todo status` 按实际终端宽高换行并支持滚动，长配置值不会被固定最小宽度裁掉；↑/↓、PgUp/PgDn 翻阅，Enter/Esc 或点击关闭。
 - **零破坏 Prompt Cache 的批注体系**：
   - **本地便签 (Local Note)**：弹窗按 `n` 键就地添加备注，数据仅在扩展内部与分支快照保存，**0 Token 消耗，0 缓存破坏**；
@@ -436,6 +438,7 @@ Ctrl+Shift+T      # 快速呼出/关闭任务树弹窗
 - **自动模型降级（Fallback）**：必须配置 `primaryModel`，后备模型按 `fallbackModels` 顺序尝试，没有硬编码默认模型。总等待上限 5 分钟，取消或超时不继续 fallback，也不写入迟到结果。
 - **图视联动（Image-to-Video）**：`generate_image` 生成的图片路径可直接作为 `generate_video` 的首帧或参考输入（`image`），极大提升视频主体的一致性与稳定性。
 - **视频接口**：调用配置 provider 的 `/videos/generations`；本地参考图读取为 data URI，不将本机路径直接发送给远程服务。当前没有 ComfyUI 驱动或异步视频任务轮询。
+- **参考图 MIME**：需要上传或编码的 PNG/JPEG/GIF/WebP 参考图，其 MIME、multipart 文件名和 data URI 均按已验证的文件头生成，不依赖可能错误的 HTTP `Content-Type` 或本地扩展名；对象存储的 `application/octet-stream` 响应可正常用于图片编辑回退。
 - **本地落盘管理**：默认写入会话工作区 `.pi/media/`，可设置 `outputDir`。图片下载检查 HTTP 状态及 PNG/JPEG/GIF/WebP 文件头；视频的下载和 Base64 返回均检查 MP4/WebM 容器签名，校验失败会尝试后备模型，不把 HTML、空数据或错误对象写成成功媒体。文件头检查不代替完整解码验证，全部模型失败返回真正的 tool error。
 - **安全影响**：提示词、参考图会发送给配置的网关及其返回的下载地址，文件写入 `outputDir`；仅使用可信服务。
 

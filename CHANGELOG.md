@@ -4,6 +4,13 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- fix(request-compress): identify providers by origin and longest path-boundary API prefix, preserving co-hosted provider exclusions and leaving shared ambiguous endpoints uncompressed.
+- fix(media-gen): derive uploaded/encoded reference-image MIME and multipart names from validated PNG/JPEG/GIF/WebP signatures, not HTTP headers or local suffixes.
+- fix(todo-tree): replace quadratic suffix scans with linear detail wrapping and cache layouts across unchanged redraws, invalidating for data/selection/width/theme changes.
+- fix(todo-tree): fit the full overlay to actual viewport dimensions, use navigable compact details on narrow/short screens, and bound deep ancestry/ID previews without losing complete details.
+- fix(todo-tree): release overlay subscriptions before keyboard/mouse note handoff and via idempotent native disposal.
+- test: add hermetic follow-up regressions with real fetch wrapping, mocked media APIs, bounded layout/cache checks and native custom/fullscreen UI paths; optionally run against a separate host installation. VOICE-001 remains unchanged.
+
 - fix(timer): stop interpreting English prompt prefixes as time units; parse tool/dialog time fields independently from numeric or English prompts.
 - fix(stream-read-retry): leave explicit permanent HTTP client failures (including 413/422) untouched while preserving potentially transient statuses and transport retries.
 - fix(paths): isolate invalid/partial file URL metadata per field so rolling-tools cannot block tool dispatch and image-pager still processes unrelated images.
