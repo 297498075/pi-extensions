@@ -91,6 +91,16 @@ Keep agent-level retry enabled in `settings.json` (the default), and configure i
 
 `retry.provider.maxRetries` controls provider SDK retries and does not enable Pi's agent-level retry. The extension has no network, file, or command side effects; it only changes the final assistant error text, which Pi may persist in session history.
 
+## Compact：Agent 主动压缩上下文
+
+`extensions/compact.ts` 将 Pi 的 `ctx.compact()` 封装为 LLM 可直接调用的 `compact` 工具。可选参数 `customInstructions` 指定摘要必须保留的任务目标、约束、进度、路径、关键决定和下一步。需要 Pi 1.2+ 的 turn boundary API；加载整个 package 时自动发现，也可以单独加载：
+
+```bash
+pi --extension ./extensions/compact.ts
+```
+
+工具先返回排队确认，等本轮所有工具结果落盘后才启动压缩；成功后自动继续原任务。取消、失败、会话切换或新用户任务不会触发旧任务恢复。它是 `model-only` 工具，需由模型直接调用，不能从 `codemode` 脚本嵌套调用。压缩使用 Pi 原有的模型、配置与 hooks，会产生摘要模型请求/费用并写入会话记录；旧历史不会被删除，摘要可能丢失细节，自动续跑也可能继续执行现有工具。参数、生命周期和验证步骤见 [`docs/compact-extension.md`](docs/compact-extension.md)。
+
 ## Todo Loop
 
 `extensions/todo-loop.ts` continues the agent when the latest structured todo state still contains unfinished items. It requires Pi's `agent_before_settle` boundary API (verified with Pi 1.2/1.3). It reads `details.tasks` from `@juicesharp/rpiv-todo` and also accepts the `details.todos` format used by Pi's example todo extension. It also understands the `plan-mode` execution state used by Pi's example extension.
