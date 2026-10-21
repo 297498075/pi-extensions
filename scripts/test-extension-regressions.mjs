@@ -123,8 +123,12 @@ try {
 		getEntries: () => [{ type: "custom", customType: "rolling-tools-history", data: { total: 1, items: [{ id: "abandoned", name: "bash", summaryDisplay: "ABANDONED-BRANCH", status: "done" }] } }],
 		getBranch: () => branchEntries,
 	} };
+	const assistantUpdate = AssistantMessageComponent.prototype.updateContent;
+	const assistantRender = AssistantMessageComponent.prototype.render;
 	rollingTools(rolling.pi);
 	await emit(rolling.handlers, "session_start", { reason: "startup" }, rollingCtx);
+	assert.equal(AssistantMessageComponent.prototype.updateContent, assistantUpdate, "rolling-tools must not patch assistant content updates");
+	assert.equal(AssistantMessageComponent.prototype.render, assistantRender, "rolling-tools must not patch assistant rendering");
 	assert.ok(!widget(tui, theme).render(100).join("\n").includes("ABANDONED-BRANCH"));
 	await rolling.commands.get("rolling-tools").handler("status", rollingCtx);
 	assert.ok(statusLines.join("\n").includes("Rolling Tools"));
@@ -139,11 +143,23 @@ try {
 	await emit(rolling.handlers, "message_update", { message: streamMessage, assistantMessageEvent: { type: "text_delta", delta: "answer" } }, rollingCtx);
 	assert.equal(streamMessage.content[0].type, "thinking");
 	await rolling.commands.get("rolling-tools").handler("on", rollingCtx);
-	const reasoningComponent = new AssistantMessageComponent(message);
-	assert.ok(!reasoningComponent.render(80).join("\n").includes("reasoning"), "thinking stays hidden at the visual layer");
+	const reasoningComponent = new AssistantMessageComponent(message, false);
+	const hiddenReasoningComponent = new AssistantMessageComponent(message, true);
+	const assertNativeThinkingVisibility = () => {
+		assert.ok(reasoningComponent.render(80).join("\n").includes("reasoning"), "native show setting must be respected");
+		assert.ok(!hiddenReasoningComponent.render(80).join("\n").includes("reasoning"), "native hide setting must be respected");
+	};
+	assertNativeThinkingVisibility();
+	reasoningComponent.setHideThinkingBlock(true);
+	assert.ok(!reasoningComponent.render(80).join("\n").includes("reasoning"), "native setting can hide thinking while rolling-tools is on");
+	reasoningComponent.setHideThinkingBlock(false);
+	reasoningComponent.updateContent(streamMessage, true);
+	hiddenReasoningComponent.updateContent(streamMessage, true);
+	assertNativeThinkingVisibility();
+	assert.deepEqual(streamMessage, message, "streaming rendering must preserve thinking and its signature");
 	assert.equal(message.content[0].thinkingSignature, "signature");
 	await rolling.commands.get("rolling-tools").handler("off", rollingCtx);
-	assert.ok(reasoningComponent.render(80).join("\n").includes("reasoning"), "off restores the original component view");
+	assertNativeThinkingVisibility();
 	branchEntries = [{ type: "custom", customType: "rolling-tools-history", data: { total: 3, items: [{ id: "in-branch", index: 3, name: "read", summaryDisplay: "BRANCH-A", status: "running", startTime: Date.now() }] } }];
 	await rolling.commands.get("rolling-tools").handler("on", rollingCtx);
 	await emit(rolling.handlers, "session_tree", {}, rollingCtx);
@@ -152,13 +168,15 @@ try {
 	branchEntries = [];
 	await emit(rolling.handlers, "session_tree", {}, rollingCtx);
 	assert.ok(!widget(tui, theme).render(100).some(l => l.includes("BRANCH-A")));
-	assert.ok(!reasoningComponent.render(80).join("\n").includes("reasoning"));
+	assertNativeThinkingVisibility();
 	await emit(rolling.handlers, "session_shutdown", { reason: "reload" }, rollingCtx);
-	assert.ok(reasoningComponent.render(80).join("\n").includes("reasoning"), "unload restores an existing assistant component");
+	assertNativeThinkingVisibility();
+	assert.equal(AssistantMessageComponent.prototype.updateContent, assistantUpdate);
+	assert.equal(AssistantMessageComponent.prototype.render, assistantRender);
 	assert.equal(ui.notify, originalNotify, "shutdown must restore wrapped UI functions");
 	const component = new ToolExecutionComponent("read", "c", { path: "x" }, {}, undefined, tui, root);
 	assert.ok(component.render(80).length > 0, "unloaded extension must not silence global tool rendering");
-	console.log("✓ visible status, working off switch, intact reasoning, branch-local history and unload cleanup");
+	console.log("✓ visible status, working off switch, native thinking visibility, intact reasoning, branch-local history and unload cleanup");
 
 	const envCtx = { defaultProvider: "fixture", providerBaseUrls: new Map([["api.example", "fixture"]]), modelToProvider: new Map([["fixture-model", "fixture"]]) };
 	const raw = Buffer.from(JSON.stringify({ model: "fixture-model", text: "x".repeat(2048) }));

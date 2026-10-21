@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { AssistantMessageComponent, InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
+import { InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem, Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { isFocusable, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { showStatusModal } from "./lib/status-modal.ts";
@@ -205,13 +205,9 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 /** Target history window; preparing/running calls are retained until terminal events. */
 const HISTORY_MEMORY_LIMIT = 500;
 const DYNAMIC_HOOKS_KEY = Symbol.for("pi-rolling-tools.dynamicHooks.v3");
-const ASSISTANT_DISPLAY_FILTERED = Symbol.for("pi-rolling-tools.assistantDisplayFiltered.v1");
 
 interface DynamicHooksState {
 	installed: boolean;
-	assistantInstalled?: boolean;
-	handleAssistantContent?: (target: any, message: any, isStreaming: boolean | undefined, original: Function) => void;
-	handleAssistantRender?: (target: any, width: number, original: Function) => string[];
 	handleToolRender?: (target: any, width: number, origRender: Function) => string[];
 	handleShowExtensionNotify?: (target: any, message: string, type: string | undefined, origFn: Function) => void;
 	handleSetExtensionStatus?: (target: any, key: string, text: string | undefined, origFn: Function) => void;
@@ -2135,25 +2131,6 @@ function installToolNotificationStripper(
  * 安装原型劫持骨架（仅在进程初次加载时拦截一次，后续所有 reload 均由 dynamicHooks 委托热刷新）
  */
 function ensureGlobalPrototypeHooksInstalled(): void {
-	if (!dynamicHooks.assistantInstalled) {
-		dynamicHooks.assistantInstalled = true;
-		const originalUpdate = AssistantMessageComponent.prototype.updateContent;
-		const originalRender = AssistantMessageComponent.prototype.render;
-		AssistantMessageComponent.prototype.updateContent = function (this: any, message: any, isStreaming?: boolean) {
-			if (dynamicHooks.handleAssistantContent) dynamicHooks.handleAssistantContent(this, message, isStreaming, originalUpdate);
-			else originalUpdate.call(this, message, isStreaming);
-		};
-		AssistantMessageComponent.prototype.render = function (this: any, width: number) {
-			if (dynamicHooks.handleAssistantRender) return dynamicHooks.handleAssistantRender(this, width, originalRender);
-			// A component rendered while the extension was loaded may still have a
-			// filtered visual tree. Rebuild once from the retained original message.
-			if (this[ASSISTANT_DISPLAY_FILTERED] && this.lastMessage) {
-				this[ASSISTANT_DISPLAY_FILTERED] = false;
-				this.updateContent(this.lastMessage);
-			}
-			return originalRender.call(this, width);
-		};
-	}
 	if (dynamicHooks.installed) return;
 	dynamicHooks.installed = true;
 
@@ -2264,23 +2241,6 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 	// 1.5 注册工具渲染器：剥掉插件在工具行里重复画的提示头（通道 C）
 	installToolNotificationStripper(pi, () => hooksActive && currentConfig.enabled && currentConfig.stripToolNotificationHeaders !== false);
-
-	// Filter only the component's view, never agent messages or persisted signatures.
-	dynamicHooks.handleAssistantContent = (target, message, isStreaming, original) => {
-		const hide = currentConfig.enabled && hooksActive;
-		const view = hide && Array.isArray(message.content)
-			? { ...message, content: message.content.filter((block: any) => block.type !== "thinking") }
-			: message;
-		original.call(target, view, isStreaming);
-		target.lastMessage = message;
-		target[ASSISTANT_DISPLAY_FILTERED] = hide;
-	};
-	dynamicHooks.handleAssistantRender = (target, width, original) => {
-		if (target.lastMessage && Boolean(target[ASSISTANT_DISPLAY_FILTERED]) !== currentConfig.enabled) {
-			target.updateContent(target.lastMessage);
-		}
-		return original.call(target, width);
-	};
 
 	// 2. 动态更新委派处理函数（支持任意次数的 /reload 即刻生效！）
 	dynamicHooks.handleToolRender = (target: any, width: number, origRender: Function) => {
@@ -2924,8 +2884,6 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	// Prototype wrappers are process-wide, but their delegates belong to this
 	// runtime. Removing the extension must leave inert pass-through wrappers.
 	const ownedHooks = {
-		assistantContent: dynamicHooks.handleAssistantContent,
-		assistantRender: dynamicHooks.handleAssistantRender,
 		render: dynamicHooks.handleToolRender,
 		notify: dynamicHooks.handleShowExtensionNotify,
 		status: dynamicHooks.handleSetExtensionStatus,
@@ -2936,8 +2894,6 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		hooksActive = false;
 		desktopActions.abort();
 		for (const cleanup of uiHookCleanups.splice(0)) cleanup();
-		if (dynamicHooks.handleAssistantContent === ownedHooks.assistantContent) dynamicHooks.handleAssistantContent = undefined;
-		if (dynamicHooks.handleAssistantRender === ownedHooks.assistantRender) dynamicHooks.handleAssistantRender = undefined;
 		if (dynamicHooks.handleToolRender === ownedHooks.render) dynamicHooks.handleToolRender = undefined;
 		if (dynamicHooks.handleShowExtensionNotify === ownedHooks.notify) dynamicHooks.handleShowExtensionNotify = undefined;
 		if (dynamicHooks.handleSetExtensionStatus === ownedHooks.status) dynamicHooks.handleSetExtensionStatus = undefined;
