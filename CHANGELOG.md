@@ -4,6 +4,9 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- feat(listary): add a read-only `listary_search` tool for Listary's fixed loopback HTTP API, with filters, bounded pagination output, structured results, cancellation and total request deadlines; no extra dependencies or background processes.
+- test(listary): add isolated loopback transport/schema/pagination/error/cleanup regressions to `npm test`, and document loading, API prerequisites and local-path privacy risks.
+
 - fix(request-compress): identify providers by origin and longest path-boundary API prefix, preserving co-hosted provider exclusions and leaving shared ambiguous endpoints uncompressed.
 - fix(media-gen): derive uploaded/encoded reference-image MIME and multipart names from validated PNG/JPEG/GIF/WebP signatures, not HTTP headers or local suffixes.
 - fix(todo-tree): replace quadratic suffix scans with linear detail wrapping and cache layouts across unchanged redraws, invalidating for data/selection/width/theme changes.

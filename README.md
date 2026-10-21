@@ -46,6 +46,16 @@ pi --extension ./extensions/example.ts
 
 命名使用小写 kebab-case；运行时依赖放在 `dependencies`，Pi core 依赖放在 `peerDependencies`。完整规则见 [`AGENTS.md`](AGENTS.md) 和 [`docs/development.md`](docs/development.md)。
 
+## Listary：本机文件搜索
+
+`extensions/listary.ts` 注册 `listary_search`，让 agent 通过 Listary Local HTTP API 按名称/路径查找本机文件和目录，支持目录、类型、扩展名过滤与分页。需在同一主机启动 Listary 并启用其本地 API（`127.0.0.1:38431`，默认关闭）。
+
+```bash
+pi --extension ./extensions/listary.ts
+```
+
+工具只搜索位置，不读取或修改文件；源码内容搜索仍使用 `rg`，读取已选中文件使用 `read`。固定 loopback 目标，10 秒总超时，支持取消，无额外服务进程、启动探测、自动重试或全盘扫描降级。查询和返回的文件路径/元数据会进入 agent 上下文，使用私密目录前应考虑模型与会话记录的数据暴露。参数、分页、限制、安全影响和验证步骤详见 [`docs/listary-extension.md`](docs/listary-extension.md)。
+
 ## Voice：语音输入适配
 
 `extensions/voice.ts` 默认关闭，通过 `/voice on` 启用 LLM 发音、单次收音和音色目录工具，通过 `/voice live on`（或 F2）单独开启持续语音输入。默认转写追加到草稿等待 Enter；`/voice stop` 取消现有工作但保留开关，`/voice off` 同时禁用后续调用。

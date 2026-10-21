@@ -69,6 +69,12 @@ An overlay subscription belongs to one interaction. Release it both on ordinary 
 
 `scripts/test-mutation-todo-tree.mjs` copies extensions and the focused test suite into a temporary workspace (dereferencing source symlinks), links installed `node_modules` for resolution, and uses an isolated agent/home directory. Mutations and test execution occur only in that copy. It never backs up/restores checkout files, so concurrent editing is safe and an interrupt cannot leave mutants in production source. A hard kill may leave a disposable temp directory; normal completion/failure cleans it up. Timeouts or unexpected failures do not count as killed mutants.
 
+## Listary search transport
+
+`extensions/listary.ts` exposes one read-only `listary_search` tool with a fixed `127.0.0.1:38431` target. It uses Node HTTP with a byte-accurate Content-Length and one-request-per-connection behavior, not fetch wrappers or shell commands. It starts work only on a tool call and cleans up each request's deadline, abort listener and failed connection. Keep response validation and bounded model output separate from transport; display-limited pages must resume after displayed results, not skip the remainder of a server page. See `docs/listary-extension.md` for usage, limits and privacy implications.
+
+`scripts/test-listary.mjs` uses a random-port loopback fixture through a test-only injected transport, asserting the production target before delegation. It never touches real Listary or personal files. It covers request framing, schema/runtime checks, filters/folders, pagination, response/error validation, size limits, no retries/redirects, pre/in-flight cancellation, wall-clock timeout including trickled responses, cleanup and output escaping/bounds. It is included in `npm test`.
+
 ## Validation
 
 Run agent-driven tests under an independent parent-process/process-tree deadline of 30–60 seconds; a timer in the tested process cannot interrupt a busy microtask or synchronous loop. Tool `timeout` values are **seconds**, whereas Node timer/child-process options use milliseconds. Mock streams and UI traversal loops must have finite response/iteration budgets and respect cancellation.
