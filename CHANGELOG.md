@@ -4,6 +4,10 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- fix(todo-loop): replace prose/regex stop detection with explicit per-task blockers in successful `todo_loop_control` results; quoted prompts, summaries and abort strings no longer silently stop unfinished work.
+- feat(todo-loop): add branch-local revision-scoped blockers, actionable-leaf continuation, structured boundary decision records and a `/todo-loop status` modal; preserve retry/abort/error protection and persisted follow-up limits.
+- test(todo-loop): add isolated protocol, quote-regression, persistence/fork, invalidation, boundary-composition, budget and status-modal coverage.
+
 - feat(listary): add a read-only `listary_search` tool for Listary's fixed loopback HTTP API, with filters, bounded pagination output, structured results, cancellation and total request deadlines; no extra dependencies or background processes.
 - test(listary): add isolated loopback transport/schema/pagination/error/cleanup regressions to `npm test`, and document loading, API prerequisites and local-path privacy risks.
 

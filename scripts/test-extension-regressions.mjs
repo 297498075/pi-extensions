@@ -61,6 +61,20 @@ try {
 	assert.deepEqual((await tool.execute("list", { action: "list" })).details.tasks.map(t => t.id), ["old"]);
 	console.log("✓ independent todo snapshots, empty branches and atomic replacement batches");
 
+	// The same todo-tree tasks have different wrapper/key/alias shapes in custom
+	// snapshots and tool results. A read/list must not silently clear blockers.
+	todoLoop(env.pi);
+	await env.commands.get("todo").handler("on", ctx);
+	await tool.execute("blockable", { action: "create", id: "live", subject: "needs an address" });
+	const report = await env.tools.get("todo_loop_control").execute("block", { action: "report_blocker", taskIds: ["live"], category: "needs_user_input", reason: "Missing address", resumeWhen: "User supplies it" }, undefined, undefined, ctx);
+	assert.notEqual(report.isError, true, JSON.stringify(report));
+	sm.appendMessage({ role: "toolResult", toolName: "todo_loop_control", toolCallId: "block", ...report, timestamp: 1 });
+	const listed = await tool.execute("list-for-blocker", { action: "list" });
+	sm.appendMessage({ role: "toolResult", toolName: "todo", toolCallId: "list-for-blocker", ...listed, timestamp: 2 });
+	const blockedBoundary = await env.handlers.get("agent_before_settle")[0]({ entries: [], outcome: "completed", context: { contextMessages: [] } }, { ...ctx, hasPendingMessages: () => false });
+	assert.equal(blockedBoundary.entries.at(-1).data.reason, "all_remaining_tasks_blocked");
+	console.log("✓ real todo-tree list/tool-result aliases preserve canonical revision-scoped blockers");
+
 	const loop = handlersFor(), sent = [], warnings = [];
 	todoLoop(loop.pi);
 	assert.equal(loop.handlers.has("agent_end"), false, "must not race core retry in agent_end");
@@ -93,7 +107,8 @@ try {
 		await runBoundary(boundary);
 	}
 	assert.equal(sent.length, 1, "authoritative UI snapshots must override stale tool state");
-	branch = [branch[0], ...Array.from({ length: 20 }, () => ({ type: "message", message: { role: "user", content: continuation } }))];
+	const legacyContinuation = "Continue working on the remaining todo items. Start with the first unfinished item, update the todo list as you progress, and do not stop while any todo remains unfinished. If you truly cannot continue, explicitly say that you cannot continue.";
+	branch = [branch[0], ...Array.from({ length: 20 }, () => ({ type: "message", message: { role: "user", content: legacyContinuation } }))];
 	await runBoundary(boundary);
 	assert.equal(sent.length, 1); assert.equal(warnings.length, 1);
 	branch = [branch[0], ...Array.from({ length: 20 }, () => ({ type: "custom_message", customType: "todo-loop-followup", content: continuation }))];

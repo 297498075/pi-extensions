@@ -290,7 +290,9 @@ try {
 		assert.equal((await h.emit("agent_before_settle", boundary)).continue, true);
 		for (const data of [{ executing: false, todos: [] }, { executing: false }, { executing: false, todos: [{ completed: false }] }]) {
 			branch = [pending, { type: "custom", customType: "plan-mode", data }];
-			assert.equal(await h.emit("agent_before_settle", boundary), undefined);
+			const stopped = await h.emit("agent_before_settle", boundary);
+			assert.notEqual(stopped?.continue, true);
+			assert.equal(stopped.entries.at(-1).data.reason, "no_unfinished_tasks");
 		}
 		branch.push(pending); assert.equal((await h.emit("agent_before_settle", boundary)).continue, true, "a genuinely restarted plan still runs");
 		console.log("✓ stopped/reset plan snapshots suppress stale todo follow-ups without blocking a restart");

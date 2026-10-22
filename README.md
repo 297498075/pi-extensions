@@ -105,7 +105,7 @@ pi --extension ./extensions/compact.ts
 
 `extensions/todo-loop.ts` continues the agent when the latest structured todo state still contains unfinished items. It requires Pi's `agent_before_settle` boundary API (verified with Pi 1.2/1.3). It reads `details.tasks` from `@juicesharp/rpiv-todo` and also accepts the `details.todos` format used by Pi's example todo extension. It also understands the `plan-mode` execution state used by Pi's example extension.
 
-After core retries, compaction, and queued work finish, the extension uses `agent_before_settle` to append a `todo-loop-followup` context message and request one continuation. It also reads `todo-tree-state`, so UI completion, `/todo clear`, and `/todo off` override stale tool state. An explicit `plan-mode` snapshot with `executing: false` clears the old execution state instead of reviving an abandoned plan. It stops when all todos are complete, the final assistant text explicitly says it cannot continue, the operation was aborted by the user, or the follow-up limit is reached. The default limit is 20 automatic follow-ups; configure it with a CLI flag:
+After core retries, compaction, and queued work finish, the extension uses `agent_before_settle` to append a `todo-loop-followup` context message and request one continuation. It also reads `todo-tree-state`, so UI completion, `/todo clear`, and `/todo off` override stale tool state. An explicit `plan-mode` snapshot with `executing: false` clears the old execution state instead of reviving an abandoned plan. It stops requesting follow-ups when all todos are complete/disabled, every actionable task has an explicitly registered blocker, the operation was aborted/errored, or the follow-up limit is reached. Assistant prose (including quoted prompts and “cannot continue”) never controls settlement. The default limit is 20 automatic follow-ups; configure it with a CLI flag:
 
 ```bash
 pi --todo-loop-max-followups 50
@@ -113,7 +113,11 @@ pi --todo-loop-max-followups 50
 
 The count includes persisted `todo-loop-followup` messages and legacy follow-up user messages in the current branch, so it survives `/reload` and session resume. Set it to `0` to disable automatic follow-ups.
 
-The extension has no network, file, command, or external state side effects. The todo extension that owns the `todo` tool must be loaded separately; this extension only observes its persisted task state (`details.tasks` or `details.todos`).
+The model-only `todo_loop_control` tool supports `status`, `report_blocker` and `clear_blocker`. Blockers require actionable task IDs, a category, a concrete reason and a resume condition. A blocked child does not stop unrelated tasks; pending parents are containers while they have unfinished children. Successful tool-result details persist blockers in the active branch. New user messages, changes to the corresponding task, and task clear/disable invalidate blockers; reload/fork reconstruct branch-local state. Blockers never complete or cancel tasks.
+
+Use `/todo-loop status` for a TUI modal showing current blockers, the budget and the last recorded boundary decision (non-TUI environments fall back to a notification). Each boundary with known todo state records a `todo-loop-decision` session entry explaining continuation or non-continuation. See [Todo Loop control protocol](docs/todo-loop.md) for examples, invalidation rules and verification.
+
+The extension has no network, external file, command execution, or background-resource side effects. It registers a tool and a slash command and adds control results, decisions and continuation messages to Pi session history. It runs with Pi’s full system permissions. The todo extension that owns the `todo` tool must be loaded separately; this extension observes its persisted task state (`details.tasks` or `details.todos`) without modifying it.
 
 ## Rolling Tools
 
