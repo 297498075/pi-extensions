@@ -110,13 +110,92 @@ try {
 	let modelsTried = [];
 	globalThis.fetch = async (_url, init) => {
 		const body = JSON.parse(init.body); modelsTried.push(body.model);
-		if (body.model === "image-primary") return new Response("unavailable", { status: 503 });
+		if (body.model === "image-primary") return Response.json({ error: { code: "model_not_found" } }, { status: 404 });
 		return Response.json({ data: [{ b64_json: pngBase64 }] });
 	};
 	const fallback = await executeImageGeneration({ prompt: "test" }, config, provider, cwd);
 	assert.equal(fallback.usedModel, "image-fallback");
-	assert.deepEqual(modelsTried, ["image-primary", "image-primary", "image-fallback"]);
+	assert.deepEqual(modelsTried, ["image-primary", "image-fallback"]);
 	console.log("✓ actual generation, HTTP/download validation and ordered fallback");
+
+	// Fixed images endpoints never probe chat, including failures with configured model fallbacks.
+	const editPath = join(cwd, "edit-reference.png"); writeFileSync(editPath, png);
+	const failures = [
+		[200, "content_policy_violation"], [400, "content_policy_violation"],
+		[400, "invalid_request"], [401, "unauthorized"], [403, "forbidden"],
+		[404, "content_policy_violation"], [429, "rate_limit"], [503, "unavailable"], [524, "timeout"],
+	];
+	for (const apiMode of ["images", "chat"]) for (const image of [undefined, editPath]) {
+		for (const [status, code] of failures) {
+			const seen = [];
+			const body = JSON.stringify({ error: { code, message: "x".repeat(256) + " diagnostic_tail " + provider.apiKey + " Bearer fixture-token" } });
+			globalThis.fetch = async (url, init) => {
+				seen.push(String(url));
+				return new Response(body, { status, headers: { "x-request-id": "fixture-" + status } });
+			};
+			let failure;
+			const before = readdirSync(output).length;
+			await assert.rejects(executeImageGeneration({ prompt: "test", image }, { ...config, apiMode }, provider, cwd), error => {
+				failure = error; return true;
+			});
+			const endpoint = apiMode === "chat" ? "/chat/completions" : image ? "/images/edits" : "/images/generations";
+			assert.deepEqual(seen, [provider.baseUrl + endpoint], "refusal/auth/transient/invalid requests must not probe another endpoint or model");
+			assert.equal(readdirSync(output).length, before);
+			assert.equal(failure.attempts.length, 1);
+			const http = failure.attempts[0].http;
+			assert.equal(http.endpoint, endpoint); assert.equal(http.status, status);
+			assert.equal(http.requestId, "fixture-" + status);
+			assert.equal(http.policyRejected, code === "content_policy_violation");
+			assert.equal(http.retryable, status === 429 || status >= 500);
+			assert.equal(http.modelFallbackAllowed, false);
+			assert.ok(http.responseBody.includes("diagnostic_tail"), "diagnostics must not be clipped at 100 characters");
+			assert.ok(!JSON.stringify(failure.attempts).includes(provider.apiKey));
+			assert.ok(!JSON.stringify(failure.attempts).includes("fixture-token"));
+		}
+	}
+	globalThis.fetch = async () => new Response("gateway timeout", { status: 524, headers: { "cf-ray": "fixture-ray" } });
+	const failedTool = await tools.get("generate_image").execute("http-failure", { prompt: "test" }, undefined, undefined, ctx);
+	assert.equal(failedTool.isError, true);
+	assert.equal(failedTool.details.attempts[0].http.status, 524);
+	assert.equal(failedTool.details.attempts[0].http.requestId, "fixture-ray");
+
+	let networkRequests = 0;
+	globalThis.fetch = async () => { networkRequests++; throw new TypeError("network failure " + provider.apiKey); };
+	await assert.rejects(executeImageGeneration({ prompt: "test" }, config, provider, cwd), error => {
+		assert.equal(error.attempts.length, 1); assert.ok(!error.message.includes(provider.apiKey)); return true;
+	});
+	assert.equal(networkRequests, 1, "network errors belong to the caller retry policy, not extra model attempts");
+	const quotedKey = 'fixture-"quoted key';
+	globalThis.fetch = async () => Response.json({ error: { message: quotedKey + " " + encodeURIComponent(quotedKey) } }, { status: 400 });
+	await assert.rejects(executeImageGeneration({ prompt: "test" }, config, { ...provider, apiKey: quotedKey }, cwd), error => {
+		for (const form of [quotedKey, JSON.stringify(quotedKey).slice(1, -1), encodeURIComponent(quotedKey)]) assert.ok(!error.message.includes(form));
+		return true;
+	});
+
+	// Explicit chat mode supports both text and real image bytes, without probing images endpoints.
+	for (const image of [undefined, editPath]) {
+		let requests = 0;
+		globalThis.fetch = async (url, init) => {
+			requests++; assert.equal(String(url), provider.baseUrl + "/chat/completions");
+			const content = JSON.parse(init.body).messages[0].content;
+			if (image) assert.equal(content.find(part => part.type === "image_url").image_url.url, dataUri);
+			else assert.equal(content, "test");
+			return Response.json({ choices: [{ message: { content: dataUri } }] });
+		};
+		const result = await executeImageGeneration({ prompt: "test", image }, { ...config, apiMode: "chat" }, provider, cwd);
+		assert.equal(requests, 1); assert.deepEqual(readFileSync(result.filePath), png);
+	}
+	let editRequests = 0;
+	globalThis.fetch = async (url, init) => {
+		editRequests++; assert.equal(String(url), provider.baseUrl + "/images/edits");
+		assert.deepEqual(Buffer.from(await init.body.get("image").arrayBuffer()), png);
+		return Response.json({ data: [{ b64_json: pngBase64 }] });
+	};
+	await executeImageGeneration({ prompt: "test", image: editPath }, config, provider, cwd);
+	assert.equal(editRequests, 1, "default mode must use the images editing endpoint exactly once");
+	await assert.rejects(executeImageGeneration({ prompt: "test" }, { ...config, apiMode: "automatic" }, provider, cwd), /apiMode/);
+	assert.equal(editRequests, 1, "invalid mode must fail before sending a request");
+	console.log("✓ explicit images/chat routing, no endpoint/refusal/transient fallback, full redacted HTTP diagnostics");
 
 	const controller = new AbortController();
 	let requestSignal, complete;

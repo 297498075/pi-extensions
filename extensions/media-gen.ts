@@ -131,6 +131,8 @@ export function resolveAspectAndSize(w?: number, h?: number, fallbackW = 1024, f
 
 export interface MediaToolConfig {
 	primaryModel: string;
+	/** Image endpoint family. Defaults to images; chat requires explicit opt-in. */
+	apiMode?: "images" | "chat";
 	fallbackModels?: string[];
 	defaultWidth?: number;
 	defaultHeight?: number;
@@ -393,6 +395,58 @@ export interface ImageExecutionResult {
 	fileSize: number;
 }
 
+export interface ImageApiFailure {
+	endpoint: string;
+	status: number;
+	requestId: string | null;
+	responseBody: string;
+	policyRejected: boolean;
+	retryable: boolean;
+	modelFallbackAllowed: boolean;
+}
+
+interface ImageAttemptFailure {
+	model: string;
+	error: string;
+	http?: ImageApiFailure;
+}
+
+function redactApiError(text: string, apiKey: string): string {
+	let safe = text;
+	if (apiKey) {
+		const forms = new Set([apiKey, JSON.stringify(apiKey).slice(1, -1), encodeURIComponent(apiKey)]);
+		for (const value of [...forms].sort((a, b) => b.length - a.length)) safe = safe.split(value).join("[REDACTED]");
+	}
+	return safe.replace(/Bearer\s+[^\s"'<>]+/gi, "Bearer [REDACTED]");
+}
+
+class ImageApiError extends Error {
+	readonly failure: ImageApiFailure;
+
+	constructor(endpoint: string, response: Response, body: string, apiKey: string) {
+		const responseBody = redactApiError(body, apiKey);
+		const requestId = response.headers.get("x-request-id") || response.headers.get("request-id") || response.headers.get("cf-ray");
+		const safeRequestId = requestId ? redactApiError(requestId, apiKey) : null;
+		const policyRejected = /content[_ -]?policy|policy[_ -]?violation|safety|moderation|content[_ -]?filter/i.test(body);
+		const retryable = [408, 425, 429].includes(response.status) || response.status >= 500;
+		const modelFallbackAllowed = !policyRejected && (response.status === 404 ||
+			([400, 422].includes(response.status) && /model[_ -](?:not[_ -]found|unsupported|not[_ -]supported)/i.test(body)));
+		super(`${endpoint}: HTTP ${response.status}${safeRequestId ? ` (request ID: ${safeRequestId})` : ""}\n${responseBody}`);
+		this.name = "ImageApiError";
+		this.failure = { endpoint, status: response.status, requestId: safeRequestId, responseBody, policyRejected, retryable, modelFallbackAllowed };
+	}
+}
+
+class ImageGenerationError extends Error {
+	readonly attempts: ImageAttemptFailure[];
+
+	constructor(attempts: ImageAttemptFailure[]) {
+		super(`Image generation failed: ${attempts.map(attempt => `[${attempt.model}]: ${attempt.error}`).join(" | ")}`);
+		this.name = "ImageGenerationError";
+		this.attempts = attempts;
+	}
+}
+
 export async function executeImageGeneration(
 	params: GenerateImageParams,
 	mediaConfig: MediaToolConfig,
@@ -419,8 +473,10 @@ export async function executeImageGeneration(
 	const defaultH = mediaConfig.defaultHeight || 1024;
 	const dims = resolveAspectAndSize(params.width, params.height, defaultW, defaultH);
 	const isEdit = Boolean(params.image && params.image.trim().length > 0);
+	const apiMode = mediaConfig.apiMode ?? "images";
+	if (apiMode !== "images" && apiMode !== "chat") throw new Error("image.apiMode must be images or chat.");
 
-	const attemptErrors: Array<{ model: string; error: string }> = [];
+	const attemptErrors: ImageAttemptFailure[] = [];
 
 	for (const model of modelsToTry) {
 		try {
@@ -431,6 +487,7 @@ export async function executeImageGeneration(
 				imageInput: params.image,
 				dimensions: dims,
 				isEdit,
+				apiMode,
 				cwd,
 				signal,
 			});
@@ -449,13 +506,37 @@ export async function executeImageGeneration(
 			};
 		} catch (err: any) {
 			signal.throwIfAborted();
-			attemptErrors.push({ model, error: err?.message || String(err) });
-			// Waterfall fallback: automatically advance to next model in sequence
+			attemptErrors.push({ model, error: redactApiError(err?.message || String(err), provider.apiKey), ...(err instanceof ImageApiError ? { http: err.failure } : {}) });
+			// Never turn a transient failure, refusal, auth error or invalid request into extra attempts.
+			if (err instanceof TypeError || (err instanceof ImageApiError && !err.failure.modelFallbackAllowed)) break;
 		}
 	}
 
-	const errorSummary = attemptErrors.map((e) => `[${e.model}]: ${e.error}`).join(" | ");
-	throw new Error(`All configured image models failed: ${errorSummary}`);
+	throw new ImageGenerationError(attemptErrors);
+}
+
+async function readImageApiResponse(
+	response: Response, endpoint: string, apiKey: string, signal?: AbortSignal, chat = false,
+): Promise<Buffer> {
+	const body = await response.text();
+	if (!response.ok) throw new ImageApiError(endpoint, response, body, apiKey);
+	let data: any;
+	try {
+		data = JSON.parse(body);
+	} catch {
+		throw new ImageApiError(endpoint, response, body, apiKey);
+	}
+	if (data?.error) throw new ImageApiError(endpoint, response, body, apiKey);
+	if (chat) {
+		const extracted = await extractImageFromChatMessage(data?.choices?.[0]?.message, signal);
+		if (extracted) return extracted;
+	} else {
+		const b64 = data?.data?.[0]?.b64_json;
+		if (b64) return Buffer.from(b64, "base64");
+		const url = data?.data?.[0]?.url;
+		if (url) return downloadImage(url, signal);
+	}
+	throw new ImageApiError(endpoint, response, body, apiKey);
 }
 
 async function callImageApi(options: {
@@ -465,16 +546,33 @@ async function callImageApi(options: {
 	imageInput?: string;
 	dimensions: ResolvedDimensions;
 	isEdit: boolean;
+	apiMode: "images" | "chat";
 	cwd: string;
 	signal?: AbortSignal;
 }): Promise<Buffer> {
-	const { provider, model, prompt, imageInput, dimensions, isEdit, cwd, signal } = options;
+	const { provider, model, prompt, imageInput, dimensions, isEdit, apiMode, cwd, signal } = options;
 
-	// Branch 1: Image editing / Image-to-Image
+	// Chat-capable models must opt in. Never change endpoints after a failed request.
+	if (apiMode === "chat") {
+		let content: string | Array<Record<string, unknown>> = prompt;
+		if (isEdit && imageInput) {
+			const { buffer, mimeType } = await loadInputImage(imageInput, cwd, signal);
+			content = [
+				{ type: "text", text: `Edit this image according to instructions: ${prompt}` },
+				{ type: "image_url", image_url: { url: `data:${mimeType};base64,${buffer.toString("base64")}` } },
+			];
+		}
+		const endpoint = "/chat/completions";
+		const response = await fetch(`${provider.baseUrl}${endpoint}`, {
+			signal, method: "POST",
+			headers: { Authorization: `Bearer ${provider.apiKey}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ model, messages: [{ role: "user", content }] }),
+		});
+		return readImageApiResponse(response, endpoint, provider.apiKey, signal, true);
+	}
+
 	if (isEdit && imageInput) {
 		const { buffer, mimeType } = await loadInputImage(imageInput, cwd, signal);
-
-		// Try OpenAI standard /images/edits endpoint
 		const formData = new FormData();
 		const blob = new Blob([new Uint8Array(buffer)], { type: mimeType });
 		formData.append("image", blob, `image.${imageExtension(buffer)}`);
@@ -482,122 +580,22 @@ async function callImageApi(options: {
 		formData.append("prompt", prompt);
 		formData.append("size", dimensions.openAiSize);
 		formData.append("response_format", "b64_json");
-
-		const editUrl = `${provider.baseUrl}/images/edits`;
-		const response = await fetch(editUrl, {
-			signal,
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${provider.apiKey}`,
-			},
+		const endpoint = "/images/edits";
+		const response = await fetch(`${provider.baseUrl}${endpoint}`, {
+			signal, method: "POST",
+			headers: { Authorization: `Bearer ${provider.apiKey}` },
 			body: formData,
 		});
-
-		if (response.ok) {
-			const data = (await response.json()) as any;
-			const b64 = data?.data?.[0]?.b64_json;
-			if (b64) return Buffer.from(b64, "base64");
-			const url = data?.data?.[0]?.url;
-			if (url) return downloadImage(url, signal);
-		}
-
-		// Fallback: Multimodal chat generation
-		const chatUrl = `${provider.baseUrl}/chat/completions`;
-		const base64DataUri = `data:${mimeType};base64,${buffer.toString("base64")}`;
-		const chatRes = await fetch(chatUrl, {
-			signal,
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${provider.apiKey}`,
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify({
-				model,
-				messages: [
-					{
-						role: "user",
-						content: [
-							{ type: "text", text: `Edit this image according to instructions: ${prompt}` },
-							{ type: "image_url", image_url: { url: base64DataUri } },
-						],
-					},
-				],
-			}),
-		});
-
-		if (chatRes.ok) {
-			const chatData = (await chatRes.json()) as any;
-			const msg = chatData?.choices?.[0]?.message;
-			const extracted = await extractImageFromChatMessage(msg, signal);
-			if (extracted) {
-				return extracted;
-			}
-		}
-
-		const editError = await response.text().catch(() => "");
-		const chatError = chatRes ? await chatRes.text().catch(() => "") : "";
-		const errorMsg = chatError
-			? `/images/edits: ${response.status} ${editError.slice(0, 100)} | /chat/completions: ${chatRes.status} ${chatError.slice(0, 100)}`
-			: `${response.status} ${response.statusText} ${editError.slice(0, 150)}`;
-		throw new Error(`Failed to edit image with model ${model} (${errorMsg})`);
+		return readImageApiResponse(response, endpoint, provider.apiKey, signal);
 	}
 
-	// Branch 2: Text-to-Image via /images/generations
-	const genUrl = `${provider.baseUrl}/images/generations`;
-	const res = await fetch(genUrl, {
-		signal,
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${provider.apiKey}`,
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify({
-			model,
-			prompt,
-			n: 1,
-			size: dimensions.openAiSize,
-			response_format: "b64_json",
-		}),
+	const endpoint = "/images/generations";
+	const response = await fetch(`${provider.baseUrl}${endpoint}`, {
+		signal, method: "POST",
+		headers: { Authorization: `Bearer ${provider.apiKey}`, "Content-Type": "application/json" },
+		body: JSON.stringify({ model, prompt, n: 1, size: dimensions.openAiSize, response_format: "b64_json" }),
 	});
-
-	if (res.ok) {
-		const data = (await res.json()) as any;
-		const b64 = data?.data?.[0]?.b64_json;
-		if (b64) return Buffer.from(b64, "base64");
-		const url = data?.data?.[0]?.url;
-		if (url) return downloadImage(url, signal);
-	}
-
-	// Fallback: Multimodal chat/completions (for Gemini, Claude, Qwen, or proxy aggregators)
-	const chatUrl = `${provider.baseUrl}/chat/completions`;
-	const chatRes = await fetch(chatUrl, {
-		signal,
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${provider.apiKey}`,
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify({
-			model,
-			messages: [{ role: "user", content: prompt }],
-		}),
-	});
-
-	if (chatRes.ok) {
-		const chatData = (await chatRes.json()) as any;
-		const msg = chatData?.choices?.[0]?.message;
-		const extracted = await extractImageFromChatMessage(msg, signal);
-		if (extracted) {
-			return extracted;
-		}
-	}
-
-	const genError = await res.text().catch(() => "");
-	const chatError = chatRes ? await chatRes.text().catch(() => "") : "";
-	const errorMsg = chatError
-		? `/images/generations: ${res.status} ${genError.slice(0, 100)} | /chat/completions: ${chatRes.status} ${chatError.slice(0, 100)}`
-		: `${res.status} ${res.statusText} ${genError.slice(0, 150)}`;
-	throw new Error(`API call failed for ${model}: ${errorMsg}`);
+	return readImageApiResponse(response, endpoint, provider.apiKey, signal);
 }
 
 /**
@@ -991,7 +989,7 @@ export default function mediaGenExtension(pi: ExtensionAPI): void {
 						},
 					],
 					isError: true,
-					details: { error: err?.message || String(err) },
+					details: { error: err?.message || String(err), ...(err instanceof ImageGenerationError ? { attempts: err.attempts } : {}) },
 				};
 			}
 		},

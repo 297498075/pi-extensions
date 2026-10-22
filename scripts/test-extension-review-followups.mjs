@@ -107,7 +107,7 @@ try {
 		{ ext: "webp", mime: "image/webp", bytes: Buffer.from("RIFF\x04\x00\x00\x00WEBP", "binary") },
 	];
 	const provider = { providerName: "fixture", baseUrl: "https://api.invalid/v1", apiKey: "fixture", availableModels: ["image", "video"] };
-	for (const image of formats) for (const header of [undefined, "application/octet-stream", "image/jpeg", "image/png; charset=binary"]) {
+	for (const image of formats) for (const header of [undefined, "application/octet-stream", "image/jpeg", "image/png; charset=binary"]) for (const apiMode of ["images", "chat"]) {
 		let edits = 0, chats = 0;
 		globalThis.fetch = async (url, init) => {
 			if (url === "https://assets.invalid/mislabeled.jpg") return new Response(image.bytes, { headers: header ? { "content-type": header } : {} });
@@ -115,15 +115,16 @@ try {
 				edits++; const file = init.body.get("image");
 				assert.equal(file.type, image.mime); assert.equal(file.name, `image.${image.ext}`);
 				assert.deepEqual(Buffer.from(await file.arrayBuffer()), image.bytes);
-				return new Response("use chat endpoint", { status: 404 });
+				return Response.json({ data: [{ b64_json: png.toString("base64") }] });
 			}
 			assert.ok(String(url).endsWith("/chat/completions"), String(url)); chats++;
 			const content = JSON.parse(init.body).messages[0].content;
 			assert.equal(content.find(part => part.type === "image_url").image_url.url, `data:${image.mime};base64,${image.bytes.toString("base64")}`);
 			return Response.json({ choices: [{ message: { images: [`data:image/png;base64,${png.toString("base64")}`] } }] });
 		};
-		const result = await media.executeImageGeneration({ prompt: "edit", image: "https://assets.invalid/mislabeled.jpg" }, { primaryModel: "image" }, provider, root);
-		assert.deepEqual(readFileSync(result.filePath), png); assert.equal(edits, 1); assert.equal(chats, 1);
+		const result = await media.executeImageGeneration({ prompt: "edit", image: "https://assets.invalid/mislabeled.jpg" }, { primaryModel: "image", apiMode }, provider, root);
+		assert.deepEqual(readFileSync(result.filePath), png);
+		assert.equal(edits, apiMode === "images" ? 1 : 0); assert.equal(chats, apiMode === "chat" ? 1 : 0);
 	}
 	const mislabeled = join(root, "actually-png.jpg"); writeFileSync(mislabeled, png);
 	const mp4 = Buffer.alloc(24); mp4.writeUInt32BE(24, 0); mp4.write("ftyp", 4); mp4.write("isom", 8);
