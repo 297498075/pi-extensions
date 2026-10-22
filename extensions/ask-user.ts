@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { Check } from "typebox/value";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	Input,
@@ -20,7 +22,7 @@ export const OptionSchema = Type.Object({
 	}),
 	description: Type.Optional(
 		Type.String({
-			description: "解释该选项的含义、优势、代价或影响",
+			description: "每个选项都应填写：具体会怎么做、影响的行为/范围、主要收益与代价或风险、适用场景。推荐项必须结合用户当前需求解释为什么比其他项更合适；避免只写‘更好/推荐/更灵活’或复述标签。不确定的影响要明确说明。",
 		}),
 	),
 });
@@ -49,6 +51,10 @@ export const QuestionItemSchema = Type.Object({
 });
 
 export const AskUserQuestionSchema = Type.Object({
+	blocking: Type.Optional(Type.Boolean({
+		default: true,
+		description: "默认 true：等待用户回答。false：立即返回 requestId，让用户回答的同时继续不依赖该答案的工作；答案自动通知。需要答案才能继续时调用 wait_user_answer，勿把未回答或取消当成同意。",
+	})),
 	questions: Type.Array(QuestionItemSchema, {
 		minItems: 1,
 		maxItems: 4,
@@ -70,6 +76,61 @@ interface QuestionAnswer {
 interface QuestionnaireResult {
 	answers: QuestionAnswer[];
 	cancelled: boolean;
+}
+
+const ANSWER_MESSAGE = "ask-user-answer";
+
+export const AnswerRequestSchema = Type.Object({
+	requestId: Type.String({ minLength: 1, description: "ask_user_question 返回的 requestId" }),
+});
+
+const RequestSnapshotSchema = Type.Object({
+	kind: Type.Literal("ask-user/v1"),
+	requestId: Type.String({ minLength: 1 }),
+	status: Type.Union([Type.Literal("pending"), Type.Literal("answered"), Type.Literal("cancelled"), Type.Literal("error")]),
+	questions: Type.Array(QuestionItemSchema),
+	answers: Type.Array(Type.Object({
+		question: Type.String(), header: Type.Optional(Type.String()),
+		selected: Type.Array(Type.String()), customText: Type.Optional(Type.String()),
+	})),
+	cancelled: Type.Boolean(),
+	reason: Type.Optional(Type.String()),
+});
+
+type RequestSnapshot = Static<typeof RequestSnapshotSchema>;
+interface LiveRequest {
+	snapshot: RequestSnapshot;
+	controller: AbortController;
+	promise: Promise<void>;
+	resolve: () => void;
+	ctx: ExtensionContext;
+	notify: boolean;
+	generation: number;
+}
+
+function requestResult(snapshot: RequestSnapshot) {
+	const prefix = `Question request ${snapshot.requestId}: ${snapshot.status}.`;
+	const text = snapshot.status === "pending"
+		? `${prefix} Continue work that does not depend on the answer. Use get_user_answer to check, or wait_user_answer when the answer is required. Unanswered questions are not consent.`
+		: snapshot.status === "answered"
+			? `${prefix}\nUser answers:\n${snapshot.answers.map(a =>
+				`- ${a.header ? `[${a.header}] ` : ""}${a.question}: ${a.selected.join(", ")}`).join("\n")}`
+			: `${prefix} ${snapshot.reason || "User cancelled the questionnaire."} No authorization was granted.`;
+	return { content: [{ type: "text" as const, text }], details: structuredClone(snapshot),
+		...(snapshot.status === "error" ? { isError: true } : {}) };
+}
+
+async function waitForRequest(promise: Promise<void>, signal?: AbortSignal): Promise<void> {
+	if (signal?.aborted) throw new Error("Waiting for user answer was aborted; the question remains available.");
+	let abort: (() => void) | undefined;
+	try {
+		await Promise.race([promise, new Promise<never>((_resolve, reject) => {
+			abort = () => reject(new Error("Waiting for user answer was aborted; the question remains available."));
+			signal?.addEventListener("abort", abort, { once: true });
+		})]);
+	} finally {
+		if (abort) signal?.removeEventListener("abort", abort);
+	}
 }
 
 function cancelledResult() {
@@ -102,6 +163,116 @@ function notifyPrompt(title: string, ctx: ExtensionContext): void {
 // ==========================================
 
 export default function askUserQuestion(pi: ExtensionAPI): void {
+	const requests = new Map<string, LiveRequest>();
+	let queue: LiveRequest[] = [];
+	let active: LiveRequest | undefined;
+	let generation = 0;
+
+	function finish(request: LiveRequest, result: QuestionnaireResult, error?: string): void {
+		if (request.snapshot.status !== "pending") return;
+		request.snapshot = {
+			...request.snapshot, ...result,
+			status: error ? "error" : result.cancelled ? "cancelled" : "answered",
+			...(error ? { reason: error } : {}),
+		};
+		request.resolve();
+		if (!request.notify || request.generation !== generation) return;
+		try {
+			// Persist immediately: delivery may be queued until the current run finishes.
+			pi.appendEntry(ANSWER_MESSAGE, request.snapshot);
+			pi.sendMessage({
+				customType: ANSWER_MESSAGE, content: requestResult(request.snapshot).content,
+				display: true, details: request.snapshot,
+			}, { triggerTurn: true, deliverAs: "followUp" });
+		} catch {
+			// A delivery failure must not discard the answer or reject a detached task.
+			request.ctx.ui.notify?.("答案已保存，可通过 get_user_answer 获取；自动通知失败。", "warning");
+		}
+	}
+
+	function pump(): void {
+		if (active) return;
+		const request = queue.shift();
+		if (!request) return;
+		if (request.snapshot.status !== "pending") { pump(); return; }
+		active = request;
+		void presentQuestionnaire({ questions: request.snapshot.questions }, request.controller.signal, request.ctx)
+			.then(result => finish(request, result.details), error => finish(request,
+				{ answers: [], cancelled: true }, error instanceof Error ? error.message : String(error)))
+			.finally(() => {
+				if (active === request) { active = undefined; pump(); }
+			}).catch(() => { /* Detached UI/notification failures must not leak rejections. */ });
+	}
+
+	function reset(): void {
+		generation++;
+		queue = [];
+		active = undefined;
+		for (const request of requests.values()) {
+			if (request.snapshot.status !== "pending") continue;
+			request.snapshot = { ...request.snapshot, reason: "Question interrupted by session shutdown or branch change." };
+			request.controller.abort();
+			finish(request, { answers: [], cancelled: true });
+		}
+		requests.clear();
+	}
+
+	function restore(ctx: ExtensionContext): void {
+		reset();
+		const snapshots = new Map<string, RequestSnapshot>();
+		for (const entry of ctx.sessionManager.getBranch()) {
+			let data: unknown;
+			if (entry.type === "message" && entry.message.role === "toolResult" &&
+				["ask_user_question", "get_user_answer", "wait_user_answer"].includes(entry.message.toolName)) {
+				data = entry.message.details;
+			} else if (entry.type === "custom_message" && entry.customType === ANSWER_MESSAGE) {
+				data = entry.details;
+			} else if (entry.type === "custom" && entry.customType === ANSWER_MESSAGE) {
+				data = entry.data;
+			}
+			if (!Check(RequestSnapshotSchema, data)) continue;
+			// A fast RPC response can be persisted before the initial pending tool result.
+			if (data.status === "pending" && snapshots.get(data.requestId)?.status !== undefined) continue;
+			snapshots.set(data.requestId, data);
+		}
+		for (const stored of snapshots.values()) {
+			const snapshot: RequestSnapshot = stored.status === "pending" ? {
+				...stored, status: "cancelled", cancelled: true, answers: [],
+				reason: "Question interrupted by session reload or branch change. Ask again if still needed.",
+			} : stored;
+			requests.set(snapshot.requestId, {
+				snapshot, controller: new AbortController(), promise: Promise.resolve(), resolve() {},
+				ctx, notify: false, generation,
+			});
+		}
+	}
+
+	pi.on("session_start", (_event, ctx) => restore(ctx));
+	pi.on("session_tree", (_event, ctx) => restore(ctx));
+	pi.on("session_shutdown", () => reset());
+
+	for (const wait of [false, true]) {
+		pi.registerTool({
+			name: wait ? "wait_user_answer" : "get_user_answer",
+			label: wait ? "Wait for User Answer" : "Get User Answer",
+			description: wait
+				? "Wait for an ask_user_question request only when further work requires its answer. Returns immediately if already answered/cancelled/failed. Aborting this wait does not cancel the question. Never treat cancellation as consent."
+				: "Check an ask_user_question request by requestId without waiting. Returns pending, answered, cancelled, or error. Do not busy-poll: continue independent work or call wait_user_answer when the answer is required.",
+			parameters: AnswerRequestSchema,
+			async execute(_id, { requestId }, signal) {
+				const request = requests.get(requestId);
+				if (!request) return {
+					content: [{ type: "text" as const, text: `Unknown requestId: ${requestId}. It is not available on this session branch; ask again if needed.` }],
+					details: { requestId, status: "not_found" }, isError: true,
+				};
+				if (wait && request.snapshot.status === "pending") {
+					await waitForRequest(request.promise, signal);
+				}
+				return requestResult(request.snapshot);
+			},
+		});
+	}
+
 	pi.registerTool({
 		name: "ask_user_question",
 		label: "Ask User Question",
@@ -110,15 +281,51 @@ Use when requirements, scope, behavior, or implementation choices are ambiguous 
 
 Guidelines:
 - Each question must provide 1 to 12 clear, distinct options.
-- Provide a concise label (1-5 words) and an informative description explaining trade-offs or consequences.
+- Provide a concise label (1-5 words) AND a clear description for EVERY option. State what will actually be done, affected behavior/scope, benefits, meaningful costs/risks, and when that option fits. Use concrete language the user can compare; do not merely restate the label or say "better/more flexible".
+- For a recommended option, explain WHY it fits this user's current goals and constraints better than the alternatives, and disclose its downside. Do not invent benefits or certainty; identify material unknowns. Keep descriptions concise but sufficient for an informed decision.
 - The system automatically appends a "Type something..." option for custom user input; do NOT author an "Other" option yourself.
 - Set multiSelect: true if multiple options can be chosen simultaneously.
-- If you recommend a specific choice, make it the first option and append "(Recommended)" to its label.
+- If you recommend a specific choice, make it the first option and append "(Recommended)" to its label; the label never replaces the explanation.
+- blocking defaults to true (wait for the answer). Use blocking: false when useful independent work can continue: you receive a requestId immediately and the answer is automatically delivered as a follow-up without interrupting running tools.
+- Use get_user_answer to check without blocking. Call wait_user_answer with that requestId once further work truly depends on the answer. Do not busy-poll, assume an unanswered choice, or treat cancellation as authorization.
 `,
 		parameters: AskUserQuestionSchema,
 
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const typedParams = params as AskUserQuestionParams;
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			if (!ctx.hasUI || !params.questions?.length || signal?.aborted) {
+				return presentQuestionnaire(params, signal, ctx);
+			}
+			let resolve!: () => void;
+			const request: LiveRequest = {
+				snapshot: {
+					kind: "ask-user/v1", requestId: randomUUID(), status: "pending",
+					questions: structuredClone(params.questions), answers: [], cancelled: false,
+				},
+				controller: new AbortController(), promise: new Promise<void>(done => { resolve = done; }),
+				resolve, ctx, notify: params.blocking === false, generation,
+			};
+			requests.set(request.snapshot.requestId, request);
+			queue.push(request);
+			const abort = () => {
+				request.controller.abort();
+				finish(request, { answers: [], cancelled: true });
+			};
+			// Detached questions outlive the originating tool call's AbortSignal.
+			if (params.blocking !== false) signal?.addEventListener("abort", abort, { once: true });
+			pump();
+			if (params.blocking === false) return requestResult(request.snapshot);
+			try {
+				await request.promise;
+				return requestResult(request.snapshot);
+			} finally {
+				signal?.removeEventListener("abort", abort);
+			}
+		},
+	});
+}
+
+async function presentQuestionnaire(typedParams: AskUserQuestionParams, _signal: AbortSignal | undefined,
+	ctx: ExtensionContext): Promise<{ content: { type: "text"; text: string }[]; details: QuestionnaireResult }> {
 			if (!typedParams.questions || typedParams.questions.length === 0) {
 				return {
 					content: [{ type: "text", text: "Error: No questions provided" }],
@@ -752,6 +959,4 @@ Guidelines:
 					cancelled: false,
 				},
 			};
-		},
-	});
 }
