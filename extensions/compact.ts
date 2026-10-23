@@ -4,7 +4,6 @@ import { Type } from "typebox";
 interface CompactRequest {
 	toolCallId: string;
 	sessionId: string;
-	customInstructions?: string;
 	phase: "queued" | "compacting";
 	cancelled: boolean;
 }
@@ -37,34 +36,26 @@ export default function compactTool(pi: ExtensionAPI): void {
 		exposure: "model-only",
 		description:
 			"Request context compaction when the conversation is long or a major task phase is complete. " +
-			"Call this tool directly, preferably by itself. Optional customInstructions tell the summarizer what to preserve. " +
+			"Call this tool directly with no arguments, preferably by itself. Pi uses its default compaction summary. " +
 			"The request is queued until all tools in this turn finish; after successful compaction you automatically resume the current task. " +
 			"Do not immediately compact again without substantial new task progress. Cancellation or failure does not auto-resume.",
 		promptGuidelines: [
-			"Use compact proactively for long conversations, not after every turn. Preserve the goal, constraints, decisions, file paths, progress, blockers, and next steps in customInstructions.",
+			"Use compact proactively for long conversations, not after every turn. Call it with an empty argument object; it takes no parameters.",
 			"A compact tool result only acknowledges a queued request; compaction completion is reported separately. Do not repeat the request while it is pending.",
 		],
-		parameters: Type.Object({
-			customInstructions: Type.Optional(Type.String({
-				minLength: 1,
-				maxLength: 16_000,
-				description: "What the compaction summary must preserve, especially current progress and the next concrete steps.",
-			})),
-		}, { additionalProperties: false }),
-		async execute(toolCallId, params, signal, _onUpdate, ctx) {
+		parameters: Type.Object({}, { additionalProperties: false }),
+		async execute(toolCallId, _params, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Compaction request aborted");
 			if (pending) throw new Error("A compaction request is already pending; do not call compact again yet.");
-			const customInstructions = params.customInstructions?.trim() || undefined;
 			pending = {
 				toolCallId,
 				sessionId: ctx.sessionManager.getSessionId(),
-				customInstructions,
 				phase: "queued",
 				cancelled: false,
 			};
 			return {
 				content: [{ type: "text", text: "Compaction queued. All tools in this turn will finish first. After successful compaction, continue the current task from the preserved next steps." }],
-				details: { status: "queued", customInstructions, contextUsage: ctx.getContextUsage() },
+				details: { status: "queued", contextUsage: ctx.getContextUsage() },
 				terminate: true,
 			};
 		},
@@ -107,7 +98,6 @@ export default function compactTool(pi: ExtensionAPI): void {
 			// NEVER await it from a tool or lifecycle handler: that would deadlock
 			// the run it is waiting on. Returning here lets that run finish first.
 			ctx.compact({
-				customInstructions: request.customInstructions,
 				onComplete: (result) => {
 					if (!isCurrent(request, ctx)) return;
 					clear();

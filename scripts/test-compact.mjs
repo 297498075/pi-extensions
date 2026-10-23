@@ -40,19 +40,21 @@ const completed = { summary: "Task state and next steps", tokensBefore: 50_000, 
 	const h = harness();
 	assert.equal(h.tool.exposure, "model-only", "context control must not run inside codemode");
 	assert.ok(Check(h.tool.parameters, {}));
-	assert.ok(Check(h.tool.parameters, { customInstructions: "Preserve task state" }));
-	for (const args of [{ customInstructions: 1 }, { customInstructions: "" }, { customInstructions: "x".repeat(16_001) }, { unknown: true }]) {
+	assert.deepEqual(h.tool.parameters.properties, {}, "compact must declare no parameters");
+	assert.doesNotMatch([h.tool.description, ...h.tool.promptGuidelines].join("\n"), /customInstructions/);
+	for (const args of [{ customInstructions: "Preserve task state" }, { customInstructions: 1 }, { customInstructions: "" }, { unknown: true }, null, []]) {
 		assert.equal(Check(h.tool.parameters, args), false);
 	}
-	const { result, message } = await h.call({ customInstructions: "  Preserve modified paths and next steps  " });
+	const { result, message } = await h.call();
 	assert.equal(result.terminate, true);
 	assert.equal(result.details.status, "queued");
+	assert.equal(Object.hasOwn(result.details, "customInstructions"), false);
 	assert.equal(result.details.contextUsage.tokens, 50_000);
 	assert.equal(h.compactions.length, 0, "execute must not start compaction before tool-result persistence");
 	await assert.rejects(h.call(), /already pending/);
 	await h.finish(message);
 	assert.equal(h.compactions.length, 1);
-	assert.equal(h.compactions[0].customInstructions, "Preserve modified paths and next steps");
+	assert.deepEqual(Object.keys(h.compactions[0]).sort(), ["onComplete", "onError"], "use Pi defaults without custom summary instructions");
 	await h.finish(message);
 	assert.equal(h.compactions.length, 1, "one request starts only once");
 	await h.emit("agent_settled", { aborted: true }); // Manual compact itself aborts the active run.
