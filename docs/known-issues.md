@@ -4,7 +4,7 @@
 
 **状态：已确认，按用户决定本次暂不修复。**
 
-受影响代码：`extensions/voice.ts` 的 `TtsGatewayAdapter.speak()`、`VoiceRuntime.speak()`。
+受影响代码：`extensions/voice.ts` 的 `TtsGatewayAdapter.speak()`、`VoiceRuntime.speak()`；ask-user 自动提醒也通过同一发音路径，受相同限制。
 
 当前行为仍为：
 
@@ -20,7 +20,7 @@
 
 ### 临时使用限制
 
-多客户端共享网关时避免调用 `voice_speak`。需要语音输入时可以仅使用 `voice_listen`/Live；不使用语音功能时执行 `/voice off`。这些限制不能替代网关端的任务隔离。
+多客户端共享网关时避免调用 `voice_speak`，也不要在 voice 开启时使用 ask-user 自动语音提醒。需要语音输入时可以仅使用 `voice_listen`/Live，但同时加载 ask-user 且 voice 开启会自动播报新问卷，不能再把这种组合视为纯输入模式；不使用语音功能时执行 `/voice off`。这些限制不能替代网关端的任务隔离。
 
 ### 后续修复条件与验收
 

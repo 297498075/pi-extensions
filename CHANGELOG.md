@@ -4,6 +4,9 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- feat(ask-user): automatically speak questionnaire reminders while voice is enabled; optional `voice_prompt` lets the LLM choose a callout or spoken question, with a generic fallback, FIFO presentation, request-owned cancellation and no automatic recording.
+- test(ask-user): cover the voice bridge with isolated gateway mocks, including load order, disabled/missing voice, busy/failing audio, detached requests, cancellation, session isolation and TUI/RPC/headless modes. VOICE-001 remains unchanged.
+
 - fix(todo-loop): replace prose/regex stop detection with explicit per-task blockers in successful `todo_loop_control` results; quoted prompts, summaries and abort strings no longer silently stop unfinished work.
 - feat(todo-loop): add branch-local revision-scoped blockers, actionable-leaf continuation, structured boundary decision records and a `/todo-loop status` modal; preserve retry/abort/error protection and persisted follow-up limits.
 - test(todo-loop): add isolated protocol, quote-regression, persistence/fork, invalidation, boundary-composition, budget and status-modal coverage.

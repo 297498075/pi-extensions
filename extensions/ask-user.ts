@@ -10,6 +10,7 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
+import { ASK_USER_VOICE_PROMPT, DEFAULT_QUESTION_VOICE_PROMPT, type QuestionVoicePrompt } from "./lib/ask-user-voice.ts";
 
 // ==========================================
 // Schema 定义
@@ -51,6 +52,11 @@ export const QuestionItemSchema = Type.Object({
 });
 
 export const AskUserQuestionSchema = Type.Object({
+	voice_prompt: Type.Optional(Type.String({
+		minLength: 1,
+		maxLength: 500,
+		description: "voice 开启时自动播放的口语提醒。由你结合当前场景决定：简短呼叫用户、直接提问或概括需要确认的选择，限 1–2 句，不读代码、路径或长选项。省略则使用简短呼叫；无需另外调用 voice_speak，不会自动录音。",
+	})),
 	blocking: Type.Optional(Type.Boolean({
 		default: true,
 		description: "默认 true：等待用户回答。false：立即返回 requestId，让用户回答的同时继续不依赖该答案的工作；答案自动通知。需要答案才能继续时调用 wait_user_answer，勿把未回答或取消当成同意。",
@@ -106,6 +112,7 @@ interface LiveRequest {
 	ctx: ExtensionContext;
 	notify: boolean;
 	generation: number;
+	voicePrompt?: string;
 }
 
 function requestResult(snapshot: RequestSnapshot) {
@@ -175,6 +182,8 @@ export default function askUserQuestion(pi: ExtensionAPI): void {
 			status: error ? "error" : result.cancelled ? "cancelled" : "answered",
 			...(error ? { reason: error } : {}),
 		};
+		// Submission/cancellation also stops any reminder still speaking.
+		request.controller.abort();
 		request.resolve();
 		if (!request.notify || request.generation !== generation) return;
 		try {
@@ -196,6 +205,14 @@ export default function askUserQuestion(pi: ExtensionAPI): void {
 		if (!request) return;
 		if (request.snapshot.status !== "pending") { pump(); return; }
 		active = request;
+		try {
+			// Only the visible FIFO questionnaire speaks. No listener means no voice dependency.
+			const prompt: QuestionVoicePrompt = {
+				text: request.voicePrompt?.trim() || DEFAULT_QUESTION_VOICE_PROMPT,
+				signal: request.controller.signal,
+			};
+			pi.events.emit(ASK_USER_VOICE_PROMPT, prompt);
+		} catch { /* Voice must never prevent presenting the question. */ }
 		void presentQuestionnaire({ questions: request.snapshot.questions }, request.controller.signal, request.ctx)
 			.then(result => finish(request, result.details), error => finish(request,
 				{ answers: [], cancelled: true }, error instanceof Error ? error.message : String(error)))
@@ -288,6 +305,7 @@ Guidelines:
 - If you recommend a specific choice, make it the first option and append "(Recommended)" to its label; the label never replaces the explanation.
 - blocking defaults to true (wait for the answer). Use blocking: false when useful independent work can continue: you receive a requestId immediately and the answer is automatically delivered as a follow-up without interrupting running tools.
 - Use get_user_answer to check without blocking. Call wait_user_answer with that requestId once further work truly depends on the answer. Do not busy-poll, assume an unanswered choice, or treat cancellation as authorization.
+- Set voice_prompt to a concise, conversational reminder suited to the moment: call the user over, ask the question aloud, or summarize the decision in 1-2 sentences. When voice is enabled it plays automatically alongside the questionnaire; do not also call voice_speak for the same question. Omit it for a generic spoken alert. This does not start recording or accept spoken answers.
 `,
 		parameters: AskUserQuestionSchema,
 
@@ -302,7 +320,7 @@ Guidelines:
 					questions: structuredClone(params.questions), answers: [], cancelled: false,
 				},
 				controller: new AbortController(), promise: new Promise<void>(done => { resolve = done; }),
-				resolve, ctx, notify: params.blocking === false, generation,
+				resolve, ctx, notify: params.blocking === false, generation, voicePrompt: params.voice_prompt,
 			};
 			requests.set(request.snapshot.requestId, request);
 			queue.push(request);

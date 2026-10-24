@@ -13,7 +13,7 @@ process.env.HOME = join(root, "home"); process.env.USERPROFILE = process.env.HOM
 process.env.PI_CODING_AGENT_DIR = join(root, "agent");
 for (const path of [process.env.HOME, process.env.PI_CODING_AGENT_DIR, join(root, ".pi")]) mkdirSync(path, { recursive: true });
 process.chdir(root);
-const { SessionManager, InteractiveMode, ToolExecutionComponent, createReadToolDefinition, initTheme } = await import("@earendil-works/pi-coding-agent");
+const { SessionManager, InteractiveMode, ToolExecutionComponent, createReadToolDefinition, createEventBus, initTheme } = await import("@earendil-works/pi-coding-agent");
 const { Text, visibleWidth } = await import("@earendil-works/pi-tui");
 const keys = { home: "\x1b[H", down: "\x1b[B", pageDown: "\x1b[6~", escape: "\x1b" };
 const { default: rollingTools } = await import("../extensions/rolling-tools.ts");
@@ -36,7 +36,7 @@ function harness({ hasUI = false, sm = SessionManager.inMemory(root) } = {}) {
 		ui: { notify() {}, setStatus() {}, setToolsExpanded() {}, setWidget() {},
 			custom(factory) { return new Promise(done => { overlay = factory(tui, theme, {}, done); }); } } };
 	const h = { handlers, commands, tools, renderers, ctx, sm, tui, overlay: () => overlay,
-		pi: { on(e, fn) { handlers.set(e, [...(handlers.get(e) || []), fn]); }, registerCommand(n, c) { commands.set(n, c); },
+		pi: { events: createEventBus(), on(e, fn) { handlers.set(e, [...(handlers.get(e) || []), fn]); }, registerCommand(n, c) { commands.set(n, c); },
 			registerTool(t) { tools.set(t.name, t); }, registerToolRenderer(r) { renderers.push(r); }, registerEntryRenderer() {}, registerShortcut() {},
 			registerFlag() {}, getFlag: () => "20", getActiveTools: () => active, setActiveTools(next) { active = next; },
 			appendEntry(type, data) { sm.appendCustomEntry(type, data); }, sendUserMessage() {} },

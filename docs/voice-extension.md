@@ -33,7 +33,7 @@ pi --extension ./extensions/voice.ts
 /voice live on
 ```
 
-启用即允许 LLM 调用语音工具，没有额外授权层。Live 始终单独开启，默认关闭，LLM 不能通过工具打开它。重复 `/voice on` 不重置任务或 Live；仅从关闭进入开启时尝试初始化尚未获取的目录。
+启用即允许 LLM 调用语音工具，并允许已加载的 ask-user 在问卷展示时自动语音提醒，没有额外授权层。Live 始终单独开启，默认关闭，LLM 不能通过工具打开它。重复 `/voice on` 不重置任务或 Live；仅从关闭进入开启时尝试初始化尚未获取的目录。
 
 ## 命令与停止语义
 
@@ -76,6 +76,14 @@ stop/off 不等待网络清理，使用 AbortSignal 中止 HTTP 请求和本地�
 - 取消时通过 `/api/tts/playback/control` 请求后端立即停播。
 - 当语音启用时，扩展会向系统提示词（`<rules>`）注入 guidelines，引导 LLM 在提问、确认决策或任务结束时主动进行精炼口语播报。
 - 朗读文本必须口语化，严禁直接朗读代码、路径或表格。若用户明确要求语音输入答复，必须等发音完毕后方可调用 `voice_listen`。
+
+### Ask User 自动语音提醒
+
+同时加载 `extensions/ask-user.ts` 时，`/voice on` 也启用问卷提醒：`ask_user_question` 的可选 `voice_prompt` 由 LLM 自行决定是呼叫用户、直接提问还是概括选择；未提供则固定说“有个问题需要你确认，请看一下终端。”无需单独调用 `voice_speak`，避免重复播音。每份问卷仅在展示时提醒一次，查询/等待不重复触发。
+
+通过进程内 `ask-user:voice-prompt` 事件复用 `VoiceRuntime.speak`，使用当前默认音色、语速、超时与取消逻辑。提醒在后台运行，不阻塞窗口和答案；答题完成/取消、会话重载或分支切换会取消仍在执行的提醒，stop/off 也照常生效。显式音频任务忙时跳过、网关失败不重试，不影响正常提问。提醒之间串行清理，避免前一份问卷取消时的本地收尾阻挡后一份提醒。
+
+仅已有 Live 会按现有 speak 语义暂停和恢复；不会因提问自动打开麦克风，也不会直接提交语音答案。单独加载 ask-user、voice 关闭或无 UI 时无语音副作用。文案会发送至配置网关且能被周围人听到；该自动路径同样继承 VOICE-001 的全局抢占/停播与播放完成限制。参数示例与手工验证见 [Ask User 使用说明](ask-user.md#与-voice-联动语音呼叫或直接提问)。
 
 ### `voice_list_voices`
 
@@ -122,6 +130,7 @@ stop/off 不等待网络清理，使用 AbortSignal 中止 HTTP 请求和本地�
 
 ```bash
 node ./scripts/test-voice-runner.mjs
+node ./scripts/test-ask-user-voice.mjs
 npm run check
 npm run validate
 npm test

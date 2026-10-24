@@ -6,6 +6,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem, Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { StatusModalComponent } from "./lib/status-modal.ts";
+import { ASK_USER_VOICE_PROMPT, isQuestionVoicePrompt, type QuestionVoicePrompt } from "./lib/ask-user-voice.ts";
 import { type Static, Type } from "typebox";
 
 export interface VoiceItem {
@@ -365,6 +366,7 @@ export class VoiceRuntime {
 	private liveRun?: LiveRun;
 	private readonly auxiliary = new Set<AbortController>();
 	private initialization?: { epoch: number; url: string; promise: Promise<VoiceListVoicesResult> };
+	private questionSpeech: Promise<void> = Promise.resolve();
 
 	private toastTimer?: NodeJS.Timeout;
 	private footerTimer?: NodeJS.Timeout;
@@ -532,6 +534,20 @@ export class VoiceRuntime {
 		return { reason: reason === "busy" || reason === "disabled" ? reason : "gateway_error",
 			message: reason === "busy" ? "Audio channel busy: another audio tool is active." :
 				reason === "disabled" ? "语音扩展已关闭；用户可执行 /voice on" : reason };
+	}
+	/** Best-effort questionnaire reminder. Never blocks the dialog or opens a microphone. */
+	public promptQuestion(prompt: QuestionVoicePrompt): void {
+		if (!this.enabled || prompt.signal.aborted) return;
+		const epoch = this.generationEpoch;
+		// Serialize our own reminders so a new dialog cannot race the previous one's abort cleanup.
+		// Explicit audio tools retain their existing busy semantics; do not interrupt or retry them.
+		this.questionSpeech = this.questionSpeech.then(async () => {
+			if (!this.enabled || epoch !== this.generationEpoch || prompt.signal.aborted) return;
+			const result = await this.speak({ text: prompt.text }, prompt.signal);
+			if (result.status === "error" && this.enabled && epoch === this.generationEpoch && !prompt.signal.aborted) {
+				this.showToast(`问题语音提醒未播放：${result.message}`);
+			}
+		}).catch(() => { /* A reminder failure must not affect question/answer delivery. */ });
 	}
 	public async speak(params: VoiceSpeakParams, signal?: AbortSignal): Promise<VoiceSpeakResult> {
 		let task: AudioTask;
@@ -862,13 +878,16 @@ export function getVoiceArgumentCompletions(
 
 export default function voiceExtension(pi: ExtensionAPI, options: VoiceRuntimeOptions = {}): void {
 	const runtime = new VoiceRuntime(pi, options);
+	pi.events.on(ASK_USER_VOICE_PROMPT, data => {
+		if (isQuestionVoicePrompt(data)) runtime.promptQuestion(data);
+	});
 	pi.registerTool({
 		name: "voice_speak",
 		label: "Voice Speak",
 		parameters: VoiceSpeakParamsSchema,
 		promptSnippet: "Speak concise, natural text aloud to verbally alert or prompt the user.",
 		promptGuidelines: [
-			"Call `voice_speak` when you need to verbally alert, prompt, or notify the user (e.g. asking questions, reporting key progress, or completing a task).",
+			"Call `voice_speak` when you need to verbally alert, prompt, or notify the user (e.g. asking questions, reporting key progress, or completing a task). For `ask_user_question`, use its `voice_prompt` instead: it automatically speaks when voice is enabled, so do not duplicate it with `voice_speak`.",
 			"Speak naturally like a human: keep it concise and conversational (1-2 sentences). Never read code, logs, paths, or markdown tables directly.",
 		],
 		description: "Speak natural text aloud to verbally alert or notify the user (e.g. asking questions, completing a task, or flagging issues). Keep it brief and conversational like human speech.",

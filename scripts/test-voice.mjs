@@ -345,6 +345,7 @@ await test("registration and lifecycle reset tools", async () => {
 	voiceExtension({
 		registerTool: t => tools.set(t.name, t), registerCommand() {}, registerShortcut() {},
 		on: (name, fn) => events.set(name, fn),
+		events: { on() { return () => {}; } },
 		getActiveTools: () => active, setActiveTools: names => { active = names; }, sendUserMessage() {},
 	}, { config: h.store, gateway: () => { throw Error("must not connect while disabled"); } });
 	try {
