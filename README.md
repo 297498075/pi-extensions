@@ -442,8 +442,10 @@ Ctrl+Shift+T      # 快速呼出/关闭任务树弹窗
   - 在输入框上方常驻 Widget 实时跳动显示最近待触发任务的倒计时（如 `⏳ [定时任务倒计时] [#t-1] 02:30 后触发`），视觉聚焦且绝不刷屏污染会话流；任务归零或取消后自动清理。
 - **正文结构化卡片提示 (Entry Renderer)**：
   - 任务创建、取消以及时间到达触发时，均在会话正文输出美观的结构化持久卡片，清楚记录任务 ID、预定/触发时间、延迟时长与提示词。
-- **无缝衔接 Agent 忙碌状态**：
-  - 倒计时到达时，若 Agent 处于空闲状态则立即启动新一轮任务；若 Agent 正在流式输出或执行中，则自动作为 `followUp` 排队，确保不丢失、不中断。
+- **可选消息交付模式**：
+  - `/timer`、`/schedule` 和 `timer_schedule` 默认使用 `steer`（steering）：Agent 忙时在下一个可处理边界插入消息，可能跳过尚未执行的工具，而非等待当前任务全部结束。
+  - LLM 可通过 `timer_schedule` 的可选参数 `deliverAs: "followUp"` 选择等当前任务结束后再处理，不打断当前任务；`deliverAs: "steer"` 显式选择默认模式。Agent 空闲时，两种模式均立即启动新一轮。
+  - 示例：`timer_schedule({ seconds: 60, prompt: "检查构建结果", deliverAs: "followUp" })`。创建结果、`timer_list` 的文本及 `details`、状态窗与持久化记录均包含所选模式。到期后会以用户消息交付提示词并启动 Agent，因此提示词可能触发工具、文件修改或网络访问，应只安排可信任务。
 - **规范模态窗口与工具集成**：
   - `/timer status` 和 `/timer list` 使用自适应宽高的 `ctx.ui.custom()` 模态窗，完整提示词可换行、用 ↑/↓、PgUp/PgDn 或鼠标滚轮浏览，Enter/Esc 或点击关闭；
   - 注册 `timer_schedule`、`timer_cancel`、`timer_list` 工具，Agent 自身亦可灵活安排延迟计划任务。

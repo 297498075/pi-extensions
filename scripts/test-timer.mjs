@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import {
+import { mock } from "node:test";
+import timerExtension, {
 	parseTimerArgs,
 	formatDuration,
 	formatClockTime,
@@ -164,6 +165,8 @@ console.log("\n=== Test 3: TimerManager Lifecycle & Dispatch ===");
 	// 1. 创建任务 (1秒延迟)
 	const task = manager.createTask(1, "测试任务1", "1秒", fakeCtx);
 	assert.equal(task.status, "pending");
+	assert.equal(task.deliverAs, "steer");
+	assert.equal(appendedEntries[0].data.deliverAs, "steer");
 	assert.equal(manager.getPendingTasks().length, 1);
 	assert.equal(appendedEntries.length, 1);
 	assert.equal(appendedEntries[0].data.action, "created");
@@ -199,6 +202,7 @@ console.log("\n=== Test 3: TimerManager Lifecycle & Dispatch ===");
 	assert.equal(manager.getPendingTasks().length, 0);
 	assert.equal(sentMessages.length, 1, "sendUserMessage should be invoked");
 	assert.equal(sentMessages[0].content, "测试任务1");
+	assert.deepEqual(sentMessages[0].options, { deliverAs: "steer" });
 
 	assert.equal(appendedEntries.length, 2);
 	assert.equal(appendedEntries[1].data.action, "triggered");
@@ -216,4 +220,95 @@ console.log("\n=== Test 3: TimerManager Lifecycle & Dispatch ===");
 
 	manager.dispose();
 	console.log("✓ TimerManager lifecycle, trigger, cancel & modal passed!");
+}
+
+console.log("\n=== Test 4: Tool/Command Delivery Modes (Idle & Busy) ===");
+{
+	mock.timers.enable({ apis: ["Date", "setTimeout", "setInterval"] });
+	const tools = new Map(), commands = new Map(), events = new Map();
+	const entries = [], sent = [];
+	let idle = true;
+	const ctx = {
+		hasUI: false,
+		isIdle: () => idle,
+		ui: { notify() {}, setWidget() {} },
+	};
+	const pi = {
+		registerTool(tool) { tools.set(tool.name, tool); },
+		registerCommand(name, command) { commands.set(name, command); },
+		registerEntryRenderer() {},
+		on(name, handler) { events.set(name, handler); },
+		appendEntry(type, data) { entries.push({ type, data }); },
+		sendUserMessage(content, options) { sent.push({ content, options }); },
+	};
+	timerExtension(pi);
+	const schedule = tools.get("timer_schedule");
+	const list = tools.get("timer_list");
+	assert.equal(schedule.parameters.properties.deliverAs.default, "steer");
+	assert.deepEqual(schedule.parameters.properties.deliverAs.anyOf.map(s => s.const), ["steer", "followUp"]);
+	try {
+		for (const isIdle of [true, false]) {
+			idle = isIdle;
+			for (const mode of [undefined, "steer", "followUp"]) {
+				const expected = mode ?? "steer";
+				const result = await schedule.execute("schedule", {
+					seconds: 1, prompt: `task-${isIdle}-${mode}`, ...(mode ? { deliverAs: mode } : {}),
+				}, undefined, undefined, ctx);
+				assert.equal(result.details.deliverAs, expected);
+				assert.ok(result.content[0].text.includes(expected));
+				const pending = await list.execute("list", {}, undefined, undefined, ctx);
+				assert.equal(pending.details.count, 1);
+				assert.equal(pending.details.tasks[0].deliverAs, expected);
+				assert.ok(pending.content[0].text.includes(`[${expected}]`));
+				assert.equal(entries.at(-1).data.deliverAs, expected);
+				const count = sent.length;
+				mock.timers.tick(999);
+				assert.equal(sent.length, count, "must not deliver before the deadline");
+				mock.timers.tick(1);
+				assert.equal(sent.length, count + 1);
+				assert.deepEqual(sent.at(-1), { content: result.details.prompt, options: { deliverAs: expected } });
+				assert.equal(entries.at(-1).data.action, "triggered");
+				assert.equal(entries.at(-1).data.deliverAs, expected);
+			}
+			for (const name of ["timer", "schedule"]) {
+				await commands.get(name).handler("1 command task", ctx);
+				mock.timers.tick(1000);
+				assert.deepEqual(sent.at(-1), { content: "command task", options: { deliverAs: "steer" } });
+			}
+		}
+		// Cancellation records retain the chosen delivery mode and never deliver.
+		const cancelled = await schedule.execute("cancel-me", {
+			seconds: 1, prompt: "cancelled", deliverAs: "followUp",
+		}, undefined, undefined, ctx);
+		await tools.get("timer_cancel").execute("cancel", { taskId: cancelled.details.taskId }, undefined, undefined, ctx);
+		assert.equal(entries.at(-1).data.action, "cancelled");
+		assert.equal(entries.at(-1).data.deliverAs, "followUp");
+		const count = sent.length;
+		mock.timers.tick(1000);
+		assert.equal(sent.length, count);
+
+		// A synchronous send failure must not silently switch delivery modes on retry.
+		const send = pi.sendUserMessage;
+		const warn = mock.method(console, "warn", () => {});
+		try {
+			for (const mode of ["steer", "followUp"]) {
+				const attempts = [];
+				pi.sendUserMessage = (content, options) => {
+					attempts.push(options.deliverAs);
+					if (attempts.length === 1) throw new Error("transient send failure");
+					send(content, options);
+				};
+				await schedule.execute("retry", { seconds: 1, prompt: "retry", deliverAs: mode }, undefined, undefined, ctx);
+				mock.timers.tick(1000);
+				assert.deepEqual(attempts, [mode, mode]);
+			}
+		} finally {
+			pi.sendUserMessage = send;
+			warn.mock.restore();
+		}
+	} finally {
+		events.get("session_shutdown")();
+		mock.timers.reset();
+	}
+	console.log("✓ Default steering, explicit followUp, idle/busy dispatch, records, cancellation & retry passed!");
 }
