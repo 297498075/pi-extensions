@@ -237,6 +237,18 @@ try {
 	console.log("✓ video reference encoding and true tool error results");
 
 	const imageTool = tools.get("generate_image");
+	const statusTool = tools.get("image_job_status");
+	assert.ok(statusTool);
+	assert.deepEqual(statusTool.parameters.required, ["jobId"]);
+	assert.equal(statusTool.parameters.properties.jobId.minLength, 1);
+	assert.equal(tools.has("image_job_cancel"), false, "no cancellation tool was requested");
+	const query = jobId => statusTool.execute("query", { jobId }, undefined, undefined, ctx);
+	for (const jobId of ["unknown-job", "   "]) {
+		const missing = await query(jobId);
+		assert.equal(missing.isError, true);
+		assert.equal(missing.details.status, "not_found");
+		assert.match(missing.content[0].text, /does not prove that upstream generation failed/);
+	}
 	assert.equal(GenerateImageSchema.properties.async.type, "boolean");
 	assert.equal(GenerateVideoSchema.properties.async, undefined, "video contract is unchanged");
 	assert.equal(IMAGE_GENERATION_TIMEOUT_MS, 600_000);
@@ -251,6 +263,17 @@ try {
 	assert.equal(started.details.filePath, undefined);
 	assert.notEqual(started.details.jobId, startedTwo.details.jobId);
 	assert.equal(messages.length, 0, "ack must arrive before the deferred result");
+	const running = await query(started.details.jobId);
+	assert.equal(running.isError, undefined);
+	assert.equal(running.details.status, "running");
+	assert.equal(running.details.toolCallId, "async-one");
+	assert.equal(running.details.timeoutMs, 600_000);
+	assert.ok(Number.isFinite(Date.parse(running.details.startedAt)));
+	assert.equal(running.details.finishedAt, undefined);
+	assert.equal(running.details.filePath, undefined);
+	assert.equal((await query(startedTwo.details.jobId)).details.status, "running");
+	assert.equal(pendingRequests.length, 2, "query must not start an HTTP request");
+	assert.equal(messages.length, 0, "query must not send a follow-up or wait for completion");
 	caller.abort();
 	assert.equal(pendingRequests[0].init.signal.aborted, false, "accepted job outlives caller's tool signal");
 	pendingRequests[1].resolve(Response.json({ data: [{ b64_json: pngBase64 }] }));
@@ -268,7 +291,20 @@ try {
 		assert.deepEqual(readFileSync(message.details.filePath), png);
 		assert.ok(message.content.includes(message.details.filePath));
 		assert.deepEqual(options, { deliverAs: "followUp", triggerTurn: true });
+		const completed = await query(ack.details.jobId);
+		assert.equal(completed.isError, undefined);
+		assert.deepEqual(completed.details, message.details);
+		assert.ok(Date.parse(completed.details.finishedAt) >= Date.parse(completed.details.startedAt));
+		assert.ok(completed.content[0].text.includes(message.details.filePath));
+		assert.deepEqual(await query(ack.details.jobId), completed, "final results are repeatable and not consumed");
+		completed.details.dimensions.requestedWidth = -1;
+		assert.notEqual((await query(ack.details.jobId)).details.dimensions.requestedWidth, -1, "queries must return independent snapshots");
+		message.details.dimensions.requestedWidth = -2;
+		assert.notEqual((await query(ack.details.jobId)).details.dimensions.requestedWidth, -2, "notification details must not alias the cache");
 	}
+	assert.equal(pendingRequests.length, 2);
+	assert.equal(messages.length, 2, "repeated queries must not repeat delivery");
+	assert.equal(running.details.status, "running", "earlier snapshots must not mutate when jobs finish");
 
 	globalThis.fetch = async () => new Response("gateway timeout", { status: 524 });
 	const asyncFailure = await imageTool.execute("async-failure", { prompt: "test" }, undefined, undefined, ctx);
@@ -278,6 +314,12 @@ try {
 	assert.equal(messages[2].message.details.status, "failed");
 	assert.equal(messages[2].message.details.jobId, asyncFailure.details.jobId);
 	assert.equal(messages[2].message.details.attempts[0].http.status, 524);
+	const failedStatus = await query(asyncFailure.details.jobId);
+	assert.equal(failedStatus.isError, undefined, "querying a failed job is a successful lookup");
+	assert.deepEqual(failedStatus.details, messages[2].message.details);
+	assert.match(failedStatus.content[0].text, /HTTP 524/);
+	assert.deepEqual(await query(asyncFailure.details.jobId), failedStatus);
+	assert.equal(messages.length, 3);
 	console.log("✓ default/explicit async ack, detached caller signal, concurrent job correlation and follow-up success/failure");
 
 	// Fake only the deadline signal: exercise timeout delivery without waiting ten minutes.
@@ -300,7 +342,34 @@ try {
 		assert.equal(messages[3].message.details.jobId, timed.details.jobId);
 		assert.equal(messages[3].message.details.status, "failed");
 		assert.match(messages[3].message.details.error, /10 minutes/);
+		assert.deepEqual((await query(timed.details.jobId)).details, messages[3].message.details);
+		assert.equal(timeoutRequests, 1, "status lookup must not retry a timed out job");
 	} finally { AbortSignal.timeout = originalTimeout; }
+
+	// A failed automatic notification must not lose a completed result or trigger retries.
+	const deliveryTools = new Map(), deliveryHandlers = new Map(), deliveryErrors = [];
+	mediaGenExtension({
+		registerTool(tool) { deliveryTools.set(tool.name, tool); },
+		on(event, handler) { deliveryHandlers.set(event, handler); },
+		sendMessage() { throw new Error("simulated delivery failure"); },
+	});
+	const originalConsoleError = console.error;
+	let deliveryRequests = 0;
+	try {
+		console.error = message => deliveryErrors.push(message);
+		globalThis.fetch = async () => { deliveryRequests++; return Response.json({ data: [{ b64_json: pngBase64 }] }); };
+		const ack = await deliveryTools.get("generate_image").execute("delivery-failure", { prompt: "test" }, undefined, undefined, ctx);
+		await flushBackground();
+		const retained = await deliveryTools.get("image_job_status").execute("lookup", { jobId: ack.details.jobId });
+		assert.equal(retained.details.status, "completed");
+		assert.deepEqual(readFileSync(retained.details.filePath), png);
+		assert.equal(deliveryRequests, 1);
+		assert.equal(deliveryErrors.length, 1);
+	} finally {
+		console.error = originalConsoleError;
+		deliveryHandlers.get("session_shutdown")();
+	}
+	console.log("✓ status schema, running/completed/failed/unknown lookups, immutable repeatable results and delivery failure retention");
 
 	for (const event of ["session_shutdown", "session_tree"]) {
 		let late, backgroundSignal;
@@ -309,13 +378,17 @@ try {
 			return new Promise(resolve => { late = resolve; }); // ignore cancellation to simulate a late server
 		};
 		const fileCount = readdirSync(output).length;
-		await imageTool.execute(event, { prompt: "test" }, undefined, undefined, ctx);
+		const ack = await imageTool.execute(event, { prompt: "test" }, undefined, undefined, ctx);
+		assert.equal((await query(ack.details.jobId)).details.status, "running");
 		handlers.get(event)(); handlers.get(event)(); // cleanup is idempotent
 		assert.equal(backgroundSignal.aborted, true);
+		assert.equal((await query(ack.details.jobId)).details.status, "not_found");
+		assert.equal((await query(started.details.jobId)).details.status, "not_found", "completed cache is scoped to the old session/branch");
 		late(Response.json({ data: [{ b64_json: pngBase64 }] }));
 		await flushBackground();
 		assert.equal(messages.length, 4, "old session/branch must not receive late messages");
 		assert.equal(readdirSync(output).length, fileCount, "cancelled jobs must not write late files");
+		assert.equal((await query(ack.details.jobId)).details.status, "not_found", "late results must not recreate cleared records");
 	}
 	let preflightRequests = 0;
 	globalThis.fetch = async () => { preflightRequests++; throw new Error("unexpected request"); };

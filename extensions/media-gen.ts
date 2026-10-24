@@ -38,6 +38,13 @@ export const GenerateImageSchema = Type.Object({
 	),
 });
 
+export const ImageJobStatusSchema = Type.Object({
+	jobId: Type.String({
+		minLength: 1,
+		description: "Job ID returned by an asynchronous generate_image call in the current session/branch. Returns the current status or retained final result immediately; does not wait, retry or generate an image.",
+	}),
+});
+
 export const GenerateVideoSchema = Type.Object({
 	prompt: Type.String({
 		description: "Motion and scene prompt describing dynamic movements, camera transformations, and cinematic changes.",
@@ -912,15 +919,62 @@ export function formatMissingModelReport(
 	return lines.join("\n");
 }
 
+interface ImageJobDetails {
+	jobId: string;
+	toolCallId: string;
+	status: "running" | "completed" | "failed";
+	startedAt: string;
+	finishedAt?: string;
+	timeoutMs: number;
+	filePath?: string;
+	model?: string;
+	dimensions?: ResolvedDimensions;
+	error?: string;
+	attempts?: ImageAttemptFailure[];
+}
+
+interface ImageJob {
+	controller?: AbortController;
+	details: ImageJobDetails;
+	report: string;
+}
+
 export default function mediaGenExtension(pi: ExtensionAPI): void {
-	// Background requests belong to this session/branch, not to the starting tool call.
-	const imageJobs = new Map<string, AbortController>();
+	// Retain final results for read-only queries within this session/branch only.
+	const imageJobs = new Map<string, ImageJob>();
 	const cancelImageJobs = () => {
-		for (const controller of imageJobs.values()) controller.abort();
+		for (const job of imageJobs.values()) job.controller?.abort();
 		imageJobs.clear();
 	};
 	pi.on("session_shutdown", cancelImageJobs);
 	pi.on("session_tree", cancelImageJobs);
+
+	pi.registerTool<typeof ImageJobStatusSchema, ImageJobDetails | { jobId: string; status: "not_found"; error: string }>({
+		name: "image_job_status",
+		label: "Image Job Status",
+		description: "Query an asynchronous image job without waiting. Returns running, completed (with image path) or failed (with error). Final results can be read repeatedly in the current session/branch; reload, session replacement or tree navigation clears the cache. Unknown IDs return not_found. Completion is still delivered automatically; do not busy-poll. Does not cancel, retry or start generation.",
+		parameters: ImageJobStatusSchema,
+		async execute(_toolCallId, params) {
+			const jobId = params.jobId.trim();
+			const job = imageJobs.get(jobId);
+			if (!job) {
+				return {
+					content: [{ type: "text", text: `Image job ${jobId || "(empty ID)"}: not_found. No record in the current session/branch. The ID may be invalid or the cache may have been cleared by reload/session replacement/tree navigation. This does not prove that upstream generation failed; do not automatically resubmit.` }],
+					isError: true,
+					details: { jobId, status: "not_found", error: "No image job record in the current session/branch" },
+				};
+			}
+			return {
+				content: [{ type: "text", text: [
+					`Image generation job ${jobId}: ${job.details.status}`,
+					`Started: ${job.details.startedAt}`,
+					...(job.details.finishedAt ? [`Finished: ${job.details.finishedAt}`] : []),
+					"", job.report,
+				].join("\n") }],
+				details: structuredClone(job.details),
+			};
+		},
+	});
 
 	// --------------------------------------------------------------------------
 	// Tool 1: generate_image
@@ -929,7 +983,7 @@ export default function mediaGenExtension(pi: ExtensionAPI): void {
 		name: "generate_image",
 		label: "Generate Image",
 		description:
-			"Generate or edit an image. By default starts a background job and returns its ID immediately, not an image path. Completion or failure is delivered automatically to the Agent; do not poll or resubmit. Use async:false to wait for the final result. Uses a 10-minute total deadline, automatic aspect ratio and configured fallback models.",
+			"Generate or edit an image. By default starts a background job and returns its ID immediately, not an image path. Completion or failure is delivered automatically to the Agent; use image_job_status for an on-demand status/result lookup, not busy-polling or resubmission. Use async:false to wait for the final result. Uses a 10-minute total deadline, automatic aspect ratio and configured fallback models.",
 		parameters: GenerateImageSchema,
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1024,22 +1078,31 @@ export default function mediaGenExtension(pi: ExtensionAPI): void {
 
 			const jobId = randomUUID();
 			const controller = new AbortController();
-			imageJobs.set(jobId, controller);
+			const job: ImageJob = {
+				controller,
+				details: { jobId, toolCallId: _toolCallId, status: "running", startedAt: new Date().toISOString(), timeoutMs: IMAGE_GENERATION_TIMEOUT_MS },
+				report: "Local image generation is in progress; upstream acceptance/progress is not known. Completion or failure will be delivered automatically. Do not busy-poll or resubmit.",
+			};
+			imageJobs.set(jobId, job);
 			void generate(controller.signal).then((result) => {
-				if (!imageJobs.has(jobId)) return; // Session/branch was replaced or shut down.
+				if (imageJobs.get(jobId) !== job) return; // Session/branch was replaced or shut down.
+				// Store before notification so delivery failures do not lose the queryable result.
+				job.details = { ...job.details, ...result.details, status: result.isError ? "failed" : "completed", finishedAt: new Date().toISOString() };
+				job.report = result.content.map(part => part.text).join("\n");
+				job.controller = undefined;
 				pi.sendMessage({
 					customType: "media-gen-image-result",
-					content: `Image generation job ${jobId}: ${result.isError ? "failed" : "completed"}\n\n${result.content.map(part => part.text).join("\n")}`,
+					content: `Image generation job ${jobId}: ${job.details.status}\n\n${job.report}`,
 					display: true,
-					details: { ...result.details, jobId, toolCallId: _toolCallId, status: result.isError ? "failed" : "completed" },
+					details: structuredClone(job.details),
 				}, { deliverAs: "followUp", triggerTurn: true });
 			}).catch(() => {
 				// Delivery errors must not become unhandled rejections or trigger duplicate paid requests.
 				if (imageJobs.has(jobId)) console.error(`media-gen: Could not deliver image job ${jobId} result.`);
-			}).finally(() => imageJobs.delete(jobId));
+			});
 
 			return {
-				content: [{ type: "text", text: `Image generation started in the background. Job ID: ${jobId}. Local execution has started; upstream acceptance is not yet confirmed. Completion or failure will be delivered automatically to the Agent. Do not poll or resubmit; continue other work or end this turn. Total timeout: 10 minutes.` }],
+				content: [{ type: "text", text: `Image generation started in the background. Job ID: ${jobId}. Local execution has started; upstream acceptance is not yet confirmed. Completion or failure will be delivered automatically to the Agent. Use image_job_status with this job ID for an on-demand lookup; do not busy-poll or resubmit. Continue other work or end this turn. Total timeout: 10 minutes.` }],
 				details: { jobId, toolCallId: _toolCallId, status: "started", timeoutMs: IMAGE_GENERATION_TIMEOUT_MS },
 			};
 		},

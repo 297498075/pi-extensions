@@ -459,7 +459,7 @@ Ctrl+Shift+T      # 快速呼出/关闭任务树弹窗
 
 ## Media Gen (Image & Video Generation)
 
-`extensions/media-gen.ts` 为 LLM 提供轻量、高可用、开箱即用的多模态多媒体生成套件，包含两个核心工具：`generate_image` 与 `generate_video`：
+`extensions/media-gen.ts` 为 LLM 提供轻量、高可用、开箱即用的多模态多媒体生成套件，包含 `generate_image`、`generate_video` 两个生成工具，以及异步生图查询工具 `image_job_status`：
 
 ### 核心亮点
 - **极简参数，拒绝复杂配置**：面向 LLM 提供符合直觉的标准参数（`prompt`, `image`, `width`, `height`），去除了死板的 `aspectRatio` 枚举与多余的 `duration` 参数，由扩展内部自动推导最匹配的标准比例（`1:1`, `16:9`, `9:16`, `4:3`, `3:4`, `21:9`）以及上游所需的分辨率。
@@ -467,12 +467,13 @@ Ctrl+Shift+T      # 快速呼出/关闭任务树弹窗
 - **显式图片端点**：`image.apiMode` 默认为 `"images"`，文生图只请求 `/images/generations`，参考图只请求 `/images/edits`，失败不会自动探测聊天接口。只有明确支持聊天生图的模型才配置 `"chat"`，这时直接使用 `/chat/completions`，同样不自动换端点。
 - **受控模型降级（Fallback）**：必须配置 `primaryModel`，后备模型按 `fallbackModels` 顺序尝试，没有硬编码默认模型。图片 API 的模型不存在／不支持等模型级错误可尝试显式后备模型；政策拒绝、认证失败、无效请求、HTTP 429 和 5xx 直接返回，不自动追加请求，由调用方决定重试与等待。图片下载／媒体签名错误仍允许尝试显式后备模型。生图总等待上限 **10 分钟**（所有模型尝试、参考图获取及结果下载共用一个 deadline），视频保持 5 分钟；取消或超时不继续 fallback，也不写入迟到结果。上游、代理或 HTTP 传输层仍可能更早超时，扩展不能延长其限制。
 - **生图默认异步**：`generate_image` 完成提示词／配置基本校验后，立即返回 `details.status: "started"`、`jobId`、`toolCallId` 和 `timeoutMs: 600000`，不等待生成完成；此状态仅表示本地任务已启动，不代表上游已受理或出图成功。成功／失败（包括超时）通过 `media-gen-image-result` 自定义消息回传同一 `jobId`，附带 `completed`／`failed` 状态及文件路径或错误信息。使用 `deliverAs: "followUp"`、`triggerTurn: true`：Agent 忙时排队，空闲时启动后续回合，无需轮询或重复提交。设置 `async: false` 保留同步最终结果／tool error 行为。
+- **按需查询生图任务**：`image_job_status({ jobId: "启动回执中的 ID" })` 立即返回当前状态，不等待完成、不请求上游，也不重试或取消任务。`running` 表示本地执行尚未结束（不代表已知上游进度）；`completed` 返回图片路径、模型、尺寸；`failed` 返回错误及已有的 HTTP 诊断。记录包含开始时间、完成时间（若已结束）及超时上限。查询失败的生成任务本身仍是一次成功查询，以 `details.status` 判断生成是否成功；未知／已清理 ID 返回 `not_found` 和 tool error，不能据此断言上游失败或自动重提。完成结果可重复查询，不因查询或自动消息投递而删除；即使自动消息投递失败，已保存的结果仍可查。自动回传保持不变，不需要频繁轮询。不提供停止工具。
 - **可追溯错误**：图片失败在 `details.attempts[].http` 保留端点、HTTP 状态、请求 ID（若服务端提供）、完整响应正文与错误类别；不再只截取前100字符。实际配置的 API key 及 Bearer 凭据会脱敏。服务端错误正文仍可能包含提示词等私人内容，不应公开日志。
 - **图视联动（Image-to-Video）**：等待异步完成消息中的文件路径，或使用 `generate_image({ prompt: "...", async: false })` 同步获取路径，再作为 `generate_video` 的首帧或参考输入（`image`）。启动回执没有图片路径，不能直接交给视频工具。
 - **视频接口**：调用配置 provider 的 `/videos/generations`；本地参考图读取为 data URI，不将本机路径直接发送给远程服务。当前没有 ComfyUI 驱动或异步视频任务轮询。
 - **参考图 MIME**：需要上传或编码的 PNG/JPEG/GIF/WebP 参考图，其 MIME、multipart 文件名和 data URI 均按已验证的文件头生成，不依赖可能错误的 HTTP `Content-Type` 或本地扩展名；对象存储的 `application/octet-stream` 响应可正常用于图片上传或显式聊天生图。
 - **本地落盘管理**：默认写入会话工作区 `.pi/media/`，可设置 `outputDir`。图片下载检查 HTTP 状态及 PNG/JPEG/GIF/WebP 文件头；视频的下载和 Base64 返回均检查 MP4/WebM 容器签名，校验失败会尝试后备模型，不把 HTML、空数据或错误对象写成成功媒体。文件头检查不代替完整解码验证，全部模型失败时同步调用返回 tool error，异步调用发送 `failed` 完成消息。
-- **后台生命周期**：已启动的异步任务独立于调用工具的取消信号，当前 Agent 回合结束或中止不会撤销生成。退出、`/reload`、切换／派生会话及 `/tree` 导航会取消尚未完成的本地请求，抑制迟到写入和跨会话结果回传；取消不保证上游停止计算或计费。任务仅存活于当前 Pi 进程，不是远程持久队列，重启／恢复／fork 不会重放任务。启动与完成信息保存在会话结果／消息 `details` 中；只有 `started` 记录而没有完成记录不表示恢复后仍在运行。一次性 print／脚本调用请使用 `async: false`，否则进程可能在收到结果前退出。
+- **后台生命周期**：已启动的异步任务独立于调用工具的取消信号，当前 Agent 回合结束或中止不会撤销生成。退出、`/reload`、切换／派生会话及 `/tree` 导航会取消尚未完成的本地请求，抑制迟到写入和跨会话结果回传；取消不保证上游停止计算或计费。任务仅存活于当前 Pi 进程，不是远程持久队列，重启／恢复／fork 不会重放任务。运行中及已完成任务的查询缓存仅保留在当前进程的会话／分支内，退出、重载、切换／派生会话及 `/tree` 导航时清空；不从历史消息重建查询缓存。启动与完成信息仍保存在会话结果／消息 `details` 中；只有 `started` 记录而没有完成记录不表示恢复后仍在运行。一次性 print／脚本调用请使用 `async: false`，否则进程可能在收到结果前退出。
 - **安全影响**：提示词、参考图会发送给配置的网关及其返回的下载地址，文件写入 `outputDir`；仅使用可信服务。异步完成消息会自动唤起 Agent，可能产生后续模型调用费用。
 
 最小配置示例（模型 ID 请填写网关实际支持的值）：
@@ -499,6 +500,9 @@ Ctrl+Shift+T      # 快速呼出/关闭任务树弹窗
    - `image` (string, optional): Reference image or first frame path/URL (Image-to-Video).
    - `width` (number, optional, default: 1280): Desired video width in pixels.
    - `height` (number, optional, default: 720): Desired video height in pixels.
+3. `image_job_status`:
+   - `jobId` (string, required): Job ID from an asynchronous `generate_image` acknowledgement in the current session/branch.
+   - Immediately returns `running`, `completed`, or `failed`; unknown/cleared IDs return `not_found` as a tool error. Final results are repeatable snapshots; no cancellation, waiting, retry or generation is performed.
 
 ## Pi package
 
