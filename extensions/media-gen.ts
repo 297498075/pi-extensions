@@ -1,9 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 
 // ============================================================================
@@ -145,6 +146,8 @@ export interface MediaToolConfig {
 	primaryModel: string;
 	/** Image endpoint family. Defaults to images; chat requires explicit opt-in. */
 	apiMode?: "images" | "chat";
+	/** Fail before async submission if the optional bg_wait bridge is unavailable. */
+	requireBackgroundWorkProvider?: boolean;
 	fallbackModels?: string[];
 	defaultWidth?: number;
 	defaultHeight?: number;
@@ -934,17 +937,64 @@ interface ImageJobDetails {
 }
 
 interface ImageJob {
+	ownerSessionId: string;
 	controller?: AbortController;
 	details: ImageJobDetails;
 	report: string;
 }
 
+interface ImageBackgroundWorkProvider {
+	name: string;
+	wakeChannels: string[];
+	listActiveWork(context?: { sessionId: string; nowMs: number }): { id: string; sessionId: string }[];
+}
+
+// Use only pi-subagents' public export; do not reproduce its process-local registry.
+async function loadBackgroundWorkRegistration(): Promise<(provider: ImageBackgroundWorkProvider) => () => void> {
+	const specifier = "pi-subagents/background-work";
+	let entry: string;
+	try {
+		entry = createRequire(import.meta.url).resolve(specifier);
+	} catch {
+		entry = createRequire(join(getAgentDir(), "npm", "package.json")).resolve(specifier);
+	}
+	const api = await import(pathToFileURL(entry).href);
+	if (typeof api.registerBackgroundWorkProvider !== "function") {
+		throw new Error("pi-subagents/background-work does not export registerBackgroundWorkProvider");
+	}
+	return api.registerBackgroundWorkProvider;
+}
+
 export default function mediaGenExtension(pi: ExtensionAPI): void {
 	// Retain final results for read-only queries within this session/branch only.
 	const imageJobs = new Map<string, ImageJob>();
+	const providerName = `media-gen-${randomUUID()}`;
+	const wakeChannel = `${providerName}:finished`;
+	let disposeProvider: (() => void) | undefined;
+	let sessionEpoch = 0;
+	const ensureBackgroundWorkProvider = async (epoch: number) => {
+		if (disposeProvider) return;
+		const register = await loadBackgroundWorkRegistration();
+		if (epoch !== sessionEpoch) throw new Error("Session/branch changed before background-work registration");
+		if (disposeProvider) return;
+		const dispose = register({
+			name: providerName,
+			wakeChannels: [wakeChannel],
+			listActiveWork: (context) => [...imageJobs.values()]
+				.filter(job => job.details.status === "running" && (!context || job.ownerSessionId === context.sessionId))
+				.map(job => ({ id: job.details.jobId, sessionId: job.ownerSessionId })),
+		});
+		if (typeof dispose !== "function") throw new Error("Background-work registration did not return a disposer");
+		disposeProvider = dispose;
+	};
 	const cancelImageJobs = () => {
+		sessionEpoch++;
 		for (const job of imageJobs.values()) job.controller?.abort();
 		imageJobs.clear();
+		try { disposeProvider?.(); } finally {
+			disposeProvider = undefined;
+			pi.events.emit(wakeChannel, {});
+		}
 	};
 	pi.on("session_shutdown", cancelImageJobs);
 	pi.on("session_tree", cancelImageJobs);
@@ -1076,9 +1126,24 @@ export default function mediaGenExtension(pi: ExtensionAPI): void {
 
 			if (typedParams.async === false) return generate(_signal);
 
+			const epoch = sessionEpoch;
+			let backgroundWorkError: string | undefined;
+			try {
+				await ensureBackgroundWorkProvider(epoch);
+			} catch (error) {
+				backgroundWorkError = error instanceof Error ? error.message : String(error);
+			}
+			if (epoch !== sessionEpoch || _signal?.aborted || (imageConfig.requireBackgroundWorkProvider && backgroundWorkError)) {
+				const error = epoch !== sessionEpoch || _signal?.aborted
+					? "Cancelled before starting: session/branch changed or tool aborted"
+					: `Required background-work provider unavailable: ${backgroundWorkError}`;
+				return { content: [{ type: "text", text: error }], isError: true, details: { error } };
+			}
+			const ownerSessionId = ctx.sessionManager.getSessionFile() ?? ctx.sessionManager.getSessionId();
 			const jobId = randomUUID();
 			const controller = new AbortController();
 			const job: ImageJob = {
+				ownerSessionId,
 				controller,
 				details: { jobId, toolCallId: _toolCallId, status: "running", startedAt: new Date().toISOString(), timeoutMs: IMAGE_GENERATION_TIMEOUT_MS },
 				report: "Local image generation is in progress; upstream acceptance/progress is not known. Completion or failure will be delivered automatically. Do not busy-poll or resubmit.",
@@ -1096,14 +1161,17 @@ export default function mediaGenExtension(pi: ExtensionAPI): void {
 					display: true,
 					details: structuredClone(job.details),
 				}, { deliverAs: "followUp", triggerTurn: true });
+			}).finally(() => {
+				// Wake after storing the result and attempting the single follow-up delivery.
+				if (imageJobs.get(jobId) === job) pi.events.emit(wakeChannel, {});
 			}).catch(() => {
 				// Delivery errors must not become unhandled rejections or trigger duplicate paid requests.
 				if (imageJobs.has(jobId)) console.error(`media-gen: Could not deliver image job ${jobId} result.`);
 			});
 
 			return {
-				content: [{ type: "text", text: `Image generation started in the background. Job ID: ${jobId}. Local execution has started; upstream acceptance is not yet confirmed. Completion or failure will be delivered automatically to the Agent. Use image_job_status with this job ID for an on-demand lookup; do not busy-poll or resubmit. Continue other work or end this turn. Total timeout: 10 minutes.` }],
-				details: { jobId, toolCallId: _toolCallId, status: "started", timeoutMs: IMAGE_GENERATION_TIMEOUT_MS },
+				content: [{ type: "text", text: `Image generation started in the background. Job ID: ${jobId}. Local execution has started; upstream acceptance is not yet confirmed. Completion or failure will be delivered automatically to the Agent. Use image_job_status with this job ID for an on-demand lookup; do not busy-poll or resubmit. ${disposeProvider ? "Background-work provider registered: use bg_wait({ all: true, timeoutMs: 660000 }) without an id in this same session to stay alive until current work finishes." : `Background-work provider unavailable (${backgroundWorkError}); automatic delivery requires this session to remain alive.`} Total timeout: 10 minutes.` }],
+				details: { jobId, toolCallId: _toolCallId, status: "started", timeoutMs: IMAGE_GENERATION_TIMEOUT_MS, backgroundWorkProvider: disposeProvider ? "registered" : "unavailable", ...(backgroundWorkError ? { backgroundWorkError } : {}) },
 			};
 		},
 	});

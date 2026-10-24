@@ -504,6 +504,14 @@ Ctrl+Shift+T      # 快速呼出/关闭任务树弹窗
    - `jobId` (string, required): Job ID from an asynchronous `generate_image` acknowledgement in the current session/branch.
    - Immediately returns `running`, `completed`, or `failed`; unknown/cleared IDs return `not_found` as a tool error. Final results are repeatable snapshots; no cancellation, waiting, retry or generation is performed.
 
+### Optional same-session `bg_wait` bridge
+
+When `pi-subagents` exposing `pi-subagents/background-work` is installed, async image jobs register with its public background-work provider API. Resolution first uses the extension's module root, then Pi's npm directory under `getAgentDir()`; this integration does not install packages or emulate the provider registry. Each extension instance has a distinct provider, with jobs owned by the exact session-file identity (session ID fallback) used by pi-subagents. Only pending image jobs are listed. Final results remain queryable by `image_job_status`; one follow-up is attempted before emitting a completion wake event, including on failure. Shutdown/tree navigation aborts and clears jobs, unregisters the provider, and wakes waiters; it does not confirm remote cancellation or refund.
+
+For one-shot generating children, explicitly load this extension, allow `bg_wait`, enable the parent's wait tool, and set `image.requireBackgroundWorkProvider: true` in that child's `media-gen.json`. This optional flag defaults to false to preserve independent Pi usage. When true, missing/invalid API or registration fails **before** creating/submitting an async job; `async:false` remains unchanged. Async acknowledgements report `backgroundWorkProvider: registered|unavailable`; a started acknowledgement is not a final image result.
+
+After submitting the desired async jobs, call `bg_wait({ all: true, timeoutMs: 660000 })` **in the generating session, without `id`** (image IDs are not subagent run IDs). This native blocking call keeps the child alive for the current snapshot of pending work. If its wait window expires or attention interrupts it with work still pending, continue waiting in the same session, not by sleeping, polling `image_job_status`, or resubmitting. Completion events wake native waiters; pi-subagents retains its own reconciliation timer fallback. No extension busy-poll loop or extra completion promise is introduced. New jobs submitted after a wait snapshot need a subsequent wait. A fresh child loading the updated explicit extension file needs no parent/global reload; an already-loaded instance keeps its old code until its own normal reload/restart.
+
 ## Pi package
 
 ```bash
