@@ -24,6 +24,7 @@ export const TIMER_CUSTOM_ENTRY_TYPE = "scheduled-timer";
 export const TIMER_WIDGET_KEY = "scheduled-timer-countdown";
 
 export type TimerTaskStatus = "pending" | "running" | "completed" | "cancelled";
+export type TimerDeliveryMode = "steer" | "followUp";
 
 export interface TimerTask {
 	id: string;
@@ -32,6 +33,7 @@ export interface TimerTask {
 	delaySeconds: number;
 	targetTime: number;
 	status: TimerTaskStatus;
+	deliverAs: TimerDeliveryMode;
 	rawTime?: string;
 	timerHandle?: NodeJS.Timeout;
 	triggeredAt?: number;
@@ -40,6 +42,7 @@ export interface TimerTask {
 
 export interface TimerEntryData {
 	action: "created" | "triggered" | "cancelled";
+	deliverAs?: TimerDeliveryMode;
 	taskId: string;
 	targetTime: number;
 	delaySeconds: number;
@@ -59,6 +62,12 @@ export interface ParsedTimerInput {
 // ==========================================
 
 export const TimerScheduleSchema = Type.Object({
+	deliverAs: Type.Optional(
+		Type.Union([Type.Literal("steer"), Type.Literal("followUp")], {
+			default: "steer",
+			description: "消息交付模式，默认 steer（steering）：Agent 忙时在下一个可处理边界插入，可跳过尚未执行的工具；followUp 等当前任务结束后再处理，不打断当前任务。空闲时两者均立即启动新一轮。",
+		}),
+	),
 	prompt: Type.String({
 		description: "到达定时时间后发送给 Agent 的提示词/任务内容",
 	}),
@@ -360,6 +369,7 @@ export class TimerManager {
 		prompt: string,
 		rawTime?: string,
 		ctx?: ExtensionContext,
+		deliverAs: TimerDeliveryMode = "steer",
 	): TimerTask {
 		if (!Number.isFinite(seconds) || seconds <= 0 || !Number.isSafeInteger(Math.round(seconds) * 1000) ||
 			Math.round(seconds) * 1000 > 8_640_000_000_000_000 - Date.now()) {
@@ -380,6 +390,7 @@ export class TimerManager {
 			delaySeconds,
 			targetTime,
 			status: "pending",
+			deliverAs,
 			rawTime: rawTime || formatDuration(delaySeconds),
 		};
 
@@ -390,6 +401,7 @@ export class TimerManager {
 		try {
 			this.pi.appendEntry<TimerEntryData>(TIMER_CUSTOM_ENTRY_TYPE, {
 				action: "created",
+				deliverAs,
 				taskId: id,
 				targetTime,
 				delaySeconds,
@@ -446,6 +458,7 @@ export class TimerManager {
 			try {
 				this.pi.appendEntry<TimerEntryData>(TIMER_CUSTOM_ENTRY_TYPE, {
 					action: "cancelled",
+					deliverAs: task.deliverAs,
 					taskId: task.id,
 					targetTime: task.targetTime,
 					delaySeconds: task.delaySeconds,
@@ -481,6 +494,7 @@ export class TimerManager {
 		try {
 			this.pi.appendEntry<TimerEntryData>(TIMER_CUSTOM_ENTRY_TYPE, {
 				action: "triggered",
+				deliverAs: task.deliverAs,
 				taskId: task.id,
 				targetTime: task.targetTime,
 				delaySeconds: task.delaySeconds,
@@ -493,16 +507,12 @@ export class TimerManager {
 
 		// 2. 发送用户消息给 Agent 并启动任务
 		try {
-			const isBusy = this.context && !this.context.isIdle();
-			if (isBusy) {
-				this.pi.sendUserMessage(task.prompt, { deliverAs: "followUp" });
-			} else {
-				this.pi.sendUserMessage(task.prompt);
-			}
+			// Always pass the selected mode: Pi handles idle/busy transitions atomically.
+			this.pi.sendUserMessage(task.prompt, { deliverAs: task.deliverAs });
 		} catch (err) {
-			console.warn("[timer] Normal send failed, attempting delivery as followUp:", err);
+			console.warn(`[timer] Send failed, retrying delivery as ${task.deliverAs}:`, err);
 			try {
-				this.pi.sendUserMessage(task.prompt, { deliverAs: "followUp" });
+				this.pi.sendUserMessage(task.prompt, { deliverAs: task.deliverAs });
 			} catch (fallbackErr) {
 				console.error("[timer] Critical: failed to deliver scheduled message:", fallbackErr);
 			}
@@ -613,7 +623,7 @@ export class TimerStatusModalComponent implements Component {
 				`活跃中: ${pending.length} 个 | 已触发: ${all.filter(t => t.status === "completed").length} 个 | 已取消: ${all.filter(t => t.status === "cancelled").length} 个`,
 				...(pending.length ? pending.flatMap(task => [
 					`[#${task.id}] 倒计时 ${formatClockTime(Math.max(0, Math.ceil((task.targetTime - Date.now()) / 1000)))} (预定 ${formatDateTime(task.targetTime)})`,
-					`提示词: ${task.prompt}`,
+					`交付模式: ${task.deliverAs} | 提示词: ${task.prompt}`,
 				]) : ["(当前暂无等待执行的定时任务)"]),
 				"",
 				"创建: /timer [秒] [分] [时] <提示词>",
@@ -987,7 +997,7 @@ export default function timerExtension(pi: ExtensionAPI): void {
 		name: "timer_schedule",
 		label: "Timer Schedule",
 		description:
-			"创建定时发送消息（启动 Agent 任务）的计划任务。到达设定时间后，会自动发送指定的提示词并启动新一轮任务执行。",
+			"创建定时发送消息的计划任务。默认 deliverAs: steer（steering），Agent 忙时在下一个可处理边界插入；如需等待当前任务结束、不打断执行，可选择 deliverAs: followUp。空闲时均立即启动新一轮。",
 		parameters: TimerScheduleSchema,
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
 			manager.attach(ctx);
@@ -1024,16 +1034,17 @@ export default function timerExtension(pi: ExtensionAPI): void {
 				};
 			}
 
-			const task = manager.createTask(totalSeconds, typedParams.prompt, rawTime, ctx);
+			const task = manager.createTask(totalSeconds, typedParams.prompt, rawTime, ctx, typedParams.deliverAs);
 			return {
 				content: [
 					{
 						type: "text" as const,
-						text: `定时任务已成功创建 [#${task.id}]。将在 ${formatDateTime(task.targetTime)} (${formatDuration(task.delaySeconds)}后) 发送提示词启动 Agent。`,
+						text: `定时任务已成功创建 [#${task.id}]。将在 ${formatDateTime(task.targetTime)} (${formatDuration(task.delaySeconds)}后) 以 ${task.deliverAs} 模式发送提示词启动 Agent。`,
 					},
 				],
 				details: {
 					taskId: task.id,
+					deliverAs: task.deliverAs,
 					targetTime: task.targetTime,
 					delaySeconds: task.delaySeconds,
 					prompt: task.prompt,
@@ -1085,7 +1096,7 @@ export default function timerExtension(pi: ExtensionAPI): void {
 									pending
 										.map(
 											(t) =>
-												`- [#${t.id}] 剩余 ${formatClockTime(Math.max(0, Math.ceil((t.targetTime - Date.now()) / 1000)))}: "${t.prompt}"`,
+												`- [#${t.id}] [${t.deliverAs}] 剩余 ${formatClockTime(Math.max(0, Math.ceil((t.targetTime - Date.now()) / 1000)))}: "${t.prompt}"`,
 										)
 										.join("\n")
 								: "当前没有等待执行的定时任务",
@@ -1095,6 +1106,7 @@ export default function timerExtension(pi: ExtensionAPI): void {
 					count: pending.length,
 					tasks: pending.map((t) => ({
 						id: t.id,
+						deliverAs: t.deliverAs,
 						targetTime: t.targetTime,
 						prompt: t.prompt,
 						delaySeconds: t.delaySeconds,
