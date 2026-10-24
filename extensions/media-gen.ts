@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
@@ -10,7 +10,12 @@ import { type Static, Type } from "typebox";
 // Schemas (Strictly English descriptions, width/height driven, no duration)
 // ============================================================================
 
+export const IMAGE_GENERATION_TIMEOUT_MS = 600_000;
+
 export const GenerateImageSchema = Type.Object({
+	async: Type.Optional(Type.Boolean({
+		description: "Defaults to true: return a job ID immediately and deliver completion/failure to the Agent automatically. Use false to wait for the final result (e.g. dependent image-to-video calls or one-shot scripts). Do not poll or resubmit a started job.",
+	})),
 	prompt: Type.String({
 		description: "Detailed prompt describing the image to generate, or explicit instructions for editing the input image.",
 	}),
@@ -454,7 +459,7 @@ export async function executeImageGeneration(
 	cwd: string = process.cwd(),
 	signal?: AbortSignal,
 ): Promise<ImageExecutionResult> {
-	signal = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(300_000)]);
+	signal = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(IMAGE_GENERATION_TIMEOUT_MS)]);
 	signal.throwIfAborted();
 	if (!mediaConfig.primaryModel || mediaConfig.primaryModel.trim().length === 0) {
 		throw new Error(`image.primaryModel is not configured in media-gen.json.`);
@@ -908,6 +913,15 @@ export function formatMissingModelReport(
 }
 
 export default function mediaGenExtension(pi: ExtensionAPI): void {
+	// Background requests belong to this session/branch, not to the starting tool call.
+	const imageJobs = new Map<string, AbortController>();
+	const cancelImageJobs = () => {
+		for (const controller of imageJobs.values()) controller.abort();
+		imageJobs.clear();
+	};
+	pi.on("session_shutdown", cancelImageJobs);
+	pi.on("session_tree", cancelImageJobs);
+
 	// --------------------------------------------------------------------------
 	// Tool 1: generate_image
 	// --------------------------------------------------------------------------
@@ -915,7 +929,7 @@ export default function mediaGenExtension(pi: ExtensionAPI): void {
 		name: "generate_image",
 		label: "Generate Image",
 		description:
-			"Generate a new image from a text description, or edit/modify an existing image (Image-to-Image / Inpainting / Style Transfer). Automatically computes optimal aspect ratio and handles configured fallback models.",
+			"Generate or edit an image. By default starts a background job and returns its ID immediately, not an image path. Completion or failure is delivered automatically to the Agent; do not poll or resubmit. Use async:false to wait for the final result. Uses a 10-minute total deadline, automatic aspect ratio and configured fallback models.",
 		parameters: GenerateImageSchema,
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -955,43 +969,79 @@ export default function mediaGenExtension(pi: ExtensionAPI): void {
 				};
 			}
 
-			try {
-				const result = await executeImageGeneration(typedParams, context.image, context.provider, ctx.cwd, _signal);
-				const fileUrl = formatLocalFileUrl(result.filePath);
-				const filename = basename(result.filePath);
-
-				const report = [
-					"### Image Generation Complete",
-					"",
-					`![${filename}](${fileUrl})`,
-					"",
-					`- **File Path**: \`${result.filePath}\``,
-					`- **Mode**: ${result.mode}`,
-					`- **Model Used**: \`${result.usedModel}\` (Provider: \`${context.provider.providerName}\`)`,
-					`- **Resolution**: ${result.dimensions.requestedWidth}x${result.dimensions.requestedHeight} (Aspect Ratio: \`${result.dimensions.aspectRatio}\`)`,
-					`- **File Size**: ${(result.fileSize / 1024).toFixed(1)} KB`,
-				].join("\n");
-
+			if (_signal?.aborted) {
 				return {
-					content: [{ type: "text", text: report }],
-					details: {
-						filePath: result.filePath,
-						model: result.usedModel,
-						dimensions: result.dimensions,
-					},
-				};
-			} catch (err: any) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Image generation failed: ${err?.message || String(err)}`,
-						},
-					],
+					content: [{ type: "text", text: "Image generation cancelled before starting." }],
 					isError: true,
-					details: { error: err?.message || String(err), ...(err instanceof ImageGenerationError ? { attempts: err.attempts } : {}) },
+					details: { error: "Cancelled before starting" },
 				};
 			}
+
+			const imageConfig = context.image;
+			const provider = context.provider;
+			const cwd = ctx.cwd;
+			const generate = async (signal?: AbortSignal) => {
+				try {
+					const result = await executeImageGeneration(typedParams, imageConfig, provider, cwd, signal);
+					const fileUrl = formatLocalFileUrl(result.filePath);
+					const filename = basename(result.filePath);
+
+					const report = [
+						"### Image Generation Complete",
+						"",
+						`![${filename}](${fileUrl})`,
+						"",
+						`- **File Path**: \`${result.filePath}\``,
+						`- **Mode**: ${result.mode}`,
+						`- **Model Used**: \`${result.usedModel}\` (Provider: \`${provider.providerName}\`)`,
+						`- **Resolution**: ${result.dimensions.requestedWidth}x${result.dimensions.requestedHeight} (Aspect Ratio: \`${result.dimensions.aspectRatio}\`)`,
+						`- **File Size**: ${(result.fileSize / 1024).toFixed(1)} KB`,
+					].join("\n");
+
+					return {
+						content: [{ type: "text" as const, text: report }],
+						details: {
+							filePath: result.filePath,
+							model: result.usedModel,
+							dimensions: result.dimensions,
+						},
+					};
+				} catch (err: any) {
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: `Image generation failed: ${err?.message || String(err)}`,
+							},
+						],
+						isError: true,
+						details: { error: err?.message || String(err), ...(err instanceof ImageGenerationError ? { attempts: err.attempts } : {}) },
+					};
+				}
+			};
+
+			if (typedParams.async === false) return generate(_signal);
+
+			const jobId = randomUUID();
+			const controller = new AbortController();
+			imageJobs.set(jobId, controller);
+			void generate(controller.signal).then((result) => {
+				if (!imageJobs.has(jobId)) return; // Session/branch was replaced or shut down.
+				pi.sendMessage({
+					customType: "media-gen-image-result",
+					content: `Image generation job ${jobId}: ${result.isError ? "failed" : "completed"}\n\n${result.content.map(part => part.text).join("\n")}`,
+					display: true,
+					details: { ...result.details, jobId, toolCallId: _toolCallId, status: result.isError ? "failed" : "completed" },
+				}, { deliverAs: "followUp", triggerTurn: true });
+			}).catch(() => {
+				// Delivery errors must not become unhandled rejections or trigger duplicate paid requests.
+				if (imageJobs.has(jobId)) console.error(`media-gen: Could not deliver image job ${jobId} result.`);
+			}).finally(() => imageJobs.delete(jobId));
+
+			return {
+				content: [{ type: "text", text: `Image generation started in the background. Job ID: ${jobId}. Local execution has started; upstream acceptance is not yet confirmed. Completion or failure will be delivered automatically to the Agent. Do not poll or resubmit; continue other work or end this turn. Total timeout: 10 minutes.` }],
+				details: { jobId, toolCallId: _toolCallId, status: "started", timeoutMs: IMAGE_GENERATION_TIMEOUT_MS },
+			};
 		},
 	});
 

@@ -5,7 +5,7 @@ import { basename, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
 	resolveAspectAndSize, resolveOutputDir, getMediaOutputPath, formatLocalFileUrl,
-	GenerateImageSchema, GenerateVideoSchema, loadMediaGenConfigFile, getMediaGenContext,
+	GenerateImageSchema, GenerateVideoSchema, IMAGE_GENERATION_TIMEOUT_MS, loadMediaGenConfigFile, getMediaGenContext,
 	resolveProviderFromModelsJson, extractImageFromChatMessage, resolveUrlOrDataUriToBuffer,
 	executeImageGeneration, executeVideoGeneration, default as mediaGenExtension,
 } from "../extensions/media-gen.ts";
@@ -27,7 +27,13 @@ const provider = { providerName: "fixture", baseUrl: "https://api.example/v1", a
 const config = { primaryModel: "image-primary", fallbackModels: ["image-fallback"], outputDir: output };
 const modelsPath = join(agent, "models.json");
 const writeModels = apiKey => writeFileSync(modelsPath, JSON.stringify({ providers: { fixture: { baseUrl: provider.baseUrl, apiKey, models: provider.availableModels.map(id => ({ id })) } } }));
-const tools = new Map(); mediaGenExtension({ registerTool(tool) { tools.set(tool.name, tool); } });
+const tools = new Map(), handlers = new Map(), messages = [];
+mediaGenExtension({
+	registerTool(tool) { tools.set(tool.name, tool); },
+	on(event, handler) { handlers.set(event, handler); },
+	sendMessage(message, options) { messages.push({ message, options }); },
+});
+const flushBackground = () => new Promise(resolve => setImmediate(resolve));
 const ctx = { cwd, ui: { notify() {} } };
 
 try {
@@ -87,7 +93,7 @@ try {
 		calls.push({ url, init });
 		return Response.json({ data: [{ b64_json: pngBase64 }] });
 	};
-	const result = await tools.get("generate_image").execute("image", { prompt: "test" }, undefined, undefined, ctx);
+	const result = await tools.get("generate_image").execute("image", { prompt: "test", async: false }, undefined, undefined, ctx);
 	assert.equal(result.isError, undefined);
 	assert.equal(result.details.model, "image-primary", "tool must use ctx.cwd project config");
 	assert.deepEqual(readFileSync(result.details.filePath), png);
@@ -154,7 +160,7 @@ try {
 		}
 	}
 	globalThis.fetch = async () => new Response("gateway timeout", { status: 524, headers: { "cf-ray": "fixture-ray" } });
-	const failedTool = await tools.get("generate_image").execute("http-failure", { prompt: "test" }, undefined, undefined, ctx);
+	const failedTool = await tools.get("generate_image").execute("http-failure", { prompt: "test", async: false }, undefined, undefined, ctx);
 	assert.equal(failedTool.isError, true);
 	assert.equal(failedTool.details.attempts[0].http.status, 524);
 	assert.equal(failedTool.details.attempts[0].http.requestId, "fixture-ray");
@@ -205,7 +211,7 @@ try {
 		return new Promise(resolve => { complete = resolve; }); // deliberately ignore cancellation
 	};
 	const beforeAbort = readdirSync(output).length;
-	const pending = tools.get("generate_image").execute("cancel", { prompt: "test" }, controller.signal, undefined, ctx);
+	const pending = tools.get("generate_image").execute("cancel", { prompt: "test", async: false }, controller.signal, undefined, ctx);
 	controller.abort();
 	assert.equal(requestSignal.aborted, true);
 	complete(Response.json({ data: [{ b64_json: pngBase64 }] }));
@@ -225,10 +231,106 @@ try {
 	assert.deepEqual(readFileSync(video.filePath), mp4);
 	globalThis.fetch = async () => new Response("not authorized", { status: 401 });
 	for (const name of ["generate_image", "generate_video"]) {
-		const error = await tools.get(name).execute("failure", { prompt: "test" }, undefined, undefined, ctx);
+		const error = await tools.get(name).execute("failure", { prompt: "test", async: false }, undefined, undefined, ctx);
 		assert.equal(error.isError, true); assert.ok(error.details.error);
 	}
 	console.log("✓ video reference encoding and true tool error results");
+
+	const imageTool = tools.get("generate_image");
+	assert.equal(GenerateImageSchema.properties.async.type, "boolean");
+	assert.equal(GenerateVideoSchema.properties.async, undefined, "video contract is unchanged");
+	assert.equal(IMAGE_GENERATION_TIMEOUT_MS, 600_000);
+	// A pending HTTP request must not keep execute() pending. Complete two jobs out of order.
+	const pendingRequests = [];
+	globalThis.fetch = (_url, init) => new Promise(resolve => pendingRequests.push({ init, resolve }));
+	const caller = new AbortController();
+	const started = await imageTool.execute("async-one", { prompt: "one" }, caller.signal, undefined, ctx);
+	const startedTwo = await imageTool.execute("async-two", { prompt: "two", async: true }, undefined, undefined, ctx);
+	assert.equal(started.details.status, "started");
+	assert.equal(started.details.timeoutMs, 600_000);
+	assert.equal(started.details.filePath, undefined);
+	assert.notEqual(started.details.jobId, startedTwo.details.jobId);
+	assert.equal(messages.length, 0, "ack must arrive before the deferred result");
+	caller.abort();
+	assert.equal(pendingRequests[0].init.signal.aborted, false, "accepted job outlives caller's tool signal");
+	pendingRequests[1].resolve(Response.json({ data: [{ b64_json: pngBase64 }] }));
+	await flushBackground();
+	pendingRequests[0].resolve(Response.json({ data: [{ b64_json: pngBase64 }] }));
+	await flushBackground();
+	assert.equal(messages.length, 2);
+	for (const [index, ack, callId] of [[0, startedTwo, "async-two"], [1, started, "async-one"]]) {
+		const { message, options } = messages[index];
+		assert.equal(message.customType, "media-gen-image-result");
+		assert.equal(message.display, true);
+		assert.equal(message.details.jobId, ack.details.jobId);
+		assert.equal(message.details.toolCallId, callId);
+		assert.equal(message.details.status, "completed");
+		assert.deepEqual(readFileSync(message.details.filePath), png);
+		assert.ok(message.content.includes(message.details.filePath));
+		assert.deepEqual(options, { deliverAs: "followUp", triggerTurn: true });
+	}
+
+	globalThis.fetch = async () => new Response("gateway timeout", { status: 524 });
+	const asyncFailure = await imageTool.execute("async-failure", { prompt: "test" }, undefined, undefined, ctx);
+	assert.equal(asyncFailure.details.status, "started");
+	await flushBackground();
+	assert.equal(messages.length, 3);
+	assert.equal(messages[2].message.details.status, "failed");
+	assert.equal(messages[2].message.details.jobId, asyncFailure.details.jobId);
+	assert.equal(messages[2].message.details.attempts[0].http.status, 524);
+	console.log("✓ default/explicit async ack, detached caller signal, concurrent job correlation and follow-up success/failure");
+
+	// Fake only the deadline signal: exercise timeout delivery without waiting ten minutes.
+	const originalTimeout = AbortSignal.timeout;
+	const deadline = new AbortController();
+	const timeoutValues = [];
+	try {
+		AbortSignal.timeout = ms => { timeoutValues.push(ms); return deadline.signal; };
+		let timeoutRequests = 0;
+		globalThis.fetch = (_url, init) => {
+			timeoutRequests++;
+			return new Promise((_resolve, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+		};
+		const timed = await imageTool.execute("async-timeout", { prompt: "test" }, undefined, undefined, ctx);
+		deadline.abort(new DOMException("Image generation exceeded 10 minutes", "TimeoutError"));
+		await flushBackground();
+		assert.deepEqual(timeoutValues, [600_000]);
+		assert.equal(timeoutRequests, 1, "timeout must not trigger fallback");
+		assert.equal(messages.length, 4);
+		assert.equal(messages[3].message.details.jobId, timed.details.jobId);
+		assert.equal(messages[3].message.details.status, "failed");
+		assert.match(messages[3].message.details.error, /10 minutes/);
+	} finally { AbortSignal.timeout = originalTimeout; }
+
+	for (const event of ["session_shutdown", "session_tree"]) {
+		let late, backgroundSignal;
+		globalThis.fetch = (_url, init) => {
+			backgroundSignal = init.signal;
+			return new Promise(resolve => { late = resolve; }); // ignore cancellation to simulate a late server
+		};
+		const fileCount = readdirSync(output).length;
+		await imageTool.execute(event, { prompt: "test" }, undefined, undefined, ctx);
+		handlers.get(event)(); handlers.get(event)(); // cleanup is idempotent
+		assert.equal(backgroundSignal.aborted, true);
+		late(Response.json({ data: [{ b64_json: pngBase64 }] }));
+		await flushBackground();
+		assert.equal(messages.length, 4, "old session/branch must not receive late messages");
+		assert.equal(readdirSync(output).length, fileCount, "cancelled jobs must not write late files");
+	}
+	let preflightRequests = 0;
+	globalThis.fetch = async () => { preflightRequests++; throw new Error("unexpected request"); };
+	for (const params of [{ prompt: "" }, { prompt: "test" }]) {
+		const rejected = await imageTool.execute("preflight", params, controller.signal, undefined, ctx);
+		assert.equal(rejected.isError, true);
+		assert.equal(rejected.details.jobId, undefined);
+	}
+	writeFileSync(join(cwd, "media-gen.json"), JSON.stringify({ provider: "fixture" }));
+	assert.equal((await imageTool.execute("missing-model", { prompt: "test" }, undefined, undefined, ctx)).isError, true);
+	writeFileSync(join(cwd, "media-gen.json"), "invalid json");
+	assert.equal((await imageTool.execute("bad-config", { prompt: "test" }, undefined, undefined, ctx)).isError, true);
+	assert.equal(preflightRequests, 0);
+	assert.equal(messages.length, 4);
+	console.log("✓ 10-minute deadline, automatic timeout failure, lifecycle cancellation and preflight errors");
 } finally {
 	globalThis.fetch = originalFetch;
 	if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
