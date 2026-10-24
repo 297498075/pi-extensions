@@ -187,12 +187,12 @@ export default function askUserQuestion(pi: ExtensionAPI): void {
 		request.resolve();
 		if (!request.notify || request.generation !== generation) return;
 		try {
-			// Persist immediately: delivery may be queued until the current run finishes.
+			// Persist before steering: queued delivery must not be the only durable copy.
 			pi.appendEntry(ANSWER_MESSAGE, request.snapshot);
 			pi.sendMessage({
 				customType: ANSWER_MESSAGE, content: requestResult(request.snapshot).content,
 				display: true, details: request.snapshot,
-			}, { triggerTurn: true, deliverAs: "followUp" });
+			}, { triggerTurn: true, deliverAs: "steer" });
 		} catch {
 			// A delivery failure must not discard the answer or reject a detached task.
 			request.ctx.ui.notify?.("答案已保存，可通过 get_user_answer 获取；自动通知失败。", "warning");
@@ -303,7 +303,7 @@ Guidelines:
 - The system automatically appends a "Type something..." option for custom user input; do NOT author an "Other" option yourself.
 - Set multiSelect: true if multiple options can be chosen simultaneously.
 - If you recommend a specific choice, make it the first option and append "(Recommended)" to its label; the label never replaces the explanation.
-- blocking defaults to true (wait for the answer). Use blocking: false when useful independent work can continue: you receive a requestId immediately and the answer is automatically delivered as a follow-up without interrupting running tools.
+- blocking defaults to true (wait for the answer). Use blocking: false when useful independent work can continue: you receive a requestId immediately and the answer is automatically delivered as a steering message at the next processing boundary (pending tools may be skipped; already running tools are not forcibly aborted).
 - Use get_user_answer to check without blocking. Call wait_user_answer with that requestId once further work truly depends on the answer. Do not busy-poll, assume an unanswered choice, or treat cancellation as authorization.
 - Set voice_prompt to a concise, conversational reminder suited to the moment: call the user over, ask the question aloud, or summarize the decision in 1-2 sentences. When voice is enabled it plays automatically alongside the questionnaire; do not also call voice_speak for the same question. Omit it for a generic spoken alert. This does not start recording or accept spoken answers.
 `,

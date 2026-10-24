@@ -97,6 +97,8 @@ assert.equal(Check(AnswerRequestSchema, { requestId: "" }), false);
 assert.match(tool.description, /description for EVERY option/);
 assert.match(tool.description, /WHY it fits this user's current goals/);
 assert.match(tool.description, /disclose its downside/);
+assert.match(tool.description, /steering message at the next processing boundary/);
+assert.match(tool.description, /pending tools may be skipped; already running tools are not forcibly aborted/);
 assert.match(AskUserQuestionSchema.properties.questions.items.properties.options.items.properties.description.description, /为什么.*代价|代价.*为什么/);
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const simple = { questions: [{ question: "Which approach?", options: [{ label: "one", description: "Keep the current behavior; fewer changes, but no new capabilities." }, { label: "two" }] }] };
@@ -150,7 +152,7 @@ try {
 	assert.deepEqual((await call(h, "get_user_answer", { requestId }, ui.ctx)).details.answers, answer.answers);
 	assert.equal((await call(h, "wait_user_answer", { requestId }, ui.ctx)).details.status, "answered");
 	assert.equal(h.notifications.length, 1);
-	assert.deepEqual(h.notifications[0].options, { triggerTurn: true, deliverAs: "followUp" }, "do not steer/skip executing tool calls");
+	assert.deepEqual(h.notifications[0].options, { triggerTurn: true, deliverAs: "steer" }, "deliver answers at the next boundary instead of after the whole run");
 	assert.equal(h.notifications[0].message.details.requestId, requestId);
 	assert.equal(h.entries[0].data.status, "answered", "answer is durable before queued notification delivery");
 	assert.equal(started.details.status, "pending", "returned snapshots must not be mutated later");
@@ -176,6 +178,8 @@ try {
 	await tick();
 	assert.equal(ui.maxActive, 1);
 	assert.equal(h.notifications.length, 3, "blocking calls do not generate duplicate background notifications");
+	assert.equal(h.notifications[1].message.details.status, "cancelled");
+	assert.deepEqual(h.notifications[1].options, { triggerTurn: true, deliverAs: "steer" }, "cancellations must steer too");
 
 	// Cancelling the wait does not consume or cancel the question.
 	const third = await call(h, "ask_user_question", { ...simple, blocking: false }, ui.ctx);
@@ -190,6 +194,8 @@ try {
 	const failed = await call(h, "wait_user_answer", { requestId: third.details.requestId }, ui.ctx);
 	assert.equal(failed.details.status, "error"); assert.equal(failed.isError, true);
 	assert.match(failed.content[0].text, /UI failed/);
+	assert.equal(h.notifications.at(-1).message.details.status, "error");
+	assert.deepEqual(h.notifications.at(-1).options, { triggerTurn: true, deliverAs: "steer" }, "UI failures must steer too");
 
 	// Rebuild only from the active branch, preserving answered requests even if a stale pending result follows.
 	const restored = harness();
@@ -227,6 +233,7 @@ try {
 	assert.equal(rpcPending.details.status, "pending");
 	selectAnswer("one"); await tick();
 	assert.equal(rpc.notifications[0].message.details.status, "answered");
+	assert.deepEqual(rpc.notifications[0].options, { triggerTurn: true, deliverAs: "steer" }, "RPC uses the same steering delivery");
 	await call(rpc, "ask_user_question", { ...simple, blocking: false }, rpcCtx);
 	rpc.events.get("session_shutdown")();
 	selectAnswer("one"); await tick();
