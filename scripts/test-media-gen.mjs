@@ -27,14 +27,19 @@ const provider = { providerName: "fixture", baseUrl: "https://api.example/v1", a
 const config = { primaryModel: "image-primary", fallbackModels: ["image-fallback"], outputDir: output };
 const modelsPath = join(agent, "models.json");
 const writeModels = apiKey => writeFileSync(modelsPath, JSON.stringify({ providers: { fixture: { baseUrl: provider.baseUrl, apiKey, models: provider.availableModels.map(id => ({ id })) } } }));
-const tools = new Map(), handlers = new Map(), messages = [];
+const tools = new Map(), handlers = new Map(), messages = [], wakeEvents = [];
+const events = { emit(channel, payload) { wakeEvents.push({ channel, payload }); } };
 mediaGenExtension({
 	registerTool(tool) { tools.set(tool.name, tool); },
 	on(event, handler) { handlers.set(event, handler); },
+	events,
 	sendMessage(message, options) { messages.push({ message, options }); },
 });
 const flushBackground = () => new Promise(resolve => setImmediate(resolve));
-const ctx = { cwd, ui: { notify() {} } };
+const ctx = {
+	cwd, ui: { notify() {} },
+	sessionManager: { getSessionFile: () => join(root, "session.jsonl"), getSessionId: () => "fixture-session" },
+};
 
 try {
 	for (const [w, h, ratio, size] of [[1920, 1080, "16:9", "1792x1024"], [1080, 1920, "9:16", "1024x1792"], [1024, 1024, "1:1", "1024x1024"], [800, 600, "4:3", "1792x1024"]]) {
@@ -351,6 +356,7 @@ try {
 	mediaGenExtension({
 		registerTool(tool) { deliveryTools.set(tool.name, tool); },
 		on(event, handler) { deliveryHandlers.set(event, handler); },
+		events,
 		sendMessage() { throw new Error("simulated delivery failure"); },
 	});
 	const originalConsoleError = console.error;

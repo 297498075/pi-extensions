@@ -512,6 +512,8 @@ For one-shot generating children, explicitly load this extension, allow `bg_wait
 
 After submitting the desired async jobs, call `bg_wait({ all: true, timeoutMs: 660000 })` **in the generating session, without `id`** (image IDs are not subagent run IDs). This native blocking call keeps the child alive for the current snapshot of pending work. If its wait window expires or attention interrupts it with work still pending, continue waiting in the same session, not by sleeping, polling `image_job_status`, or resubmitting. Completion events wake native waiters; pi-subagents retains its own reconciliation timer fallback. No extension busy-poll loop or extra completion promise is introduced. New jobs submitted after a wait snapshot need a subsequent wait. A fresh child loading the updated explicit extension file needs no parent/global reload; an already-loaded instance keeps its old code until its own normal reload/restart.
 
+桥接回归测试：`node scripts/test-media-background-work.mjs`（已纳入 `npm test`）。测试在临时 agent 目录创建模拟的 `pi-subagents/background-work` 公开导出，覆盖并发注册、准确的会话归属、结果落库／消息投递后唤醒、投递失败仍唤醒、缺失／无效 API、强制模式提交前拒绝、可选降级、同步兼容及注册期间切换／取消竞态；不读取个人配置、不请求真实生图服务。`node scripts/test-media-gen.mjs` 覆盖原有生成与状态查询行为。此类隔离测试不等同于真实网关出图或完整子会话 `bg_wait` 端到端验证。
+
 ## Pi package
 
 ```bash
