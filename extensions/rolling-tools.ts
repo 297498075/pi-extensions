@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
+import { AssistantMessageComponent, InteractiveMode, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem, Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { isFocusable, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { showStatusModal } from "./lib/status-modal.ts";
@@ -208,6 +208,8 @@ const DYNAMIC_HOOKS_KEY = Symbol.for("pi-rolling-tools.dynamicHooks.v3");
 
 interface DynamicHooksState {
 	installed: boolean;
+	assistantThinkingInstalled?: boolean;
+	shouldHideThinking?: (target: any) => boolean;
 	handleToolRender?: (target: any, width: number, origRender: Function) => string[];
 	handleShowExtensionNotify?: (target: any, message: string, type: string | undefined, origFn: Function) => void;
 	handleSetExtensionStatus?: (target: any, key: string, text: string | undefined, origFn: Function) => void;
@@ -2131,6 +2133,36 @@ function installToolNotificationStripper(
  * 安装原型劫持骨架（仅在进程初次加载时拦截一次，后续所有 reload 均由 dynamicHooks 委托热刷新）
  */
 function ensureGlobalPrototypeHooksInstalled(): void {
+	// Separate installation flag also upgrades the existing v3 singleton on /reload.
+	if (!dynamicHooks.assistantThinkingInstalled) {
+		dynamicHooks.assistantThinkingInstalled = true;
+		const hiddenViews = new WeakMap<object, boolean>();
+		const origUpdate = AssistantMessageComponent.prototype.updateContent;
+		const origRender = AssistantMessageComponent.prototype.render;
+		const shouldHide = (target: any) => dynamicHooks.shouldHideThinking?.(target) === true;
+
+		AssistantMessageComponent.prototype.updateContent = function (this: any, message: any, isStreaming?: boolean) {
+			const hide = shouldHide(this);
+			// Only the renderer sees this shallow view. Never edit stream/session messages,
+			// thinking signatures, or the canonical lastMessage used to reveal content later.
+			const view = hide ? { ...message, content: message.content.filter((block: any) => block.type !== "thinking") } : message;
+			try {
+				origUpdate.call(this, view, isStreaming);
+				hiddenViews.set(this, hide);
+			} finally {
+				this.lastMessage = message;
+			}
+		};
+
+		AssistantMessageComponent.prototype.render = function (this: any, width: number): string[] {
+			// Rebuild existing components when enabled/off/reload/shutdown changes the
+			// policy, even without another stream event. Normal renders reuse native caches.
+			if (this.lastMessage && hiddenViews.get(this) !== shouldHide(this)) {
+				this.updateContent(this.lastMessage);
+			}
+			return origRender.call(this, width);
+		};
+	}
 	if (dynamicHooks.installed) return;
 	dynamicHooks.installed = true;
 
@@ -2243,6 +2275,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	installToolNotificationStripper(pi, () => hooksActive && currentConfig.enabled && currentConfig.stripToolNotificationHeaders !== false);
 
 	// 2. 动态更新委派处理函数（支持任意次数的 /reload 即刻生效！）
+	dynamicHooks.shouldHideThinking = (target: any) => hooksActive && currentConfig.enabled && target.hideThinkingBlock === true;
 	dynamicHooks.handleToolRender = (target: any, width: number, origRender: Function) => {
 		if (currentConfig.enabled && !target.expanded && shouldSilenceInTranscript(target.toolName, currentConfig)) {
 			return [];
@@ -2884,6 +2917,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	// Prototype wrappers are process-wide, but their delegates belong to this
 	// runtime. Removing the extension must leave inert pass-through wrappers.
 	const ownedHooks = {
+		thinking: dynamicHooks.shouldHideThinking,
 		render: dynamicHooks.handleToolRender,
 		notify: dynamicHooks.handleShowExtensionNotify,
 		status: dynamicHooks.handleSetExtensionStatus,
@@ -2894,6 +2928,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		hooksActive = false;
 		desktopActions.abort();
 		for (const cleanup of uiHookCleanups.splice(0)) cleanup();
+		if (dynamicHooks.shouldHideThinking === ownedHooks.thinking) dynamicHooks.shouldHideThinking = undefined;
 		if (dynamicHooks.handleToolRender === ownedHooks.render) dynamicHooks.handleToolRender = undefined;
 		if (dynamicHooks.handleShowExtensionNotify === ownedHooks.notify) dynamicHooks.handleShowExtensionNotify = undefined;
 		if (dynamicHooks.handleSetExtensionStatus === ownedHooks.status) dynamicHooks.handleSetExtensionStatus = undefined;

@@ -138,12 +138,13 @@ try {
 		getEntries: () => [{ type: "custom", customType: "rolling-tools-history", data: { total: 1, items: [{ id: "abandoned", name: "bash", summaryDisplay: "ABANDONED-BRANCH", status: "done" }] } }],
 		getBranch: () => branchEntries,
 	} };
+	const existingThinking = new AssistantMessageComponent({ role: "assistant", content: [{ type: "thinking", thinking: "existing reasoning" }] }, true);
+	assert.ok(existingThinking.render(80).join("\n").includes("Thinking..."));
+	rollingTools(rolling.pi);
 	const assistantUpdate = AssistantMessageComponent.prototype.updateContent;
 	const assistantRender = AssistantMessageComponent.prototype.render;
-	rollingTools(rolling.pi);
 	await emit(rolling.handlers, "session_start", { reason: "startup" }, rollingCtx);
-	assert.equal(AssistantMessageComponent.prototype.updateContent, assistantUpdate, "rolling-tools must not patch assistant content updates");
-	assert.equal(AssistantMessageComponent.prototype.render, assistantRender, "rolling-tools must not patch assistant rendering");
+	assert.deepEqual(existingThinking.render(80), [], "already-mounted thinking-only messages must disappear without blank lines");
 	assert.ok(!widget(tui, theme).render(100).join("\n").includes("ABANDONED-BRANCH"));
 	await rolling.commands.get("rolling-tools").handler("status", rollingCtx);
 	assert.ok(statusLines.join("\n").includes("Rolling Tools"));
@@ -151,7 +152,8 @@ try {
 	ui.notify("normal notice", "info"); assert.equal(notifications.length, 0);
 	await rolling.commands.get("rolling-tools").handler("off", rollingCtx);
 	ui.notify("notice after off", "info"); assert.ok(notifications.some(n => n.m === "notice after off"));
-	const message = { role: "assistant", content: [{ type: "thinking", thinking: "reasoning", thinkingSignature: "signature" }, { type: "text", text: "answer" }] };
+	const message = { role: "assistant", content: [{ type: "thinking", thinking: "reasoning" + " full content".repeat(2000), thinkingSignature: "signature" }, { type: "text", text: "answer" }] };
+	const originalMessage = structuredClone(message);
 	await emit(rolling.handlers, "message_end", { message }, rollingCtx);
 	assert.equal(message.content[0].thinkingSignature, "signature");
 	const streamMessage = structuredClone(message);
@@ -164,7 +166,17 @@ try {
 		assert.ok(reasoningComponent.render(80).join("\n").includes("reasoning"), "native show setting must be respected");
 		assert.ok(!hiddenReasoningComponent.render(80).join("\n").includes("reasoning"), "native hide setting must be respected");
 	};
+	const assertCompletelyHidden = (component) => {
+		const lines = component.render(80);
+		assert.ok(!lines.join("\n").includes("Thinking..."), "no native thinking placeholder may remain");
+		assert.ok(!lines.join("\n").includes("reasoning"), "no reasoning may remain");
+		assert.deepEqual(lines, new AssistantMessageComponent({ role: "assistant", content: [{ type: "text", text: "answer" }] }, true).render(80), "thinking must leave no extra spacing");
+	};
 	assertNativeThinkingVisibility();
+	assertCompletelyHidden(hiddenReasoningComponent);
+	assert.equal(hiddenReasoningComponent.lastMessage, message, "renderer must retain the original message, not the filtered view");
+	hiddenReasoningComponent.invalidate();
+	assertCompletelyHidden(hiddenReasoningComponent);
 	reasoningComponent.setHideThinkingBlock(true);
 	assert.ok(!reasoningComponent.render(80).join("\n").includes("reasoning"), "native setting can hide thinking while rolling-tools is on");
 	reasoningComponent.setHideThinkingBlock(false);
@@ -173,8 +185,41 @@ try {
 	assertNativeThinkingVisibility();
 	assert.deepEqual(streamMessage, message, "streaming rendering must preserve thinking and its signature");
 	assert.equal(message.content[0].thinkingSignature, "signature");
+	assertCompletelyHidden(hiddenReasoningComponent);
+	streamMessage.content[0].thinking += " streamed tail";
+	hiddenReasoningComponent.updateContent(streamMessage, true);
+	assertCompletelyHidden(hiddenReasoningComponent);
+	hiddenReasoningComponent.setHideThinkingBlock(false);
+	assert.ok(hiddenReasoningComponent.render(80).join("\n").includes("streamed tail"), "revealing thinking must recover the entire streamed tail");
+	assert.equal(hiddenReasoningComponent.lastMessage.content[0].thinking, streamMessage.content[0].thinking);
+	hiddenReasoningComponent.setHideThinkingBlock(true);
+	assertCompletelyHidden(hiddenReasoningComponent);
+	assert.deepEqual(message, originalMessage, "no source thinking content may be truncated or mutated");
+	const thinkingOnly = { role: "assistant", content: [{ type: "thinking", thinking: "secret", thinkingSignature: "signed" }] };
+	for (const isStreaming of [false, true]) {
+		const component = new AssistantMessageComponent(undefined, true);
+		component.updateContent(thinkingOnly, isStreaming);
+		assert.deepEqual(component.render(80), [], "thinking-only streaming and completed messages must occupy zero rows");
+		assert.equal(component.lastMessage, thinkingOnly);
+	}
+	for (const stopReason of ["length", "error", "aborted"]) {
+		const component = new AssistantMessageComponent({ ...thinkingOnly, stopReason }, true);
+		const text = component.render(80).join("\n");
+		assert.ok(text.includes(stopReason === "length" ? "truncated before completion" : stopReason === "error" ? "Error:" : "Operation aborted"), "hiding thinking must not swallow errors or truncation warnings");
+		assert.ok(!text.includes("secret") && !text.includes("Thinking..."));
+	}
+	const mixed = { role: "assistant", content: [
+		{ type: "thinking", thinking: "first secret" }, { type: "text", text: "first answer" },
+		{ type: "thinking", thinking: "second secret" }, { type: "thinking", thinking: "third secret" },
+		{ type: "text", text: "second answer" }, { type: "toolCall", id: "call", name: "read", arguments: {} },
+	] };
+	const mixedSnapshot = structuredClone(mixed);
+	assert.deepEqual(new AssistantMessageComponent(mixed, true).render(80), new AssistantMessageComponent({ ...mixed, content: mixed.content.filter(c => c.type !== "thinking") }, true).render(80));
+	assert.deepEqual(mixed, mixedSnapshot, "alternating thinking, text and tool calls must remain intact");
 	await rolling.commands.get("rolling-tools").handler("off", rollingCtx);
 	assertNativeThinkingVisibility();
+	assert.ok(hiddenReasoningComponent.render(80).join("\n").includes("Thinking..."), "off must restore native placeholder on an existing component");
+	assert.ok(existingThinking.render(80).join("\n").includes("Thinking..."));
 	branchEntries = [{ type: "custom", customType: "rolling-tools-history", data: { total: 3, items: [{ id: "in-branch", index: 3, name: "read", summaryDisplay: "BRANCH-A", status: "running", startTime: Date.now() }] } }];
 	await rolling.commands.get("rolling-tools").handler("on", rollingCtx);
 	await emit(rolling.handlers, "session_tree", {}, rollingCtx);
@@ -184,14 +229,25 @@ try {
 	await emit(rolling.handlers, "session_tree", {}, rollingCtx);
 	assert.ok(!widget(tui, theme).render(100).some(l => l.includes("BRANCH-A")));
 	assertNativeThinkingVisibility();
+	assertCompletelyHidden(hiddenReasoningComponent);
 	await emit(rolling.handlers, "session_shutdown", { reason: "reload" }, rollingCtx);
 	assertNativeThinkingVisibility();
+	assert.ok(hiddenReasoningComponent.render(80).join("\n").includes("Thinking..."), "shutdown must restore native thinking rendering");
+	const reloadedRolling = handlersFor();
+	rollingTools(reloadedRolling.pi);
+	assert.equal(AssistantMessageComponent.prototype.updateContent, assistantUpdate, "reload must not stack assistant update hooks");
+	assert.equal(AssistantMessageComponent.prototype.render, assistantRender, "reload must not stack assistant render hooks");
+	assertCompletelyHidden(hiddenReasoningComponent);
+	await emit(rolling.handlers, "session_shutdown", { reason: "reload" }, rollingCtx);
+	assertCompletelyHidden(hiddenReasoningComponent);
+	await emit(reloadedRolling.handlers, "session_shutdown", { reason: "exit" }, rollingCtx);
+	assert.ok(hiddenReasoningComponent.render(80).join("\n").includes("Thinking..."));
 	assert.equal(AssistantMessageComponent.prototype.updateContent, assistantUpdate);
 	assert.equal(AssistantMessageComponent.prototype.render, assistantRender);
 	assert.equal(ui.notify, originalNotify, "shutdown must restore wrapped UI functions");
 	const component = new ToolExecutionComponent("read", "c", { path: "x" }, {}, undefined, tui, root);
 	assert.ok(component.render(80).length > 0, "unloaded extension must not silence global tool rendering");
-	console.log("✓ visible status, working off switch, native thinking visibility, intact reasoning, branch-local history and unload cleanup");
+	console.log("✓ visible status, working off switch, placeholder-free hidden thinking, intact reasoning, branch-local history and reload/unload cleanup");
 
 	const envCtx = { defaultProvider: "fixture", providerBaseUrls: new Map([["api.example", "fixture"]]), modelToProvider: new Map([["fixture-model", "fixture"]]) };
 	const raw = Buffer.from(JSON.stringify({ model: "fixture-model", text: "x".repeat(2048) }));
