@@ -9,11 +9,9 @@ import { StatusModalComponent } from "./lib/status-modal.ts";
 import { ASK_USER_VOICE_PROMPT, isQuestionVoicePrompt, type QuestionVoicePrompt } from "./lib/ask-user-voice.ts";
 import { type Static, Type } from "typebox";
 
-export interface VoiceItem {
-	id: string;
-	name: string;
-	description?: string;
-}
+import { parseVoices, resolveVoice, VoiceDirectory, voicePage, type VoiceItem } from "./lib/voice-catalog.ts";
+import { VoicePickerComponent } from "./lib/voice-picker.ts";
+export type { VoiceItem } from "./lib/voice-catalog.ts";
 export type DeliveryMode = "editor" | "submit";
 export interface VoiceConfig {
 	gatewayUrl: string;
@@ -33,7 +31,7 @@ export const DEFAULT_CONFIG: VoiceConfig = {
 };
 export const VoiceSpeakParamsSchema = Type.Object({
 	text: Type.String({ minLength: 1, description: "Concise, natural spoken text (1-2 sentences). Speak like a human; do not read code, paths, logs, or tables." }),
-	voice_id: Type.Optional(Type.String({ description: "Voice ID (optional; defaults to saved setting)" })),
+	voice_id: Type.Optional(Type.String({ description: "Optional stable ID from voice_list_voices (query it live first); overrides this call only. Routes to the voice's engine. Native voice-library: at most 80 characters, speed=1, no instruct; whole-utterance synthesis remains the default." })),
 	instruct: Type.Optional(Type.String({ description: "Optional tone or emotion instruction (e.g. 'cheerful', 'urgent')" })),
 	speed: Type.Optional(Type.Number({ minimum: 0.5, maximum: 2 })),
 });
@@ -42,7 +40,10 @@ export const VoiceListenParamsSchema = Type.Object({
 	timeout_sec: Type.Optional(Type.Integer({ minimum: 3, maximum: 60, description: "Total timeout for recording and transcription in seconds (default 15)" })),
 });
 export const VoiceListVoicesParamsSchema = Type.Object({
-	refresh: Type.Optional(Type.Boolean({ description: "Force refresh from gateway instead of using local cache" })),
+	query: Type.Optional(Type.String({ maxLength: 256, description: "Search name, stable ID, engine or description; spaces require all terms" })),
+	offset: Type.Optional(Type.Integer({ minimum: 0, description: "Zero-based result offset (default 0)" })),
+	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50, description: "Page size, default 20, maximum 50" })),
+	refresh: Type.Optional(Type.Boolean({ description: "Force live refresh; otherwise reuse an in-memory snapshot for at most 5 seconds. Concurrent refreshes coalesce." })),
 });
 export type VoiceSpeakParams = Static<typeof VoiceSpeakParamsSchema>;
 export type VoiceListenParams = Static<typeof VoiceListenParamsSchema>;
@@ -63,6 +64,14 @@ export interface VoiceListVoicesResult {
 	success: boolean;
 	default_voice_id: string;
 	voices: VoiceItem[];
+	total?: number;
+	matched?: number;
+	offset?: number;
+	limit?: number;
+	has_more?: boolean;
+	source?: "live" | "memory" | "cache";
+	stale?: boolean;
+	checked_at?: string;
 	message?: string;
 	warning?: string;
 }
@@ -105,20 +114,6 @@ function gatewayKey(value: string): string {
 		throw new Error("gatewayUrl 必须是无查询参数及 fragment 的 HTTP(S) 地址");
 	}
 	return url.toString().replace(/\/+$/, "");
-}
-function parseVoices(value: unknown, wireFormat = false): VoiceItem[] {
-	if (!Array.isArray(value)) throw new Error("音色目录响应必须是数组");
-	return value.map(item => {
-		if (!isObject(item)) throw new Error("无效的音色目录条目");
-		const id = item[wireFormat ? "voice_id" : "id"];
-		if (typeof id !== "string" || !id.trim() || typeof item.name !== "string" || !item.name.trim()) {
-			throw new Error("音色目录缺少有效 ID 或名称");
-		}
-		if (item.description !== undefined && item.description !== null && typeof item.description !== "string") {
-			throw new Error("音色描述必须是字符串");
-		}
-		return { id, name: item.name, ...(typeof item.description === "string" ? { description: item.description } : {}) };
-	});
 }
 function parseConfig(raw: unknown): VoiceConfig {
 	if (!isObject(raw)) throw new Error("语音配置必须是 JSON object");
@@ -234,7 +229,11 @@ export const UNSUPPORTED_SPEAKER = "当前 TtsGateway 不提供任务级取消�
 
 export class TtsGatewayAdapter implements VoiceGateway {
 	private readonly baseUrl: string;
-	constructor(baseUrl: string) { this.baseUrl = gatewayKey(baseUrl); }
+	private readonly directory: VoiceDirectory;
+	constructor(baseUrl: string) {
+		this.baseUrl = gatewayKey(baseUrl);
+		this.directory = new VoiceDirectory(async signal => ({ voices: parseVoices(await this.json("/api/voices", signal), true) }));
+	}
 	private async json(path: string, signal: AbortSignal, payload?: unknown): Promise<unknown> {
 		checkSignal(signal);
 		const res = await fetch(`${this.baseUrl}${path}`, {
@@ -246,11 +245,11 @@ export class TtsGatewayAdapter implements VoiceGateway {
 		return res.json();
 	}
 	public async probe(signal: AbortSignal): Promise<{ online: boolean }> {
-		try { await this.json("/api/tts/playback/state", signal); return { online: true }; }
+		try { await this.getVoices(signal); return { online: true }; }
 		catch { return { online: false }; }
 	}
 	public async getVoices(signal: AbortSignal): Promise<VoiceItem[]> {
-		return parseVoices(await this.json("/api/voices", signal), true);
+		return (await this.directory.get(true, signal)).voices;
 	}
 	public async recordAndTranscribe(options: { maxDurationSec: number; silenceTimeoutMs?: number; signal: AbortSignal }): Promise<RecordingResult> {
 		const data = await this.json("/api/v1/input/record-and-transcribe", options.signal, {
@@ -265,18 +264,22 @@ export class TtsGatewayAdapter implements VoiceGateway {
 	}
 	public async speak(text: string, options: { voiceId: string; instruct?: string; speed: number; signal: AbortSignal }): Promise<void> {
 		checkSignal(options.signal);
+		const voice = resolveVoice((await this.directory.get(false, options.signal)).voices, options.voiceId);
+		checkSignal(options.signal);
+		const native = voice.engine === "voice-library";
+		if (native && (text.trim().length > 80 || options.speed !== 1 || options.instruct?.trim())) {
+			throw new Error("原配方音色每次最多80字，仅支持 speed=1 且不支持 instruct；不会静默修改参数或改用其它引擎");
+		}
 		const payload: Record<string, unknown> = {
 			text,
-			engine: "cosyvoice",
-			voice_id: options.voiceId || "default",
-			speed: options.speed ?? 1.0,
+			engine: voice.engine ?? "cosyvoice",
+			voice_id: voice.id,
+			...(!native ? { speed: options.speed ?? 1.0 } : {}),
 			output_mode: "speaker_playback",
 			concurrency: "preempt",
 			wait: true,
 		};
-		if (options.instruct) {
-			payload.instruct = options.instruct;
-		}
+		if (!native && options.instruct) payload.instruct = options.instruct;
 
 		// When cancelled, notify gateway to stop physical playback immediately
 		const onAbort = () => {
@@ -316,6 +319,7 @@ interface LiveRun {
 }
 export interface VoiceStatusModalInfo {
 	enabled: boolean;
+	defaultEnabled: boolean;
 	live: boolean;
 	activeTool: string | null;
 	gatewayUrl: string;
@@ -332,14 +336,18 @@ export class VoiceStatusModalComponent implements Component {
 		const mode = info.deliveryMode === "editor" ? "editor (追加至草稿待确认)" : "submit (直接提交/排队)";
 		this.modal = new StatusModalComponent(tui, theme, "Pi Voice Extension Status", [
 			`• 扩展总开关   : ${info.enabled ? "ENABLED (ON)" : "DISABLED (OFF)"}`,
+			`• 新会话默认   : ${info.defaultEnabled ? "ON（不自动开启 Live）" : "OFF"}`,
 			`• 持续语音输入 : ${info.live ? "RUNNING (🔴 LIVE ON)" : "STOPPED (⏸ OFF)"}`,
 			`• 当前主动活动 : ${info.activeTool ? `BUSY (${info.activeTool})` : "IDLE"}`,
 			`• 识别投递模式 : ${mode}`,
 			`• 后台网关地址 : ${info.gatewayUrl}`,
 			`• 默认发音音色 : ${info.defaultVoiceId} (${info.speed}x 语速)`,
-			`• 扬声发音服务 : ${info.speakerSupported ? "ONLINE (CosyVoice 直出)" : "INCOMPATIBLE (已保护阻断)"}`,
+			`• 扬声发音服务 : ${info.speakerSupported ? "按目录引擎路由（未探测连接）" : "INCOMPATIBLE (已保护阻断)"}`,
+			"• 发音风险     : 全局抢占/停播，未确认物理播放完成（VOICE-001）",
+			"• 参数命令     : /voice voice | speed | gateway | default | mode",
+			"• 完整帮助     : /voice help",
 			"• 全局快捷键   : F2 (持续输入切换) | Alt+X (紧急停播/停录)",
-		], onClose, { maxWidth: 74, maxHeight: 16, center: true });
+		], onClose, { maxWidth: 74, maxHeight: 20, center: true });
 	}
 
 	invalidate(): void { this.modal.invalidate(); }
@@ -365,6 +373,8 @@ export class VoiceRuntime {
 	private active?: AudioTask;
 	private liveRun?: LiveRun;
 	private readonly auxiliary = new Set<AbortController>();
+	private readonly directories = new Map<string, VoiceDirectory>();
+	private completionGateway?: { url: string; expires: number };
 	private initialization?: { epoch: number; url: string; promise: Promise<VoiceListVoicesResult> };
 	private questionSpeech: Promise<void> = Promise.resolve();
 
@@ -374,7 +384,12 @@ export class VoiceRuntime {
 	constructor(pi: ExtensionAPI, options: VoiceRuntimeOptions = {}) {
 		this.pi = pi;
 		this.config = options.config ?? new VoiceConfigManager();
-		this.gateway = options.gateway ?? (url => new TtsGatewayAdapter(url));
+		const adapters = new Map<string, TtsGatewayAdapter>();
+		this.gateway = options.gateway ?? (url => {
+			let adapter = adapters.get(url);
+			if (!adapter) { adapter = new TtsGatewayAdapter(url); adapters.set(url, adapter); }
+			return adapter;
+		});
 	}
 	public attach(ctx: ExtensionContext): void { this.context = ctx; }
 	public getVoiceConfig(): VoiceConfig { return this.config.get(); }
@@ -460,6 +475,9 @@ export class VoiceRuntime {
 		task?.controller.abort();
 		for (const controller of this.auxiliary) controller.abort();
 		this.auxiliary.clear();
+		for (const directory of this.directories.values()) directory.clear();
+		this.directories.clear();
+		this.completionGateway = undefined;
 		this.initialization = undefined;
 		if (this.toastTimer) {
 			clearTimeout(this.toastTimer);
@@ -565,7 +583,7 @@ export class VoiceRuntime {
 			if (!this.isCurrent(task)) throw abortError();
 			await delay(150, task.controller.signal);
 			if (!this.isCurrent(task)) throw abortError();
-			return { status: "success", message: "播放及残响保护结束" };
+			return { status: "success", message: "音频已提交网关；尚未确认扬声器物理播放完成（VOICE-001）" };
 		} catch (error) {
 			if (expired && this.active === task && task.epoch === this.generationEpoch && this.enabled) {
 				return { status: "error", reason: "deadline_exceeded", message: "发音总等待超时，已取消自身任务；不要自动重试" };
@@ -668,62 +686,109 @@ export class VoiceRuntime {
 			this.showToast(`📥 语音已排队: "${text}"`);
 		}
 	}
-	public async listVoices(params: VoiceListVoicesParams, signal?: AbortSignal): Promise<VoiceListVoicesResult> {
+	private directory(url: string): VoiceDirectory {
+		let directory = this.directories.get(url);
+		if (!directory) {
+			directory = new VoiceDirectory(async signal => {
+				const epoch = this.generationEpoch;
+				const voices = await this.gateway(url).getVoices(signal);
+				checkSignal(signal);
+				if (epoch !== this.generationEpoch || this.config.get().gatewayUrl !== url) throw abortError();
+				let warning: string | undefined;
+				try {
+					if (JSON.stringify(this.config.get().voicesCacheByGateway[url]) !== JSON.stringify(voices)) {
+						await this.config.update(current => {
+							checkSignal(signal);
+							if (epoch !== this.generationEpoch || current.gatewayUrl !== url) throw abortError();
+							return { ...current, voicesCacheByGateway: { ...current.voicesCacheByGateway, [url]: voices } };
+						}, signal);
+					}
+				} catch (error) { checkSignal(signal); if (epoch !== this.generationEpoch || this.config.get().gatewayUrl !== url) throw abortError(); warning = `目录获取成功，但持久化失败: ${errorText(error)}`; }
+				return { voices, warning };
+			});
+			this.directories.set(url, directory);
+		}
+		return directory;
+	}
+	/** Autocomplete reuses the indexed snapshot; no per-key config reads or HTTP. */
+	public async voiceCompletions(command: string, query: string): Promise<AutocompleteItem[] | null> {
+		try {
+			if (!this.completionGateway || this.completionGateway.expires < Date.now()) this.completionGateway = { url: this.config.get().gatewayUrl, expires: Date.now() + 5000 };
+			const snapshot = await this.directory(this.completionGateway.url).get();
+			const voices = voicePage(snapshot.voices, { query, limit: 20 }, snapshot.index).voices;
+			return voices.length ? voices.map(v => ({ value: `${command} ${v.id}`, label: `${v.name} · ${v.id}`, description: `${v.engine ?? "引擎未知"}${v.ready === false ? " · 未就绪" : ""}` })) : null;
+		} catch { return null; }
+	}
+	public async listVoices(params: VoiceListVoicesParams, signal?: AbortSignal, allowDisabled = false): Promise<VoiceListVoicesResult> {
 		let cfg: VoiceConfig;
-		try { cfg = this.config.get(); }
+		try { cfg = this.config.get(); voicePage([], params); }
 		catch (error) { return { success: false, default_voice_id: "", voices: [], message: errorText(error) }; }
 		const empty = { success: false, default_voice_id: cfg.defaultVoiceId, voices: [] };
-		if (!this.enabled) return { ...empty, message: "语音扩展已关闭" };
+		if (!this.enabled && !allowDisabled) return { ...empty, message: "语音扩展已关闭" };
 		if (signal?.aborted) return { ...empty, message: "音色查询已取消" };
-		const cached = cfg.voicesCacheByGateway[cfg.gatewayUrl] ?? null;
-		if (!params.refresh && cached !== null) return { success: true, default_voice_id: cfg.defaultVoiceId, voices: cached };
-		if (!params.refresh && this.initialization?.epoch === this.generationEpoch && this.initialization.url === cfg.gatewayUrl) {
-			try { return signal ? await abortable(this.initialization.promise, signal) : await this.initialization.promise; }
-			catch { return { ...empty, message: "音色查询已取消" }; }
-		}
-		const controller = new AbortController();
 		const epoch = this.generationEpoch;
-		this.auxiliary.add(controller);
-		const deadline = new AbortController();
-		const timer = setTimeout(() => deadline.abort(), 3000);
-		const combined = AbortSignal.any([controller.signal, deadline.signal, ...(signal ? [signal] : [])]);
+		const directory = this.directory(cfg.gatewayUrl);
+		const before = directory.peek();
 		try {
-			const voices = await abortable(this.gateway(cfg.gatewayUrl).getVoices(combined), combined);
-			if (!this.enabled || epoch !== this.generationEpoch) throw abortError();
-			try {
-				await this.config.update(current => ({ ...current, voicesCacheByGateway: { ...current.voicesCacheByGateway, [cfg.gatewayUrl]: voices } }), combined);
-			} catch (error) {
-				checkSignal(combined);
-				return { success: true, default_voice_id: cfg.defaultVoiceId, voices, warning: `目录获取成功，但持久化失败: ${errorText(error)}` };
-			}
-			checkSignal(combined);
-			if (!this.enabled || epoch !== this.generationEpoch) throw abortError();
-			return { success: true, default_voice_id: cfg.defaultVoiceId, voices };
+			const snapshot = await directory.get(params.refresh, signal);
+			if (epoch !== this.generationEpoch) throw abortError();
+			return { success: true, default_voice_id: this.config.get().defaultVoiceId, ...voicePage(snapshot.voices, params, snapshot.index), source: snapshot === before ? "memory" : "live", stale: false, checked_at: new Date(snapshot.checkedAt).toISOString(), ...(snapshot.warning ? { warning: snapshot.warning } : {}) };
 		} catch (error) {
-			if (controller.signal.aborted || signal?.aborted || epoch !== this.generationEpoch) return { ...empty, message: "音色查询已取消" };
-			return cached === null ? { ...empty, message: `无可用音色缓存: ${errorText(error)}` } :
-				{ success: true, default_voice_id: cfg.defaultVoiceId, voices: cached, warning: `刷新失败，展示历史缓存: ${errorText(error)}` };
-		} finally { clearTimeout(timer); controller.abort(); deadline.abort(); this.auxiliary.delete(controller); }
+			if (signal?.aborted || epoch !== this.generationEpoch) return { ...empty, message: "音色查询已取消" };
+			const cached = cfg.voicesCacheByGateway[cfg.gatewayUrl] ?? null;
+			return cached === null ? { ...empty, message: `无可用音色缓存: ${errorText(error)}` } : { success: true, default_voice_id: cfg.defaultVoiceId, ...voicePage(cached, params), source: "cache", stale: true, warning: `刷新失败，展示历史缓存，不能据此保存选择或确认可用: ${errorText(error)}` };
+		}
+	}
+	private async selectVoice(argument: string, ctx: ExtensionContext): Promise<void> {
+		const cfg = this.config.get();
+		const epoch = this.generationEpoch;
+		const snapshot = await this.directory(cfg.gatewayUrl).get(true);
+		const exactIds = snapshot.voices.filter(v => v.id.toLowerCase() === argument.toLowerCase());
+		const exactNames = snapshot.voices.filter(v => v.name.toLowerCase() === argument.toLowerCase());
+		let id: string | undefined;
+		let interactive = false;
+		if (argument && exactIds.length === 1) id = exactIds[0].id;
+		else if (argument && exactNames.length === 1) id = exactNames[0].id;
+		else {
+			if (!ctx.hasUI || ctx.mode === "rpc" || !ctx.ui?.custom) {
+				const matches = voicePage(snapshot.voices, { query: argument, limit: 10 }, snapshot.index);
+				throw new Error(`请指定唯一音色 ID；匹配 ${matches.matched} 项: ${matches.voices.map(v => `${v.id} (${v.name})`).join(", ")}`);
+			}
+			interactive = true;
+			id = await ctx.ui.custom<string | undefined>((tui, theme, _keys, done) => new VoicePickerComponent(snapshot.voices, argument, theme, () => tui.requestRender(), done, Math.min(10, Math.max(2, (tui.terminal.rows || 24) - 8))), { overlay: true, overlayOptions: { width: "90%", maxHeight: "90%" } });
+			if (!id) return;
+		}
+		// Recheck after an interactive wait; never trust stale/offline choices.
+		if (epoch !== this.generationEpoch) throw abortError();
+		if (this.config.get().gatewayUrl !== cfg.gatewayUrl) throw new Error("网关已变更，请重新选择音色");
+		const latest = interactive ? await this.directory(cfg.gatewayUrl).get(true) : snapshot;
+		const voice = resolveVoice(latest.voices, id);
+		await this.config.update(current => {
+			if (epoch !== this.generationEpoch) throw abortError();
+			if (current.gatewayUrl !== cfg.gatewayUrl) throw new Error("网关已变更，请重新选择音色");
+			return { ...current, defaultVoiceId: voice.id };
+		});
+		this.notify(`默认音色已保存: ${voice.name} (${voice.id}, ${voice.engine ?? "cosyvoice"})；仅后续请求生效，语音开关及当前句不变`);
 	}
 	public openStatusModal(ctx: ExtensionContext): void {
 		this.attach(ctx);
 		const cfg = this.config.get();
 		const info: VoiceStatusModalInfo = {
 			enabled: this.enabled,
+			defaultEnabled: cfg.defaultEnabled,
 			live: this.live,
 			activeTool: this.active?.kind ?? null,
 			gatewayUrl: cfg.gatewayUrl,
 			deliveryMode: cfg.deliveryMode,
 			defaultVoiceId: cfg.defaultVoiceId,
 			speed: cfg.speed,
-			speakerSupported: true, // Connected to running gateway CosyVoice
+			speakerSupported: true, // Adapter supports the protocol; status does not probe the gateway.
 		};
 
 		if (!ctx.hasUI || ctx.mode === "rpc" || !ctx.ui?.custom) {
-			ctx.ui?.notify?.(
-				`Voice: ${info.enabled ? "ON" : "OFF"}\nLive: ${info.live ? "ON" : "OFF"}\nGateway: ${info.gatewayUrl}\nMode: ${info.deliveryMode}\nVoice: ${info.defaultVoiceId}\n发音风险: 全局抢占/停播，未确认物理播放完成（VOICE-001）\n快捷键: F2 / Alt+X`,
-				"info",
-			);
+			const text = `Voice: ${info.enabled ? "ON" : "OFF"}\nDefault: ${info.defaultEnabled ? "ON" : "OFF"}\nLive: ${info.live ? "ON" : "OFF"}\nGateway: ${info.gatewayUrl}\nMode: ${info.deliveryMode}\nVoice: ${info.defaultVoiceId}\nSpeed: ${info.speed}x\n连接状态: 未探测\n发音风险: 全局抢占/停播，未确认物理播放完成（VOICE-001）\n帮助: /voice help\n快捷键: F2 / Alt+X`;
+			if (ctx.hasUI) ctx.ui?.notify?.(text, "info");
+			else console.log(text);
 			return;
 		}
 
@@ -745,14 +810,26 @@ export class VoiceRuntime {
 		});
 	}
 
+	private async showInfo(ctx: ExtensionContext, title: string, lines: string[]): Promise<void> {
+		if (!ctx.hasUI || ctx.mode === "rpc" || !ctx.ui?.custom) {
+			if (ctx.hasUI) ctx.ui.notify(`${title}\n${lines.join("\n")}`, "info");
+			else console.log(`${title}\n${lines.join("\n")}`);
+			return;
+		}
+		await ctx.ui.custom<void>((tui, theme, _keys, done) =>
+			new StatusModalComponent(tui, theme, title, lines, () => done(), { maxWidth: 84, maxHeight: 22, center: true }),
+			{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 } },
+		);
+	}
+
 	public async command(args: string, ctx: ExtensionContext): Promise<void> {
 		this.attach(ctx);
 		const raw = args.trim();
-		const [rawAction = "status", param] = raw.split(/\s+/);
+		const [rawAction = "status", param, extra] = raw.split(/\s+/);
 		const action = rawAction.toLowerCase() || "status";
 		try {
 			switch (action) {
-				case "on": this.enable(); this.notify("语音工具已启用；Live 需单独开启。当前网关发音协议不兼容，详见 /voice status", "warning"); break;
+				case "on": this.enable(); this.notify("语音工具已启用；Live 需单独开启。共享网关存在全局停播风险，详见 /voice status"); break;
 				case "off": this.stop(true); this.notify("语音已关闭，后续新调用将拒绝"); break;
 				case "stop": this.stop(); this.notify("现有活动已取消；扩展开关不变，开启时仍接受新调用"); break;
 				case "live":
@@ -760,38 +837,49 @@ export class VoiceRuntime {
 					this.setLive(param ? param === "on" : !this.live);
 					this.notify(`Live: ${this.live ? "ON（请求边界交接可能丢弃当前半句）" : "OFF"}`);
 					break;
+				case "speed": {
+					if (!param) { this.openStatusModal(ctx); break; }
+					const speed = Number(param);
+					if (extra || !Number.isFinite(speed) || speed < 0.5 || speed > 2) throw new Error("用法: /voice speed <0.5–2>");
+					await this.config.update(current => ({ ...current, speed }));
+					this.notify(`语速已保存: ${speed}x（后续发音生效）`); break;
+				}
+				case "gateway": {
+					if (!param) { this.openStatusModal(ctx); break; }
+					if (extra) throw new Error("用法: /voice gateway <HTTP(S) URL>");
+					const url = gatewayKey(param);
+					await this.config.update(current => ({ ...current, gatewayUrl: url }));
+					this.stop();
+					if (this.enabled) this.initializeVoices();
+					this.notify("网关地址已保存，旧语音任务及 Live 已停止；总开关不变"); break;
+				}
+				case "default":
+					if (!param) { this.openStatusModal(ctx); break; }
+					if (extra || (param !== "on" && param !== "off")) throw new Error("用法: /voice default on|off");
+					await this.config.update(current => ({ ...current, defaultEnabled: param === "on" }));
+					this.notify(`新会话默认开关已保存: ${param.toUpperCase()}（当前开关及 Live 不变）`); break;
 				case "mode":
 					if (param !== "editor" && param !== "submit") throw new Error("用法: /voice mode editor|submit");
 					await this.config.update(current => ({ ...current, deliveryMode: param }));
 					this.notify(`投递模式已更新: ${param}`); break;
-				case "set-voice": {
-					const voiceArg = raw.slice(rawAction.length).trim();
-					if (!voiceArg) throw new Error("用法: /voice set-voice <音色名称或ID>");
-					const cfg = this.config.get();
-					const voices = cfg.voicesCacheByGateway[cfg.gatewayUrl] || [];
-					// 优先精确匹配名称或 ID，次选忽略大小写匹配，再次选子串模糊匹配
-					let matched = voices.find(v => v.name === voiceArg || v.id === voiceArg);
-					if (!matched) {
-						matched = voices.find(v => v.name.toLowerCase() === voiceArg.toLowerCase() || v.id.toLowerCase() === voiceArg.toLowerCase());
-					}
-					if (!matched) {
-						matched = voices.find(v => v.name.toLowerCase().includes(voiceArg.toLowerCase()) || v.id.toLowerCase().includes(voiceArg.toLowerCase()));
-					}
-					const targetId = matched ? matched.id : voiceArg;
-					const displayName = matched ? `${matched.name} (${matched.id})` : targetId;
-					await this.config.update(current => ({ ...current, defaultVoiceId: targetId }));
-					this.notify(`默认音色已保存: ${displayName}`); break;
-				}
+				case "voice":
+				case "set-voice":
+					await this.selectVoice(raw.slice(rawAction.length).trim(), ctx); break;
 				case "voices": {
-					const result = await this.listVoices({});
-					this.notify(result.success ? [result.warning, `默认: ${result.default_voice_id}`, ...result.voices.map(v => `${v.id}: ${v.name}`)].filter(Boolean).join("\n") : result.message || "查询失败", result.success && !result.warning ? "info" : "warning");
+					const result = await this.listVoices({ query: raw.slice(rawAction.length).trim(), refresh: true }, undefined, true);
+					await this.showInfo(ctx, "Voice 音色目录", result.success
+						? [result.warning, `默认: ${result.default_voice_id} · 匹配 ${result.matched}/${result.total} · 本页 ${result.voices.length} 项`, ...result.voices.map(v => `${v.id}: ${v.name} · ${v.engine ?? "引擎未知"}${v.ready === false ? " · 未就绪" : ""}`), "更多：/voice voice [关键词] 搜索选择；工具 voice_list_voices 支持 offset/limit 分页"].filter((line): line is string => Boolean(line))
+						: [result.message || "查询失败"]);
 					break;
 				}
 				case "status": {
 					this.openStatusModal(ctx);
 					break;
 				}
-				default: throw new Error("用法: /voice on|off|stop|live|mode|set-voice|voices|status");
+				case "help":
+					await this.showInfo(ctx, "Voice 命令帮助", VOICE_HELP);
+					break;
+				default: throw new Error("未知语音命令；用 /voice help 查看用法");
 			}
 		} catch (error) { this.notify(errorText(error), "error"); }
 	}
@@ -803,28 +891,49 @@ function toolResult<T extends { status?: string; success?: boolean }>(details: T
 		...(details.status === "error" || details.success === false ? { isError: true } : {}),
 	};
 }
+const VOICE_HELP = [
+	"/voice 或 /voice status — 查看当前开关、默认开关及全部参数（不探测网关）",
+	"/voice on | off — 仅启用/禁用当前会话；off 同时取消现有语音任务",
+	"/voice stop — 取消当前任务并关闭 Live，保留当前总开关；快捷键 Alt+X",
+	"/voice live [on|off] — 切换持续收音；快捷键 F2；需先 on",
+	"/voice mode editor|submit — 转写填入草稿或直接发送（持久化）",
+	"/voice voice [ID或关键词] — 实时搜索选择默认音色；不自动开启语音或试听",
+	"/voice set-voice [ID或关键词] — 兼容入口，同上；Esc 不更改配置",
+	"/voice voices [关键词] — 实时查询，最多展示20项；工具可用 offset/limit 分页",
+	"/voice speed <0.5–2> — 保存默认语速；仅影响后续发音",
+	"/voice gateway <HTTP(S) URL> — 保存网关并取消旧任务/Live；总开关不变",
+	"/voice default on|off — 保存新会话默认开关；当前开关不变，不自动开启 Live",
+	"speed / gateway / default 不带参数时打开状态窗；参数保存到 agent 目录的 voice.json",
+	"发音风险 VOICE-001：取消可能全局停播，无法确认物理播放完成；共享网关请谨慎",
+];
 const VOICE_SUBCOMMANDS: AutocompleteItem[] = [
+	{ value: "help", label: "help", description: "查看全部语音命令与参数说明" },
+	{ value: "speed", label: "speed", description: "保存默认语速 (speed 0.5–2)；无参数查看状态" },
+	{ value: "gateway", label: "gateway", description: "保存 HTTP(S) 网关地址，停止旧任务及 Live" },
+	{ value: "default", label: "default", description: "新会话默认开关 (default on | default off)，当前会话不变" },
 	{ value: "status", label: "status", description: "打开语音配置与状态模态窗" },
 	{ value: "on", label: "on", description: "启用语音扩展" },
 	{ value: "off", label: "off", description: "关闭语音扩展" },
 	{ value: "stop", label: "stop", description: "立即停止当前语音活动（播报或收音）" },
 	{ value: "live", label: "live", description: "持续收音模式开关 (live on | live off)" },
 	{ value: "mode", label: "mode", description: "转写投递模式 (mode editor | mode submit)" },
-	{ value: "voices", label: "voices", description: "列出当前网关可用音色" },
+	{ value: "voice", label: "voice", description: "实时搜索选择默认音色；不启用语音、不自动试听" },
+	{ value: "voices", label: "voices", description: "实时查询目录 (voices [关键词])；最多20项" },
 	{ value: "set-voice", label: "set-voice", description: "设置默认音色 (用法: /voice set-voice <id>)" },
 ];
 
 export function getVoiceArgumentCompletions(
 	argumentPrefix: string,
 	runtime?: VoiceRuntime,
-): AutocompleteItem[] | null {
+): AutocompleteItem[] | null | Promise<AutocompleteItem[] | null> {
 	const prefix = (argumentPrefix || "").trimStart();
 
-	if (prefix.startsWith("live")) {
-		const sub = prefix.slice(4).trimStart().toLowerCase();
+	const toggleCommand = prefix.startsWith("default") ? "default" : "live";
+	if (prefix.startsWith(toggleCommand)) {
+		const sub = prefix.slice(toggleCommand.length).trimStart().toLowerCase();
 		const options: AutocompleteItem[] = [
-			{ value: "live on", label: "on", description: "开启持续语音输入模式" },
-			{ value: "live off", label: "off", description: "关闭持续语音输入模式" },
+			{ value: `${toggleCommand} on`, label: "on", description: toggleCommand === "live" ? "开启持续语音输入模式" : "保存新会话默认开启（不自动录音）" },
+			{ value: `${toggleCommand} off`, label: "off", description: toggleCommand === "live" ? "关闭持续语音输入模式" : "保存新会话默认关闭" },
 		];
 		const filtered = options.filter(
 			(o) => o.label.toLowerCase().startsWith(sub) || o.value.toLowerCase().startsWith(prefix.toLowerCase()),
@@ -844,31 +953,8 @@ export function getVoiceArgumentCompletions(
 		return filtered.length > 0 ? filtered : options;
 	}
 
-	if (prefix.startsWith("set-voice")) {
-		const rawSub = prefix.slice(9).trimStart();
-		const sub = rawSub.toLowerCase();
-		const options: AutocompleteItem[] = [];
-		if (runtime) {
-			try {
-				const cfg = runtime.getVoiceConfig();
-				const voices = cfg.voicesCacheByGateway[cfg.gatewayUrl] || [];
-				for (const v of voices) {
-					options.push({
-						value: `set-voice ${v.name}`,
-						label: v.name,
-						description: `音色ID: ${v.id}${v.description ? ` · ${v.description}` : ""}`,
-					});
-				}
-			} catch {}
-		}
-		const filtered = options.filter(
-			(o) =>
-				o.label.toLowerCase().includes(sub) ||
-				o.value.toLowerCase().includes(sub) ||
-				(o.description && o.description.toLowerCase().includes(sub)),
-		);
-		return filtered.length > 0 ? filtered : options.length > 0 ? options : null;
-	}
+	const selection = /^(voice|set-voice)(?:\s+|$)/.exec(prefix);
+	if (selection) return runtime?.voiceCompletions(selection[1], prefix.slice(selection[0].length)) ?? null;
 
 	const filtered = VOICE_SUBCOMMANDS.filter((item) =>
 		item.value.toLowerCase().startsWith(prefix.toLowerCase()),
@@ -909,11 +995,11 @@ export default function voiceExtension(pi: ExtensionAPI, options: VoiceRuntimeOp
 		label: "Voice List Voices",
 		parameters: VoiceListVoicesParamsSchema,
 		promptSnippet: "List available TTS voice options from cache or gateway.",
-		description: "Query available TTS voices. Prefers local cache; only use when specifically requested or changing voices.",
+		description: "Query the live TTS catalog before choosing a voice. Search with query and page with offset/limit (20 default, 50 max); a 5-second snapshot reduces traffic. Cache-only fallback is explicitly stale and does not confirm availability. Only use when requested or changing voices.",
 		async execute(_id, params, signal, _update, ctx) { runtime.attach(ctx); return toolResult(await runtime.listVoices(params, signal)); },
 	});
 	pi.registerCommand("voice", {
-		description: "Voice: on/off/stop/live/mode/set-voice/voices/status",
+		description: "Voice: status/help/on/off/stop/live/mode/set-voice/voices/speed/gateway/default",
 		getArgumentCompletions: (prefix) => getVoiceArgumentCompletions(prefix, runtime),
 		handler: (args, ctx) => runtime.command(args, ctx),
 	});

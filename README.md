@@ -62,7 +62,9 @@ pi --extension ./extensions/listary.ts
 
 **已知风险（本次按用户决定暂不修复）**：`voice_speak` 当前仍向 TtsGateway 发送 `concurrency: "preempt"`，取消时调用全局停播；网关缺少任务级取消和扬声器物理播放完成确认，可能打断其他终端或在尚未播完时恢复收音。不要将其视为多客户端安全。Live 为分段输入，并非无缝音频流。扩展会访问配置的网关并写入 `~/.pi/agent/voice.json`，录音及云端 ASR 风险取决于后端配置。详见 [已知问题](docs/known-issues.md)。
 
-失败的语音工具结果会设置 `isError: true`；可用旧缓存的刷新 warning 与用户取消保持独立状态。`/voice status` 支持窄屏换行和滚动。加载、操作、限制和测试详见 [`docs/voice-extension.md`](docs/voice-extension.md)。
+`/voice`（或 `/voice status`）打开支持窄屏换行和滚动的状态窗；`/voice help` 查看完整命令。`/voice voice [ID或关键词]` 独立搜索选择默认音色，兼容 `/voice set-voice`，不启用语音或自动试听；打开/确认实时查目录，逐键仅本地过滤。`/voice voices [关键词]` 最多展示20项，LLM 的 `voice_list_voices` 支持 `query/offset/limit` 分页，`voice_speak.voice_id` 单次覆盖默认。目录保留所属引擎，原配方180候选按 `voice-library` 路由，不静默改用 CosyVoice；5秒快照和并发请求合并避免大目录反复拉取。用 `/voice speed 1.2`、`/voice gateway http://127.0.0.1:5234`、`/voice default on|off` 保存语速、网关和新会话默认开关。切换网关取消旧任务及 Live，默认开关只影响新会话；不会自动录音。若完全找不到 `/voice`，先检查 package 资源过滤中是否有 `-extensions/voice.ts`：精确禁用优先于启用项，修正后需 `/reload` 或重启。
+
+失败的语音工具结果会设置 `isError: true`；可用旧缓存的刷新 warning 与用户取消保持独立状态。加载、操作、限制和测试详见 [`docs/voice-extension.md`](docs/voice-extension.md)。
 
 ## Stream Read Retry
 

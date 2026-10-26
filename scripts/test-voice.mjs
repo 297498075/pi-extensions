@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import voiceExtension, {
-	DEFAULT_CONFIG, VoiceConfigManager, VoiceRuntime, TtsGatewayAdapter, UNSUPPORTED_SPEAKER, VoiceStatusModalComponent, defaultVoiceConfigDir,
+	DEFAULT_CONFIG, VoiceConfigManager, VoiceRuntime, TtsGatewayAdapter, UNSUPPORTED_SPEAKER, VoiceStatusModalComponent, defaultVoiceConfigDir, getVoiceArgumentCompletions,
 } from "../extensions/voice.ts";
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -248,16 +248,17 @@ await test("cache null/empty/refresh/failure and startup fetch deduplication", a
 
 await test("actual HTTP adapter sends synthesize request for speak and rejects bad responses", async () => {
 	const original = globalThis.fetch; const requests = [];
-	let response;
-	globalThis.fetch = async (url, options) => { requests.push({ url, options }); return Response.json(response); };
+	let response, catalogResponse = [{ voice_id: "clone", name: "Clone" }];
+	globalThis.fetch = async (url, options) => { requests.push({ url, options }); return Response.json(url.endsWith("/api/voices") ? catalogResponse : response); };
 	const adapter = new TtsGatewayAdapter("http://mock/");
 	const signal = new AbortController().signal;
 	try {
 		response = { status: "completed", task_id: "t1" };
 		await adapter.speak("hello world", { voiceId: "clone", speed: 1.2, signal });
-		assert.equal(requests.length, 1);
-		assert(requests[0].url.includes("/api/tts/synthesize"));
-		const body = JSON.parse(requests[0].options.body);
+		assert.equal(requests.length, 2);
+		assert(requests[0].url.endsWith("/api/voices"));
+		assert(requests[1].url.includes("/api/tts/synthesize"));
+		const body = JSON.parse(requests[1].options.body);
 		assert.equal(body.text, "hello world");
 		assert.equal(body.engine, "cosyvoice");
 		assert.equal(body.voice_id, "clone");
@@ -272,9 +273,9 @@ await test("actual HTTP adapter sends synthesize request for speak and rejects b
 		}
 		response = { code: 0, text: " ok ", duration_ms: 2 };
 		assert.deepEqual(await adapter.recordAndTranscribe({ maxDurationSec: 15, signal }), { text: "ok", durationMs: 2 });
-		response = {}; await assert.rejects(adapter.getVoices(signal));
-		response = [{ voice_id: "clone", name: "Clone" }];
-		assert.deepEqual(await adapter.getVoices(signal), [{ id: "clone", name: "Clone" }]);
+		catalogResponse = {}; await assert.rejects(adapter.getVoices(signal));
+		catalogResponse = [{ voice_id: "clone", name: "Clone" }];
+		assert.deepEqual(await adapter.getVoices(signal), [{ id: "clone", name: "Clone", engine: "cosyvoice" }]);
 	} finally { globalThis.fetch = original; }
 });
 
@@ -312,6 +313,7 @@ await test("default adapter synthesizes via speak and handles abort cleanup", as
 	const original = globalThis.fetch; const calls = [];
 	globalThis.fetch = async (url, opts) => {
 		calls.push({ url, body: opts.body ? JSON.parse(opts.body) : undefined });
+		if (url.endsWith("/api/voices")) return Response.json([{ voice_id: "custom", name: "Custom", engine: "cosyvoice" }]);
 		if (url.includes("/api/tts/synthesize")) return Response.json({ status: "completed", task_id: "s1" });
 		if (url.includes("/api/tts/playback/control")) return Response.json({ action: "stop" });
 		return Response.json({});
@@ -340,16 +342,21 @@ await test("session start cancels in-flight input, discards late results, resets
 });
 
 await test("registration and lifecycle reset tools", async () => {
-	const h = harness(); const tools = new Map(), events = new Map(); let active = ["read", "voice_speak", "voice_listen", "voice_list_voices"];
+	const h = harness(); const tools = new Map(), events = new Map(), commands = new Map(); let active = ["read", "voice_speak", "voice_listen", "voice_list_voices"];
 	const ctx = h.ctx;
 	voiceExtension({
-		registerTool: t => tools.set(t.name, t), registerCommand() {}, registerShortcut() {},
+		registerTool: t => tools.set(t.name, t), registerCommand: (name, command) => commands.set(name, command), registerShortcut() {},
 		on: (name, fn) => events.set(name, fn),
 		events: { on() { return () => {}; } },
 		getActiveTools: () => active, setActiveTools: names => { active = names; }, sendUserMessage() {},
 	}, { config: h.store, gateway: () => { throw Error("must not connect while disabled"); } });
 	try {
-		assert.equal(tools.size, 3); events.get("session_start")({}, ctx);
+		assert.equal(tools.size, 3);
+		assert(commands.has("voice"));
+		for (const name of ["status", "help", "speed", "gateway", "default"]) {
+			assert(commands.get("voice").getArgumentCompletions("").some(item => item.value === name));
+		}
+		events.get("session_start")({}, ctx);
 		assert.deepEqual(active, ["read"]);
 		const result = await tools.get("voice_listen").execute("call", {}, undefined, undefined, ctx);
 		assert.equal(JSON.parse(result.content[0].text).reason, "disabled");
@@ -368,6 +375,7 @@ await test("status modal component renders nicely and handles key/click close", 
 	};
 	const comp = new VoiceStatusModalComponent(mockTui, mockTheme, {
 		enabled: true,
+		defaultEnabled: false,
 		live: false,
 		activeTool: null,
 		gatewayUrl: "http://127.0.0.1:5234",
@@ -384,7 +392,9 @@ await test("status modal component renders nicely and handles key/click close", 
 	assert(lines.some(l => l.includes("扩展总开关")));
 	assert(lines.some(l => l.includes("ENABLED (ON)")));
 	assert(lines.some(l => l.includes("扬声发音服务")));
-	assert(lines.some(l => l.includes("ONLINE (CosyVoice 直出)")));
+	assert(lines.some(l => l.includes("未探测连接")));
+	assert(lines.some(l => l.includes("新会话默认")));
+	assert(!lines.some(l => l.includes("ONLINE")), "status must not claim unprobed connectivity");
 
 	// Keyboard input triggers close
 	comp.handleInput("q");
@@ -412,6 +422,110 @@ await test("status modal component renders nicely and handles key/click close", 
 	};
 	await h.runtime.command("status", modalCtx);
 	assert.equal(customCalled, true, "/voice status must invoke ctx.ui.custom modal");
+});
+
+await test("parameter commands validate without mutation and persist settings across restart", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-voice-command-"));
+	await writeFile(join(dir, "voice.json"), JSON.stringify(DEFAULT_CONFIG));
+	const h = harness();
+	const store = new VoiceConfigManager(dir);
+	const runtime = new VoiceRuntime({ getActiveTools: () => [], setActiveTools() {} }, {
+		config: store, gateway: () => ({ getVoices: async () => [] }),
+	});
+	runtime.start(h.ctx);
+	try {
+		for (const command of ["speed NaN", "speed Infinity", "speed 0.49", "speed 2.01", "speed 1 extra", "gateway file:///tmp/x", "gateway http://localhost/?q=x", "gateway http://localhost/#x", "gateway http://localhost extra", "default yes", "default on extra"]) {
+			const before = store.get(), count = h.notices.length;
+			await runtime.command(command, h.ctx);
+			assert.deepEqual(store.get(), before, command);
+			assert(h.notices.slice(count).some(([, level]) => level === "error"), command);
+		}
+		await runtime.command("speed 0.5", h.ctx);
+		assert.equal(store.get().speed, 0.5);
+		await runtime.command("speed 2", h.ctx);
+		await runtime.command("gateway https://example.com/voice/", h.ctx);
+		await runtime.command("default on", h.ctx);
+		assert.equal(runtime.enabled, false, "default on must not enable the current session");
+		const reloaded = new VoiceConfigManager(dir).get();
+		assert.equal(reloaded.speed, 2);
+		assert.equal(reloaded.gatewayUrl, "https://example.com/voice");
+		assert.equal(reloaded.defaultEnabled, true);
+		runtime.start(h.ctx);
+		assert.equal(runtime.enabled, true);
+		assert.equal(runtime.live, false);
+		await runtime.command("default off", h.ctx);
+		assert.equal(runtime.enabled, true, "default off must not disable the current session");
+		runtime.start(h.ctx);
+		assert.equal(runtime.enabled, false);
+	} finally { runtime.stop(true); h.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+await test("gateway switch cancels old live work, isolates cache and rejects stale callbacks", async () => {
+	const h = harness();
+	try {
+		h.runtime.enable(); h.runtime.setLive(true);
+		const old = h.recordings[0];
+		await h.runtime.command("gateway http://127.0.0.1:9999/", h.ctx);
+		assert(old.signal.aborted);
+		assert.equal(h.runtime.enabled, true);
+		assert.equal(h.runtime.live, false);
+		assert.equal(h.store.get().gatewayUrl, "http://127.0.0.1:9999");
+		assert.deepEqual(h.store.get().voicesCacheByGateway[DEFAULT_CONFIG.gatewayUrl], []);
+		assert.equal(h.voiceRequests.length, 1);
+		assert.equal(h.gatewayUrls.at(-1), "http://127.0.0.1:9999");
+		old.resolve({ text: "old gateway result", durationMs: 1 });
+		h.voiceRequests[0].resolve([{ id: "new", name: "New voice" }]);
+		await tick();
+		assert.equal(h.editor, ""); assert.deepEqual(h.deliveries, []);
+		assert.equal(h.store.get().voicesCacheByGateway["http://127.0.0.1:9999"][0].id, "new");
+	} finally { h.close(); }
+});
+
+await test("failed gateway save leaves current audio and settings intact", async () => {
+	const h = harness();
+	try {
+		h.runtime.enable(); h.runtime.setLive(true);
+		h.store.update = async () => { throw Error("disk full"); };
+		await h.runtime.command("gateway https://example.com", h.ctx);
+		assert.equal(h.store.get().gatewayUrl, DEFAULT_CONFIG.gatewayUrl);
+		assert.equal(h.runtime.live, true); assert.equal(h.recordings[0].signal.aborted, false);
+		assert(h.notices.some(([message, level]) => level === "error" && message.includes("disk full")));
+	} finally { h.close(); }
+});
+
+await test("speed affects subsequent speech only, and on does not report an unsupported adapter", async () => {
+	const h = harness();
+	try {
+		await h.runtime.command("on", h.ctx);
+		assert(!h.notices.some(([message]) => message.includes("协议不兼容")));
+		const first = h.runtime.speak({ text: "first" });
+		await h.runtime.command("speed 1.5", h.ctx);
+		assert.equal(h.speeches[0].speed, 1); h.speeches[0].resolve(); await first;
+		const next = h.runtime.speak({ text: "next" });
+		assert.equal(h.speeches[1].speed, 1.5); h.speeches[1].resolve(); await next;
+	} finally { h.close(); }
+});
+
+await test("help and bare parameter queries are local; voices explicitly refreshes without enabling audio", async () => {
+	const h = harness(); const rendered = [];
+	const ctx = { ...h.ctx, mode: "tui", ui: { ...h.ctx.ui,
+		custom: async factory => {
+			const component = factory({ terminal: { rows: 40 } }, { fg: (_c, text) => text }, {}, () => {});
+			rendered.push(component.render(100).join("\n"));
+		},
+	} };
+	try {
+		h.runtime.enable();
+		for (const command of ["", "status", "speed", "gateway", "default", "help"]) await h.runtime.command(command, ctx);
+		assert.equal(h.gatewayUrls.length, 0);
+		const pending = h.runtime.command("voices", ctx);
+		h.voiceRequests.at(-1).resolve([]); await pending;
+		assert.equal(rendered.length, 7);
+		assert(rendered[5].includes("/voice speed")); assert(rendered[6].includes("Voice 音色目录"));
+		assert.equal(h.notices.length, 0); assert.equal(h.gatewayUrls.length, 1);
+		for (const command of ["help", "speed", "gateway", "default"]) assert(getVoiceArgumentCompletions(command).some(item => item.value === command || item.value.startsWith(command + " ")));
+		assert.deepEqual(getVoiceArgumentCompletions("default o").map(item => item.value), ["default on", "default off"]);
+	} finally { h.close(); }
 });
 
 await test("defaultVoiceConfigDir points to .pi/agent and respects PI_CODING_AGENT_DIR", async () => {

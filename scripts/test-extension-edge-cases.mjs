@@ -326,7 +326,7 @@ try {
 			manager.createTask(3600, "中文任务 ".repeat(40) + "TIMER-LAST");
 			const components = [
 				[new timer.TimerStatusModalComponent(tui, theme, manager, () => {}), "TIMER-LAST"],
-				[new voice.VoiceStatusModalComponent(tui, theme, { enabled: true, live: false, activeTool: null, gatewayUrl: "https://fixture.invalid/" + "x".repeat(400), deliveryMode: "editor", defaultVoiceId: "VOICE-LAST", speed: 1, speakerSupported: true }, () => {}), "VOICE-LAST"],
+				[new voice.VoiceStatusModalComponent(tui, theme, { enabled: true, defaultEnabled: false, live: false, activeTool: null, gatewayUrl: "https://fixture.invalid/" + "x".repeat(400), deliveryMode: "editor", defaultVoiceId: "VOICE-LAST", speed: 1, speakerSupported: true }, () => {}), "VOICE-LAST"],
 				[new todo.TodoTreeStatusModalComponent(tui, theme, { enabled: false, isToolActive: false, shortcut: "ctrl+".repeat(60) + " TODO-LAST", stats: new todo.TodoTreeStore().getProgressStats() }, () => {}), "TODO-LAST"],
 			];
 			for (const [component, marker] of components) {
