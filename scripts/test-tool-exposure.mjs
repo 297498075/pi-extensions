@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import askUser from "../extensions/ask-user.ts";
 import listary from "../extensions/listary.ts";
 import mediaGen from "../extensions/media-gen.ts";
@@ -13,6 +14,13 @@ const extensions = [
 	{ name: "ask-user", load: askUser, tools: ["get_user_answer", "wait_user_answer", "ask_user_question"] },
 ];
 const deferredTools = extensions.flatMap((entry) => entry.tools);
+const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+
+assert.equal(
+	manifest.peerDependencies["@earendil-works/pi-coding-agent"],
+	">=1.2.0",
+	"deferTools requires the reachesTools metadata exposed by Pi 1.2.0",
+);
 
 /** Minimal ExtensionAPI for `deferTools`: only the members it reads or writes. */
 function accessFixture({ active = [], registered = [], searchTool = true } = {}) {

@@ -4,6 +4,7 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- fix(exposure): require Pi 1.2.0 or newer, whose `getAllTools()` exposes the `reachesTools` metadata used to detect a real `tool_search`; older supported ranges silently activated every deferred tool and lost the context savings.
 - chore(i18n): write every model- and user-facing string in English (tool descriptions, prompt guidelines, parameter schemas, tool results, status modals, slash-command help and completion), keeping the functional Chinese values that match Chinese plugin notifications and Chinese time-unit input.
 
 - feat(exposure): register the `listary`, `timer`, `media-gen` and `ask-user` tools as `deferred`, so their schemas (about 11 KB, roughly 2.7K prompt tokens per request) stay out of every request until the model searches for one; `extensions/lib/tool-exposure.ts` activates `tool_search` on session start, keeps already loaded tools declared, and falls back to activating the tools themselves when no search tool can reach them.
