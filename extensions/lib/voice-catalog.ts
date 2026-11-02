@@ -11,15 +11,15 @@ export interface VoiceItem {
 }
 const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 export function parseVoices(value: unknown, wireFormat = false): VoiceItem[] {
-	if (!Array.isArray(value)) throw new Error("音色目录响应必须是数组");
+	if (!Array.isArray(value)) throw new Error("Voice catalog response must be an array");
 	const ids = new Set<string>();
 	return value.map(item => {
-		if (!object(item)) throw new Error("无效的音色目录条目");
+		if (!object(item)) throw new Error("Invalid voice catalog entry");
 		const id = item[wireFormat ? "voice_id" : "id"];
-		if (typeof id !== "string" || !id.trim() || /[\x00-\x1f\x7f]/.test(id) || id.length > 256 || typeof item.name !== "string" || !item.name.trim()) throw new Error("音色目录缺少有效 ID 或名称");
-		if (ids.has(id)) throw new Error(`音色目录出现重复 ID: ${id}`);
+		if (typeof id !== "string" || !id.trim() || /[\x00-\x1f\x7f]/.test(id) || id.length > 256 || typeof item.name !== "string" || !item.name.trim()) throw new Error("Voice catalog entry has no valid ID or name");
+		if (ids.has(id)) throw new Error(`Duplicate voice ID in catalog: ${id}`);
 		ids.add(id);
-		if (item.description != null && typeof item.description !== "string") throw new Error("音色描述必须是字符串");
+		if (item.description != null && typeof item.description !== "string") throw new Error("Voice description must be a string");
 		const rawEngine = typeof item.engine === "string" ? item.engine.trim().toLowerCase() : wireFormat ? "cosyvoice" : undefined;
 		const engine = rawEngine && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(rawEngine) ? rawEngine : rawEngine === undefined ? undefined : "unknown";
 		const capabilities = object(item.capabilities) ? Object.fromEntries(Object.entries(item.capabilities).filter(([, v]) => typeof v === "boolean")) as Record<string, boolean> : undefined;
@@ -27,13 +27,13 @@ export function parseVoices(value: unknown, wireFormat = false): VoiceItem[] {
 	});
 }
 export function voiceUnavailableReason(voice: VoiceItem): string | undefined {
-	if (voice.ready === false) return "音色尚未就绪";
-	if (voice.engine && !["cosyvoice", "voice-library"].includes(voice.engine)) return `当前扩展不支持 ${voice.engine} 所需的引擎专用参数`;
+	if (voice.ready === false) return "Voice is not ready yet";
+	if (voice.engine && !["cosyvoice", "voice-library"].includes(voice.engine)) return `This extension does not support the engine-specific parameters required by ${voice.engine}`;
 	return undefined;
 }
 export function resolveVoice(voices: VoiceItem[], id: string): VoiceItem {
 	const matches = voices.filter(v => v.id.toLowerCase() === id.toLowerCase());
-	if (matches.length !== 1) throw new Error(`音色 ID 不存在或不唯一: ${id}；请实时查询 /voice voices`);
+	if (matches.length !== 1) throw new Error(`Voice ID does not exist or is not unique: ${id}; query /voice voices for the live catalog`);
 	const reason = voiceUnavailableReason(matches[0]);
 	if (reason) throw new Error(`${matches[0].id}: ${reason}`);
 	return matches[0];
@@ -47,12 +47,12 @@ export function filterVoices(voices: VoiceItem[], query = "", index = voiceSearc
 }
 export function voicePage(voices: VoiceItem[], params: { query?: string; offset?: number; limit?: number }, index?: string[]) {
 	const { query = "", offset = 0, limit = 20 } = params;
-	if (typeof query !== "string" || query.length > 256 || !Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 50) throw new Error("音色查询参数无效：query ≤256 字，offset ≥0，limit 1–50");
+	if (typeof query !== "string" || query.length > 256 || !Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 50) throw new Error("Invalid voice query parameters: query <=256 chars, offset >=0, limit 1-50");
 	const matches = filterVoices(voices, query, index);
 	return { voices: matches.slice(offset, offset + limit), total: voices.length, matched: matches.length, offset, limit, has_more: offset + limit < matches.length };
 }
 export interface CatalogSnapshot { voices: VoiceItem[]; index: string[]; checkedAt: number; warning?: string }
-function cancelled(): Error { return new DOMException("音色查询已取消", "AbortError"); }
+function cancelled(): Error { return new DOMException("Voice catalog query cancelled", "AbortError"); }
 function wait<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
 	if (!signal) return operation;
 	return new Promise((resolve, reject) => {

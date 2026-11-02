@@ -412,7 +412,7 @@ assert.equal(currentWidgetKey, "image-pager-status", "Should display modal for s
 assert.ok(currentWidgetLines && currentWidgetLines.length > 0);
 const widgetText = currentWidgetLines.join("\n");
 assert.ok(widgetText.includes("Image Pager"), "Widget text should have header");
-assert.ok(widgetText.includes("图像统计"), "Widget text should have image stats");
+assert.ok(widgetText.includes("Images: "), "Widget text should have image stats");
 assert.ok(!widgetText.includes("Commands:"), "Widget text MUST NOT include verbose commands usage list!");
 console.log("  ✓ Empty arguments default to compact status modal without usage clutter.");
 
@@ -420,7 +420,7 @@ await cmd.handler("strategy fifo", mockCtx);
 assert.ok(lastNotification.includes("FIFO"));
 
 await cmd.handler("strategy turn-boundary", mockCtx);
-assert.ok(lastNotification.includes("Cache-Friendly"));
+assert.ok(lastNotification.includes("cache-friendly mode"));
 
 await cmd.handler("keep 3", mockCtx);
 assert.ok(lastNotification.includes("3"));

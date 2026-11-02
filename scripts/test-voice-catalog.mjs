@@ -24,13 +24,13 @@ await test("catalog retains routing metadata and legacy wire compatibility, reje
  assert.equal(parseVoices([{ voice_id: "legacy", name: "Legacy" }], true)[0].engine, "cosyvoice");
  assert.equal(parseVoices([{ id: "old", name: "Old cache" }])[0].engine, undefined);
  for (const bad of [[wire(native), wire(native)], [{ voice_id: "bad\n", name: "x" }], {}]) assert.throws(() => parseVoices(bad, true));
- assert.throws(() => resolveVoice([{ ...native, ready: false }], native.id), /未就绪/);
- assert.throws(() => resolveVoice([{ ...native, engine: "future-engine" }], native.id), /不支持/);
- assert.throws(() => resolveVoice([native], "missing"), /不存在/);
+	assert.throws(() => resolveVoice([{ ...native, ready: false }], native.id), /not ready/);
+	assert.throws(() => resolveVoice([{ ...native, engine: "future-engine" }], native.id), /does not support/);
+	assert.throws(() => resolveVoice([native], "missing"), /does not exist/);
 });
 await test("untrusted catalog labels cannot inject terminal control sequences", () => {
  const [v] = parseVoices([{ voice_id: "safe", name: "\u001b[31mName\u001b[0m\nnext", engine: "\u001b[31munsafe", description: "line\r\nvalue" }], true);
- assert.equal(v.name, "Name next"); assert(!/[\u0000-\u001f]/.test(v.description)); assert.equal(v.engine, "unknown"); assert.throws(() => resolveVoice([v], "safe"), /不支持/);
+ assert.equal(v.name, "Name next"); assert(!/[\u0000-\u001f]/.test(v.description)); assert.equal(v.engine, "unknown"); assert.throws(() => resolveVoice([v], "safe"), /does not support/);
 });
 await test("large catalog pages are bounded, searchable and schema stays small", () => {
  const rows = Array.from({ length: 10000 }, (_, i) => ({ id: `C${i}`, name: `Voice ${i}`, engine: i % 2 ? "voice-library" : "cosyvoice" }));
@@ -45,15 +45,15 @@ await test("single-flight refreshes coalesce; one cancelled subscriber leaves ot
  const d = deferred(); let calls = 0, producerSignal;
  const dir = new VoiceDirectory(s => { calls++; producerSignal = s; return d.promise; });
  const c = new AbortController(); const a = dir.get(true, c.signal), b = dir.get(true), z = dir.get(false);
- c.abort(); await assert.rejects(a, /取消/); assert.equal(calls, 1); assert(!producerSignal.aborted);
+ c.abort(); await assert.rejects(a, /cancelled/); assert.equal(calls, 1); assert(!producerSignal.aborted);
  d.resolve({ voices: [native] }); const [bb, zz] = await Promise.all([b, z]); assert.equal(bb, zz);
  assert.equal(await dir.get(), bb); assert.equal(calls, 1); dir.clear();
 });
 await test("clear invalidates an uncooperative producer; deadline settles and a later request can succeed", async () => {
  const late = deferred(); const dir = new VoiceDirectory(() => late.promise, 5, 15);
- const p = dir.get(); await assert.rejects(p, /取消/); assert.equal(dir.peek(), undefined);
+ const p = dir.get(); await assert.rejects(p, /cancelled/); assert.equal(dir.peek(), undefined);
  late.resolve({ voices: [native] }); await Promise.resolve(); assert.equal(dir.peek(), undefined);
- const next = dir.get(); dir.clear(); await assert.rejects(next, /取消/); assert.equal(dir.peek(), undefined);
+ const next = dir.get(); dir.clear(); await assert.rejects(next, /cancelled/); assert.equal(dir.peek(), undefined);
 });
 await test("TTL expiry and explicit refresh fetch again; identical catalogs do not churn the config file", async () => {
  let calls = 0; const dir = new VoiceDirectory(async () => { calls++; return { voices: [native] }; }, 0);
@@ -106,16 +106,16 @@ await test("unknown/ambiguous names and offline cache cannot silently change the
  const h = harness([native, { ...native, id: "other" }]);
  try {
   for (const arg of ["Iggy", "missing"]) await h.runtime.command(`voice ${arg}`, h.ctx);
-  assert.equal(h.store.get().defaultVoiceId, DEFAULT_CONFIG.defaultVoiceId); assert(h.notices.some(n => n[0].includes("唯一")));
+  assert.equal(h.store.get().defaultVoiceId, DEFAULT_CONFIG.defaultVoiceId); assert(h.notices.some(n => n[0].includes("Specify a single voice ID")));
   h.gateway.getVoices = async () => { throw Error("offline"); };
   await h.runtime.command(`voice ${native.id}`, h.ctx); assert.equal(h.store.get().defaultVoiceId, DEFAULT_CONFIG.defaultVoiceId);
-  const result = await h.runtime.listVoices({ refresh: true }, undefined, true); assert.equal(result.source, "cache"); assert.equal(result.stale, true); assert.match(result.warning, /历史缓存/);
+  const result = await h.runtime.listVoices({ refresh: true }, undefined, true); assert.equal(result.source, "cache"); assert.equal(result.stale, true); assert.match(result.warning, /stale cache must not be used/);
  } finally { h.close(); }
 });
 await test("picker cancellation saves no default, confirmation revalidates removal and stop", async () => {
  for (const mode of ["cancel", "removed", "stopped", "saved"]) {
   const h = harness();
-  h.ctx.ui.custom = async factory => { const component = factory({ terminal: { rows: 30 }, requestRender() {} }, { fg: (_c, s) => s }, {}, () => {}); assert(component.render(70).some(s => s.includes("默认音色"))); if (mode === "removed") h.setCatalog([]); if (mode === "stopped") h.runtime.stop(true); return mode === "cancel" ? undefined : native.id; };
+  h.ctx.ui.custom = async factory => { const component = factory({ terminal: { rows: 30 }, requestRender() {} }, { fg: (_c, s) => s }, {}, () => {}); assert(component.render(70).some(s => s.includes("Select the default voice"))); if (mode === "removed") h.setCatalog([]); if (mode === "stopped") h.runtime.stop(true); return mode === "cancel" ? undefined : native.id; };
   try {
    await h.runtime.command("voice", h.ctx);
    assert.equal(h.store.get().defaultVoiceId, mode === "saved" ? native.id : DEFAULT_CONFIG.defaultVoiceId);

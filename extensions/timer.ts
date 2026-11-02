@@ -15,6 +15,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import { StatusModalComponent } from "./lib/status-modal.ts";
+import { deferTools } from "./lib/tool-exposure.ts";
 
 // ==========================================
 // 常量与类型定义
@@ -65,34 +66,34 @@ export const TimerScheduleSchema = Type.Object({
 	deliverAs: Type.Optional(
 		Type.Union([Type.Literal("steer"), Type.Literal("followUp")], {
 			default: "steer",
-			description: "消息交付模式，默认 steer（steering）：Agent 忙时在下一个可处理边界插入，可跳过尚未执行的工具；followUp 等当前任务结束后再处理，不打断当前任务。空闲时两者均立即启动新一轮。",
+			description: "Delivery mode, steer by default: the message is inserted at the next processable boundary while the agent is busy, which may skip tools that have not run yet. followUp waits until the current task finishes and does not interrupt it. Either mode starts a new turn immediately when the agent is idle.",
 		}),
 	),
 	prompt: Type.String({
-		description: "到达定时时间后发送给 Agent 的提示词/任务内容",
+		description: "Prompt or task sent to the agent when the timer fires.",
 	}),
 	seconds: Type.Optional(
 		Type.Integer({
 			minimum: 0,
-			description: "定时秒数 (与 minutes, hours 累加)",
+			description: "Delay in seconds, added to minutes and hours.",
 		}),
 	),
 	minutes: Type.Optional(
 		Type.Integer({
 			minimum: 0,
-			description: "定时分钟数 (与 seconds, hours 累加)",
+			description: "Delay in minutes, added to seconds and hours.",
 		}),
 	),
 	hours: Type.Optional(
 		Type.Integer({
 			minimum: 0,
-			description: "定时小时数 (与 seconds, minutes 累加)",
+			description: "Delay in hours, added to seconds and minutes.",
 		}),
 	),
 	timeExpression: Type.Optional(
 		Type.String({
 			description:
-				"时间表达式 (例如 '30 0 0 秒分时', '5m', '00:05:00', '1小时30分')。若提供此项则优先按表达式解析",
+				"Time expression such as '30 0 0' (seconds minutes hours), '5m', '00:05:00' or '1h 30m'. Takes precedence over the numeric fields.",
 		}),
 	),
 });
@@ -100,7 +101,7 @@ export const TimerScheduleSchema = Type.Object({
 export const TimerCancelSchema = Type.Object({
 	taskId: Type.Optional(
 		Type.String({
-			description: "要取消的定时任务 ID (例如 't-1')，传 'all' 或省略则取消所有等待中的任务",
+			description: "Timer task ID to cancel, for example 't-1'. Pass 'all' or omit it to cancel every waiting task.",
 		}),
 	),
 });
@@ -116,17 +117,17 @@ export type TimerCancelParams = Static<typeof TimerCancelSchema>;
 
 export function formatDuration(totalSeconds: number): string {
 	if (totalSeconds < 60) {
-		return `${totalSeconds}秒`;
+		return `${totalSeconds}s`;
 	}
 	const hours = Math.floor(totalSeconds / 3600);
 	const minutes = Math.floor((totalSeconds % 3600) / 60);
 	const seconds = totalSeconds % 60;
 
 	const parts: string[] = [];
-	if (hours > 0) parts.push(`${hours}小时`);
-	if (minutes > 0) parts.push(`${minutes}分`);
-	if (seconds > 0) parts.push(`${seconds}秒`);
-	return parts.join("") || "0秒";
+	if (hours > 0) parts.push(`${hours}h`);
+	if (minutes > 0) parts.push(`${minutes}m`);
+	if (seconds > 0) parts.push(`${seconds}s`);
+	return parts.join("") || "0s";
 }
 
 export function formatClockTime(totalSeconds: number): string {
@@ -195,7 +196,7 @@ export function parseTimerArgs(
 	if (!trimmed) {
 		return {
 			success: false,
-			error: "缺少参数。用法: /timer [秒] [分] [时] <提示词> 或 /timer <时间> <提示词>",
+			error: "Missing arguments. Usage: /timer [seconds] [minutes] [hours] <prompt> or /timer <time> <prompt>",
 		};
 	}
 
@@ -218,7 +219,7 @@ export function parseTimerArgs(
 		}
 		const prompt = stripOuterQuotes(colonMatch[4] ?? "");
 		if (totalSeconds <= 0) {
-			return { success: false, error: "定时时间必须大于 0 秒" };
+			return { success: false, error: "The delay must be greater than 0 seconds" };
 		}
 		return { success: true, data: { seconds: totalSeconds, prompt, rawTime } };
 	}
@@ -232,14 +233,14 @@ export function parseTimerArgs(
 		const totalSeconds = s + m * 60 + h * 3600;
 		const prompt = stripOuterQuotes(threeNumsMatch[4] ?? "");
 		if (totalSeconds <= 0) {
-			return { success: false, error: "定时时间必须大于 0 秒" };
+			return { success: false, error: "The delay must be greater than 0 seconds" };
 		}
 		return {
 			success: true,
 			data: {
 				seconds: totalSeconds,
 				prompt,
-				rawTime: `${s}秒 ${m}分 ${h}时`,
+				rawTime: `${s}s ${m}m ${h}h`,
 			},
 		};
 	}
@@ -252,14 +253,14 @@ export function parseTimerArgs(
 		const totalSeconds = s + m * 60;
 		const prompt = stripOuterQuotes(twoNumsMatch[3] ?? "");
 		if (totalSeconds <= 0) {
-			return { success: false, error: "定时时间必须大于 0 秒" };
+			return { success: false, error: "The delay must be greater than 0 seconds" };
 		}
 		return {
 			success: true,
 			data: {
 				seconds: totalSeconds,
 				prompt,
-				rawTime: `${s}秒 ${m}分`,
+				rawTime: `${s}s ${m}m`,
 			},
 		};
 	}
@@ -292,7 +293,7 @@ export function parseTimerArgs(
 
 	if (matchedTokens.length > 0) {
 		if (accumulatedSeconds <= 0) {
-			return { success: false, error: "定时时间必须大于 0 秒" };
+			return { success: false, error: "The delay must be greater than 0 seconds" };
 		}
 		return {
 			success: true,
@@ -310,21 +311,21 @@ export function parseTimerArgs(
 		const s = parseInt(singleNumMatch[1], 10);
 		const prompt = stripOuterQuotes(singleNumMatch[2] ?? "");
 		if (s <= 0) {
-			return { success: false, error: "定时时间必须大于 0 秒" };
+			return { success: false, error: "The delay must be greater than 0 seconds" };
 		}
 		return {
 			success: true,
 			data: {
 				seconds: s,
 				prompt,
-				rawTime: `${s}秒`,
+				rawTime: `${s}s`,
 			},
 		};
 	}
 
 	return {
 		success: false,
-		error: `无法识别的时间格式: "${trimmed}"。支持: "30 2 0" (秒 分 时)、"5m"、"00:05:00"、"30s" 等`,
+		error: `Unrecognized time format: "${trimmed}". Supported: "30 2 0" (seconds minutes hours), "5m", "00:05:00", "30s" and similar`,
 	};
 }
 
@@ -373,9 +374,9 @@ export class TimerManager {
 	): TimerTask {
 		if (!Number.isFinite(seconds) || seconds <= 0 || !Number.isSafeInteger(Math.round(seconds) * 1000) ||
 			Math.round(seconds) * 1000 > 8_640_000_000_000_000 - Date.now()) {
-			throw new Error("定时时长无效或超出支持范围");
+			throw new Error("The delay is invalid or out of the supported range");
 		}
-		if (!prompt.trim()) throw new Error("提示词不能为空");
+		if (!prompt.trim()) throw new Error("The prompt must not be empty");
 		if (ctx) this.attach(ctx);
 
 		const id = `t-${this.nextId++}`;
@@ -417,7 +418,7 @@ export class TimerManager {
 		// 3. 提示通知
 		const targetTimeStr = formatDateTime(targetTime);
 		this.notify(
-			`⏱️ 定时任务 [#${id}] 已创建，将在 ${targetTimeStr} (${formatDuration(delaySeconds)}后) 发送提示词启动 Agent。`,
+			`⏱️ Scheduled task [#${id}] created. The prompt will be sent in ${formatDuration(delaySeconds)} at ${targetTimeStr} to start the agent.`,
 			"info",
 		);
 
@@ -473,7 +474,7 @@ export class TimerManager {
 		this.updateWidget();
 
 		if (cancelledIds.length > 0) {
-			this.notify(`🚫 已取消定时任务: ${cancelledIds.map((tid) => `#${tid}`).join(", ")}`, "info");
+			this.notify(`🚫 Cancelled scheduled task(s): ${cancelledIds.map((tid) => `#${tid}`).join(", ")}`, "info");
 		}
 
 		return { cancelled: cancelledIds, count: cancelledIds.length };
@@ -519,7 +520,7 @@ export class TimerManager {
 		}
 
 		// 3. 发送提示通知
-		this.notify(`🚀 定时任务 [#${task.id}] 倒计时已到达，已发送消息启动任务！`, "info");
+		this.notify(`🚀 Scheduled task [#${task.id}] reached its deadline; the message was sent to start the task.`, "info");
 
 		// 4. 更新/清除 Widget
 		this.updateWidget();
@@ -565,11 +566,11 @@ export class TimerManager {
 		const previewPrompt =
 			soonest.prompt.length > 28 ? `${soonest.prompt.slice(0, 28)}...` : soonest.prompt;
 
-		const moreInfo = pending.length > 1 ? ` (+${pending.length - 1} 更多待执行)` : "";
+		const moreInfo = pending.length > 1 ? ` (+${pending.length - 1} more waiting)` : "";
 		const urgent = remainingSeconds <= 10;
 		const icon = urgent ? "🔥" : "⏳";
 
-		const line = `${icon} [定时任务倒计时] [#${soonest.id}] ${clockStr} 后触发${moreInfo} | 提示词: "${previewPrompt}" | 取消: /timer cancel ${soonest.id}`;
+		const line = `${icon} [timer] [#${soonest.id}] fires in ${clockStr}${moreInfo} | prompt: "${previewPrompt}" | cancel: /timer cancel ${soonest.id}`;
 
 		try {
 			if (this.context?.ui?.setWidget) {
@@ -616,18 +617,18 @@ export class TimerStatusModalComponent implements Component {
 	private readonly modal: StatusModalComponent;
 
 	constructor(tui: any, theme: any, manager: TimerManager, onClose: () => void) {
-		this.modal = new StatusModalComponent(tui, theme, "⏱️ 定时任务管理器 (Scheduled Tasks)", () => {
+		this.modal = new StatusModalComponent(tui, theme, "⏱️ Scheduled Tasks", () => {
 			const pending = manager.getPendingTasks();
 			const all = manager.getAllTasks();
 			return [
-				`活跃中: ${pending.length} 个 | 已触发: ${all.filter(t => t.status === "completed").length} 个 | 已取消: ${all.filter(t => t.status === "cancelled").length} 个`,
+				`active: ${pending.length} | fired: ${all.filter(t => t.status === "completed").length} | cancelled: ${all.filter(t => t.status === "cancelled").length}`,
 				...(pending.length ? pending.flatMap(task => [
-					`[#${task.id}] 倒计时 ${formatClockTime(Math.max(0, Math.ceil((task.targetTime - Date.now()) / 1000)))} (预定 ${formatDateTime(task.targetTime)})`,
-					`交付模式: ${task.deliverAs} | 提示词: ${task.prompt}`,
-				]) : ["(当前暂无等待执行的定时任务)"]),
+					`[#${task.id}] fires in ${formatClockTime(Math.max(0, Math.ceil((task.targetTime - Date.now()) / 1000)))} (due ${formatDateTime(task.targetTime)})`,
+					`delivery: ${task.deliverAs} | prompt: ${task.prompt}`,
+				]) : ["(no scheduled task is waiting)"]),
 				"",
-				"创建: /timer [秒] [分] [时] <提示词>",
-				"取消: /timer cancel <id> 或 /timer cancel all",
+				"create: /timer [seconds] [minutes] [hours] <prompt>",
+				"cancel: /timer cancel <id> or /timer cancel all",
 			];
 		}, onClose, { maxWidth: 76, maxHeight: 16, center: true });
 	}
@@ -646,11 +647,11 @@ export function openTimerStatusModal(ctx: ExtensionContext, manager: TimerManage
 	if (!ctx.hasUI || ctx.mode === "rpc" || !ctx.ui?.custom) {
 		const pending = manager.getPendingTasks();
 		const info = [
-			`[定时任务状态]`,
-			`等待中任务数: ${pending.length}`,
+			`Scheduled task status`,
+			`Waiting tasks: ${pending.length}`,
 			...pending.map(
 				(t) =>
-					`#${t.id} - 剩余 ${formatClockTime(Math.max(0, Math.ceil((t.targetTime - Date.now()) / 1000)))} - 提示词: ${t.prompt}`,
+					`#${t.id} - ${formatClockTime(Math.max(0, Math.ceil((t.targetTime - Date.now()) / 1000)))} left - prompt: ${t.prompt}`,
 			),
 		].join("\n");
 		manager.notify(info, "info");
@@ -695,22 +696,22 @@ export function registerTimerEntryRenderer(pi: ExtensionAPI): void {
 
 			if (data.action === "created") {
 				box.addChild(
-					new Text(safeFg(theme, "accent", `⏱️ 定时任务已创建 [#${data.taskId}]`), 0, 0),
+					new Text(safeFg(theme, "accent", `⏱️ Scheduled task created [#${data.taskId}]`), 0, 0),
 				);
 				box.addChild(
 					new Text(
-						`${safeFg(theme, "muted", "目标触发时间: ")}${targetTimeStr} (${durationStr}后)`,
+						`${safeFg(theme, "muted", "Due at: ")}${targetTimeStr} (in ${durationStr})`,
 						0,
 						0,
 					),
 				);
-				box.addChild(new Text(`${safeFg(theme, "accent", "提示词: ")}${data.prompt}`, 0, 0));
+				box.addChild(new Text(`${safeFg(theme, "accent", "Prompt: ")}${data.prompt}`, 0, 0));
 				box.addChild(
 					new Text(
 						safeFg(
 							theme,
 							"dim",
-							"倒计时由输入框上方实时显示，到达后将自动发送并启动 Agent 任务",
+							"The countdown updates above the input box; when it reaches zero the prompt is sent and the task starts",
 						),
 						0,
 						0,
@@ -719,34 +720,34 @@ export function registerTimerEntryRenderer(pi: ExtensionAPI): void {
 			} else if (data.action === "triggered") {
 				const triggerTimeStr = formatDateTime(data.triggeredAt || Date.now());
 				box.addChild(
-					new Text(safeFg(theme, "success", `🚀 定时任务已触发 [#${data.taskId}]`), 0, 0),
+					new Text(safeFg(theme, "success", `🚀 Scheduled task fired [#${data.taskId}]`), 0, 0),
 				);
 				box.addChild(
-					new Text(`${safeFg(theme, "muted", "触发时间: ")}${triggerTimeStr}`, 0, 0),
+					new Text(`${safeFg(theme, "muted", "Fired at: ")}${triggerTimeStr}`, 0, 0),
 				);
 				box.addChild(
 					new Text(
-						safeFg(theme, "success", "已向 Agent 发送提示词，正在启动 Agent 任务..."),
+						safeFg(theme, "success", "The prompt was sent to the agent; starting the task..."),
 						0,
 						0,
 					),
 				);
-				box.addChild(new Text(`${safeFg(theme, "accent", "提示词: ")}${data.prompt}`, 0, 0));
+				box.addChild(new Text(`${safeFg(theme, "accent", "Prompt: ")}${data.prompt}`, 0, 0));
 			} else if (data.action === "cancelled") {
 				const cancelTimeStr = formatDateTime(data.cancelledAt || Date.now());
 				box.addChild(
-					new Text(safeFg(theme, "warning", `🚫 定时任务已取消 [#${data.taskId}]`), 0, 0),
+					new Text(safeFg(theme, "warning", `🚫 Scheduled task cancelled [#${data.taskId}]`), 0, 0),
 				);
 				box.addChild(
-					new Text(`${safeFg(theme, "muted", "取消时间: ")}${cancelTimeStr}`, 0, 0),
+					new Text(`${safeFg(theme, "muted", "Cancelled at: ")}${cancelTimeStr}`, 0, 0),
 				);
 				box.addChild(
-					new Text(`${safeFg(theme, "dim", "原定提示词: ")}${data.prompt}`, 0, 0),
+					new Text(`${safeFg(theme, "dim", "Original prompt: ")}${data.prompt}`, 0, 0),
 				);
 			}
 
 			if (expanded) {
-				const meta = `Task ID: ${data.taskId} | 设定延迟: ${data.delaySeconds}秒 | 记录时间: ${new Date(data.targetTime - data.delaySeconds * 1000).toLocaleString()}`;
+				const meta = `Task ID: ${data.taskId} | delay: ${data.delaySeconds}s | recorded: ${new Date(data.targetTime - data.delaySeconds * 1000).toLocaleString()}`;
 				box.addChild(new Text(safeFg(theme, "dim", meta), 0, 0));
 			}
 
@@ -771,15 +772,15 @@ export async function handleTimerCommand(
 	if (!raw) {
 		if (ctx.hasUI && ctx.ui?.input) {
 			const timeStr = await ctx.ui.input(
-				"请输入定时时间 (如 '30 0 0 秒分时'、'5m'、'00:05:00'):",
+				"Enter the delay (for example '30 0 0' for seconds minutes hours, '5m' or '00:05:00'):",
 			);
 			if (!timeStr || !timeStr.trim()) {
-				ctx.ui.notify("已取消创建定时任务", "info");
+				ctx.ui.notify("Scheduled task creation cancelled", "info");
 				return;
 			}
-			const promptStr = await ctx.ui.input("请输入到达时间后发送给 Agent 的提示词:");
+			const promptStr = await ctx.ui.input("Enter the prompt to send to the agent when the timer fires:");
 			if (!promptStr || !promptStr.trim()) {
-				ctx.ui.notify("已取消创建定时任务（未提供提示词）", "info");
+				ctx.ui.notify("Scheduled task creation cancelled (no prompt given)", "info");
 				return;
 			}
 			const parsed = parseTimerArgs(timeStr.trim());
@@ -792,7 +793,7 @@ export async function handleTimerCommand(
 		}
 
 		ctx.ui.notify(
-			"用法: /timer [秒] [分] [时] <提示词>\n或: /timer <时间单位: 5m|30s|1h30m> <提示词>\n子命令: /timer status | list | cancel [id|all]",
+			"Usage: /timer [seconds] [minutes] [hours] <prompt>\nor: /timer <duration: 5m|30s|1h30m> <prompt>\nsubcommands: /timer status | list | cancel [id|all]",
 			"info",
 		);
 		return;
@@ -818,7 +819,7 @@ export async function handleTimerCommand(
 		const pending = manager.getPendingTasks();
 
 		if (pending.length === 0) {
-			ctx.ui.notify("当前没有等待执行的定时任务", "info");
+			ctx.ui.notify("No scheduled task is waiting", "info");
 			return;
 		}
 
@@ -831,7 +832,7 @@ export async function handleTimerCommand(
 			const targetId = rest.startsWith("#") ? rest.slice(1) : rest;
 			const task = manager.getTask(targetId);
 			if (!task || task.status !== "pending") {
-				ctx.ui.notify(`未找到处于等待状态的任务: ${rest}`, "warning");
+				ctx.ui.notify(`No waiting task matched: ${rest}`, "warning");
 				return;
 			}
 			manager.cancelTask(targetId);
@@ -848,16 +849,16 @@ export async function handleTimerCommand(
 		if (ctx.hasUI && ctx.ui?.select) {
 			const options = pending.map((t) => {
 				const rem = Math.max(0, Math.ceil((t.targetTime - Date.now()) / 1000));
-				return `#${t.id}: 倒计时 ${formatClockTime(rem)} - "${t.prompt.slice(0, 24)}"`;
+				return `#${t.id}: ${formatClockTime(rem)} left - "${t.prompt.slice(0, 24)}"`;
 			});
-			options.push("全部取消 (Cancel All)");
+			options.push("Cancel all");
 
-			const selected = await ctx.ui.select("请选择要取消的定时任务:", options);
+			const selected = await ctx.ui.select("Select the scheduled task to cancel:", options);
 			if (!selected) {
-				ctx.ui.notify("已取消操作", "info");
+				ctx.ui.notify("Operation cancelled", "info");
 				return;
 			}
-			if (selected === "全部取消 (Cancel All)") {
+			if (selected === "Cancel all") {
 				manager.cancelTask("all");
 				return;
 			}
@@ -868,7 +869,7 @@ export async function handleTimerCommand(
 			return;
 		}
 
-		ctx.ui.notify("请指定要取消的任务 ID，例如: /timer cancel t-1 或 /timer cancel all", "warning");
+		ctx.ui.notify("Specify the task ID to cancel, for example /timer cancel t-1 or /timer cancel all", "warning");
 		return;
 	}
 
@@ -876,13 +877,13 @@ export async function handleTimerCommand(
 	if (firstToken === "help") {
 		ctx.ui.notify(
 			[
-				"⏱️ 定时任务扩展使用指南:",
-				"1. 按「秒 分 时」设置: /timer 30 2 0 帮我检查代码 (2分30秒后触发)",
-				"2. 按自然时间设置: /timer 5m 帮我重构代码 或 /timer 30s 提醒我",
-				"3. 按时钟冒号设置: /timer 00:05:00 帮我执行测试",
-				"4. 查看状态弹窗: /timer status",
-				"5. 查看待执行列表: /timer list",
-				"6. 取消定时任务: /timer cancel [id|all]",
+				"⏱️ Timer extension guide:",
+				"1. By seconds minutes hours: /timer 30 2 0 check my code (fires 2m30s later)",
+				"2. By duration: /timer 5m refactor my code, or /timer 30s remind me",
+				"3. By clock notation: /timer 00:05:00 run my tests",
+				"4. Open the status modal: /timer status",
+				"5. List waiting tasks: /timer list",
+				"6. Cancel tasks: /timer cancel [id|all]",
 			].join("\n"),
 			"info",
 		);
@@ -899,14 +900,14 @@ export async function handleTimerCommand(
 	let prompt = parsed.data.prompt;
 	if (!prompt) {
 		if (ctx.hasUI && ctx.ui?.input) {
-			const promptStr = await ctx.ui.input("请输入到达时间后发送给 Agent 的提示词:");
+			const promptStr = await ctx.ui.input("Enter the prompt to send to the agent when the timer fires:");
 			if (!promptStr || !promptStr.trim()) {
-				ctx.ui.notify("已取消创建定时任务（未提供提示词）", "info");
+				ctx.ui.notify("Scheduled task creation cancelled (no prompt given)", "info");
 				return;
 			}
 			prompt = promptStr.trim();
 		} else {
-			ctx.ui.notify("缺少提示词。请在时间后附带要发送给 Agent 的任务内容。", "warning");
+			ctx.ui.notify("The prompt is missing. Add the task text to send to the agent after the delay.", "warning");
 			return;
 		}
 	}
@@ -919,16 +920,16 @@ export async function handleTimerCommand(
 // ==========================================
 
 const TIMER_SUBCOMMANDS: AutocompleteItem[] = [
-	{ value: "status", label: "status", description: "查看定时任务状态与历史模态窗" },
-	{ value: "list", label: "list", description: "列出当前所有等待执行的定时任务" },
-	{ value: "cancel", label: "cancel", description: "取消指定的定时任务 (支持 cancel all 或 ID)" },
-	{ value: "help", label: "help", description: "查看定时时间表达式与使用指南" },
-	{ value: "5m ", label: "5m", description: "预设：5 分钟后发送提示词" },
-	{ value: "30s ", label: "30s", description: "预设：30 秒后发送提示词" },
-	{ value: "10m ", label: "10m", description: "预设：10 分钟后发送提示词" },
-	{ value: "30m ", label: "30m", description: "预设：30 分钟后发送提示词" },
-	{ value: "1h ", label: "1h", description: "预设：1 小时后发送提示词" },
-	{ value: "30 0 0 ", label: "30 0 0", description: "预设：30秒后 (秒 分 时)" },
+	{ value: "status", label: "status", description: "Show the scheduled task status and history modal" },
+	{ value: "list", label: "list", description: "List every scheduled task that is waiting" },
+	{ value: "cancel", label: "cancel", description: "Cancel a scheduled task (cancel all or an ID)" },
+	{ value: "help", label: "help", description: "Show the time expression syntax and usage guide" },
+	{ value: "5m ", label: "5m", description: "Preset: send the prompt in 5 minutes" },
+	{ value: "30s ", label: "30s", description: "Preset: send the prompt in 30 seconds" },
+	{ value: "10m ", label: "10m", description: "Preset: send the prompt in 10 minutes" },
+	{ value: "30m ", label: "30m", description: "Preset: send the prompt in 30 minutes" },
+	{ value: "1h ", label: "1h", description: "Preset: send the prompt in 1 hour" },
+	{ value: "30 0 0 ", label: "30 0 0", description: "Preset: 30 seconds (seconds minutes hours)" },
 ];
 
 export function getTimerArgumentCompletions(
@@ -940,7 +941,7 @@ export function getTimerArgumentCompletions(
 	if (prefix.startsWith("cancel")) {
 		const sub = prefix.slice(6).trimStart().toLowerCase();
 		const options: AutocompleteItem[] = [
-			{ value: "cancel all", label: "all", description: "取消所有等待执行的定时任务" },
+			{ value: "cancel all", label: "all", description: "Cancel every waiting scheduled task" },
 		];
 
 		if (manager) {
@@ -950,7 +951,7 @@ export function getTimerArgumentCompletions(
 				options.push({
 					value: `cancel ${t.id}`,
 					label: t.id,
-					description: `取消任务 #${t.id} (剩余 ${formatClockTime(rem)}): "${t.prompt.slice(0, 20)}"`,
+					description: `Cancel task #${t.id} (${formatClockTime(rem)} left): "${t.prompt.slice(0, 20)}"`,
 				});
 			}
 		}
@@ -969,6 +970,7 @@ export function getTimerArgumentCompletions(
 }
 
 export default function timerExtension(pi: ExtensionAPI): void {
+	deferTools(pi, ["timer_schedule", "timer_cancel", "timer_list"]);
 	const manager = new TimerManager(pi);
 
 	// 注册正文渲染器
@@ -976,7 +978,7 @@ export default function timerExtension(pi: ExtensionAPI): void {
 
 	// 注册主命令 /timer
 	pi.registerCommand("timer", {
-		description: "设置定时发送消息启动 Agent 任务，如 /timer 30 2 0 提示词 或 /timer 5m 提示词",
+		description: "Schedule a message that starts an agent task later, for example /timer 30 2 0 <prompt> or /timer 5m <prompt>",
 		getArgumentCompletions: (prefix) => getTimerArgumentCompletions(prefix, manager),
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			await handleTimerCommand(args, ctx, manager);
@@ -985,7 +987,7 @@ export default function timerExtension(pi: ExtensionAPI): void {
 
 	// 注册别名命令 /schedule
 	pi.registerCommand("schedule", {
-		description: "设置定时任务别名 (/timer 的同义命令)",
+		description: "Alias for scheduling tasks (same as /timer)",
 		getArgumentCompletions: (prefix) => getTimerArgumentCompletions(prefix, manager),
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			await handleTimerCommand(args, ctx, manager);
@@ -997,8 +999,9 @@ export default function timerExtension(pi: ExtensionAPI): void {
 		name: "timer_schedule",
 		label: "Timer Schedule",
 		description:
-			"创建定时发送消息的计划任务。默认 deliverAs: steer（steering），Agent 忙时在下一个可处理边界插入；如需等待当前任务结束、不打断执行，可选择 deliverAs: followUp。空闲时均立即启动新一轮。",
+			"Schedule a prompt to be sent later as a new turn. deliverAs defaults to steer, which inserts the message at the next processable boundary while the agent is busy; followUp waits until the current task finishes instead of interrupting it. Either mode starts a new turn when the agent is idle.",
 		parameters: TimerScheduleSchema,
+		exposure: "deferred",
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
 			manager.attach(ctx);
 			const typedParams = params as TimerScheduleParams;
@@ -1011,7 +1014,7 @@ export default function timerExtension(pi: ExtensionAPI): void {
 				const parsed = parseTimerArgs(typedParams.timeExpression);
 				if (!parsed.success) {
 					return {
-						content: [{ type: "text" as const, text: `时间表达式解析失败: ${parsed.error}` }],
+						content: [{ type: "text" as const, text: `Could not parse the time expression: ${parsed.error}` }],
 						isError: true,
 						details: { error: parsed.error },
 					};
@@ -1023,12 +1026,12 @@ export default function timerExtension(pi: ExtensionAPI): void {
 				const m = typedParams.minutes ?? 0;
 				const h = typedParams.hours ?? 0;
 				totalSeconds = s + m * 60 + h * 3600;
-				rawTime = `${s}秒 ${m}分 ${h}时`;
+				rawTime = `${s}s ${m}m ${h}h`;
 			}
 
 			if (totalSeconds <= 0) {
 				return {
-					content: [{ type: "text" as const, text: "定时时间必须大于 0 秒" }],
+					content: [{ type: "text" as const, text: "The delay must be greater than 0 seconds." }],
 					isError: true,
 					details: { error: "Invalid duration" },
 				};
@@ -1039,7 +1042,7 @@ export default function timerExtension(pi: ExtensionAPI): void {
 				content: [
 					{
 						type: "text" as const,
-						text: `定时任务已成功创建 [#${task.id}]。将在 ${formatDateTime(task.targetTime)} (${formatDuration(task.delaySeconds)}后) 以 ${task.deliverAs} 模式发送提示词启动 Agent。`,
+						text: `Timer task created [#${task.id}]. The prompt will be sent in ${formatDuration(task.delaySeconds)} at ${formatDateTime(task.targetTime)}, using ${task.deliverAs} mode.`,
 					},
 				],
 				details: {
@@ -1056,8 +1059,9 @@ export default function timerExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "timer_cancel",
 		label: "Timer Cancel",
-		description: "取消已创建但尚未触发的定时任务",
+		description: "Cancel a scheduled task that has not fired yet.",
 		parameters: TimerCancelSchema,
+		exposure: "deferred",
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
 			manager.attach(ctx);
 			const typedParams = params as TimerCancelParams;
@@ -1069,8 +1073,8 @@ export default function timerExtension(pi: ExtensionAPI): void {
 						type: "text" as const,
 						text:
 							result.count > 0
-								? `已取消 ${result.count} 个定时任务: ${result.cancelled.map((id) => `#${id}`).join(", ")}`
-								: "没有找到匹配的可取消定时任务",
+								? `Cancelled ${result.count} scheduled task(s): ${result.cancelled.map((id) => `#${id}`).join(", ")}`
+								: "No matching scheduled task could be cancelled",
 					},
 				],
 				details: result,
@@ -1081,8 +1085,9 @@ export default function timerExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "timer_list",
 		label: "Timer List",
-		description: "列出当前所有正在等待执行的定时任务",
+		description: "List every scheduled task that is still waiting to fire.",
 		parameters: TimerListSchema,
+		exposure: "deferred",
 		execute: async (_toolCallId, _params, _signal, _onUpdate, ctx) => {
 			manager.attach(ctx);
 			const pending = manager.getPendingTasks();
@@ -1092,14 +1097,15 @@ export default function timerExtension(pi: ExtensionAPI): void {
 						type: "text" as const,
 						text:
 							pending.length > 0
-								? `当前共有 ${pending.length} 个定时任务等待执行:\n` +
+								? `${pending.length} scheduled task(s) waiting:
+` +
 									pending
 										.map(
 											(t) =>
-												`- [#${t.id}] [${t.deliverAs}] 剩余 ${formatClockTime(Math.max(0, Math.ceil((t.targetTime - Date.now()) / 1000)))}: "${t.prompt}"`,
+												`- [#${t.id}] [${t.deliverAs}] ${formatClockTime(Math.max(0, Math.ceil((t.targetTime - Date.now()) / 1000)))} left: "${t.prompt}"`,
 										)
 										.join("\n")
-								: "当前没有等待执行的定时任务",
+								: "No scheduled task is waiting",
 					},
 				],
 				details: {

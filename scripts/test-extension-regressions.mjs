@@ -301,7 +301,7 @@ try {
 		assert.ok(waits[1].delay > 0 && waits[1].delay <= 2_147_483_647);
 		now = task.targetTime; waits[1].fn();
 		assert.deepEqual(sentTimers, ["execute in 30 days"]);
-		for (const duration of [NaN, Infinity, -1, Number.MAX_VALUE]) assert.throws(() => manager.createTask(duration, "bad"), /无效/);
+		for (const duration of [NaN, Infinity, -1, Number.MAX_VALUE]) assert.throws(() => manager.createTask(duration, "bad"), /invalid/);
 	} finally { manager.dispose(); Date.now = realNow; globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout; }
 	assert.equal(normalizeDisplayPath("~/reference.png", root), join(homedir(), "reference.png").replace(/\\/g, "/"));
 	assert.equal(normalizeDisplayPath("@~/reference.png", root), join(homedir(), "reference.png").replace(/\\/g, "/"));

@@ -111,21 +111,21 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
 function gatewayKey(value: string): string {
 	const url = new URL(value);
 	if (!["http:", "https:"].includes(url.protocol) || url.search || url.hash) {
-		throw new Error("gatewayUrl 必须是无查询参数及 fragment 的 HTTP(S) 地址");
+		throw new Error("gatewayUrl must be an HTTP(S) URL without query parameters or fragment");
 	}
 	return url.toString().replace(/\/+$/, "");
 }
 function parseConfig(raw: unknown): VoiceConfig {
-	if (!isObject(raw)) throw new Error("语音配置必须是 JSON object");
+	if (!isObject(raw)) throw new Error("Voice configuration must be a JSON object");
 	const config = { ...DEFAULT_CONFIG, ...raw };
 	if (typeof config.gatewayUrl !== "string" || typeof config.defaultEnabled !== "boolean" ||
 		typeof config.defaultVoiceId !== "string" || !config.defaultVoiceId.trim() ||
 		typeof config.speed !== "number" || !Number.isFinite(config.speed) || config.speed < 0.5 || config.speed > 2 ||
 		!["editor", "submit"].includes(String(config.deliveryMode))) {
-		throw new Error("无效的语音配置字段");
+		throw new Error("Invalid voice configuration field");
 	}
 	const cache = config.voicesCacheByGateway;
-	if (!isObject(cache)) throw new Error("voicesCacheByGateway 必须是 object");
+	if (!isObject(cache)) throw new Error("voicesCacheByGateway must be an object");
 	const entries = Object.entries(cache).map(([key, value]) => [gatewayKey(key), value === null ? null : parseVoices(value)]);
 	return { ...config, gatewayUrl: gatewayKey(config.gatewayUrl), voicesCacheByGateway: Object.fromEntries(entries) } as VoiceConfig;
 }
@@ -170,7 +170,7 @@ export class VoiceConfigManager implements VoiceConfigStore {
 				}
 				return structuredClone(DEFAULT_CONFIG);
 			}
-			throw new Error(`读取 ${this.configPath} 失败: ${errorText(error)}`);
+			throw new Error(`Could not read ${this.configPath}: ${errorText(error)}`);
 		}
 	}
 	public async update(updater: (current: VoiceConfig) => VoiceConfig, signal?: AbortSignal): Promise<VoiceConfig> {
@@ -186,7 +186,7 @@ export class VoiceConfigManager implements VoiceConfigStore {
 				break;
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-				if (Date.now() >= deadline) throw new Error(`语音配置锁超时: ${this.lockPath}；未写入。若进程异常退出，请确认无写入进程后移除遗留锁。`);
+				if (Date.now() >= deadline) throw new Error(`Voice configuration lock timed out: ${this.lockPath}; nothing was written. If a process crashed, confirm no writer remains and remove the stale lock file.`);
 				await delay(Math.min(25, Math.max(1, deadline - Date.now())), signal);
 			}
 		}
@@ -225,7 +225,7 @@ export interface VoiceGateway {
 	recordAndTranscribe(options: { maxDurationSec: number; silenceTimeoutMs?: number; signal: AbortSignal }): Promise<RecordingResult>;
 	speak(text: string, options: { voiceId: string; instruct?: string; speed: number; signal: AbortSignal }): Promise<void>;
 }
-export const UNSUPPORTED_SPEAKER = "当前 TtsGateway 不提供任务级取消和扬声器物理播放完成确认；已拒绝发音，不发送全局停播。需要后端协议升级。";
+export const UNSUPPORTED_SPEAKER = "The current TtsGateway provides no per-task cancellation and no confirmation that a speaker finished playing; speaking was refused and no global stop was sent. A backend protocol upgrade is required.";
 
 export class TtsGatewayAdapter implements VoiceGateway {
 	private readonly baseUrl: string;
@@ -241,7 +241,7 @@ export class TtsGatewayAdapter implements VoiceGateway {
 			...(payload === undefined ? {} : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }),
 			signal,
 		});
-		if (!res.ok) throw new Error(`网关 HTTP ${res.status}`);
+		if (!res.ok) throw new Error(`Gateway HTTP ${res.status}`);
 		return res.json();
 	}
 	public async probe(signal: AbortSignal): Promise<{ online: boolean }> {
@@ -258,7 +258,7 @@ export class TtsGatewayAdapter implements VoiceGateway {
 		});
 		if (!isObject(data) || data.code !== 0 || typeof data.text !== "string" ||
 			(data.duration_ms !== undefined && (typeof data.duration_ms !== "number" || !Number.isFinite(data.duration_ms) || data.duration_ms < 0))) {
-			throw new Error(isObject(data) && typeof data.error === "string" ? data.error : "无效或失败的录音转写响应");
+			throw new Error(isObject(data) && typeof data.error === "string" ? data.error : "Invalid or failed transcription response");
 		}
 		return { text: data.text.trim(), durationMs: typeof data.duration_ms === "number" ? data.duration_ms : 0 };
 	}
@@ -268,7 +268,7 @@ export class TtsGatewayAdapter implements VoiceGateway {
 		checkSignal(options.signal);
 		const native = voice.engine === "voice-library";
 		if (native && (text.trim().length > 80 || options.speed !== 1 || options.instruct?.trim())) {
-			throw new Error("原配方音色每次最多80字，仅支持 speed=1 且不支持 instruct；不会静默修改参数或改用其它引擎");
+			throw new Error("This recipe voice accepts at most 80 characters per call, supports only speed=1 and does not support instruct; parameters are never adjusted silently and no other engine is substituted");
 		}
 		const payload: Record<string, unknown> = {
 			text,
@@ -295,7 +295,7 @@ export class TtsGatewayAdapter implements VoiceGateway {
 		try {
 			const data = await this.json("/api/tts/synthesize", options.signal, payload);
 			if (!isObject(data) || data.status !== "completed" || data.error || (data.code !== undefined && data.code !== 0)) {
-				const errMsg = isObject(data) && typeof data.error === "string" ? data.error : (isObject(data) && typeof data.status === "string" ? data.status : "合成播音失败");
+				const errMsg = isObject(data) && typeof data.error === "string" ? data.error : (isObject(data) && typeof data.status === "string" ? data.status : "Speech synthesis failed");
 				throw new Error(errMsg);
 			}
 		} finally {
@@ -333,20 +333,20 @@ export class VoiceStatusModalComponent implements Component {
 	private readonly modal: StatusModalComponent;
 
 	constructor(tui: any, theme: any, info: VoiceStatusModalInfo, onClose: () => void) {
-		const mode = info.deliveryMode === "editor" ? "editor (追加至草稿待确认)" : "submit (直接提交/排队)";
+		const mode = info.deliveryMode === "editor" ? "editor (appended to the draft for confirmation)" : "submit (submitted directly or queued)";
 		this.modal = new StatusModalComponent(tui, theme, "Pi Voice Extension Status", [
-			`• 扩展总开关   : ${info.enabled ? "ENABLED (ON)" : "DISABLED (OFF)"}`,
-			`• 新会话默认   : ${info.defaultEnabled ? "ON（不自动开启 Live）" : "OFF"}`,
-			`• 持续语音输入 : ${info.live ? "RUNNING (🔴 LIVE ON)" : "STOPPED (⏸ OFF)"}`,
-			`• 当前主动活动 : ${info.activeTool ? `BUSY (${info.activeTool})` : "IDLE"}`,
-			`• 识别投递模式 : ${mode}`,
-			`• 后台网关地址 : ${info.gatewayUrl}`,
-			`• 默认发音音色 : ${info.defaultVoiceId} (${info.speed}x 语速)`,
-			`• 扬声发音服务 : ${info.speakerSupported ? "按目录引擎路由（未探测连接）" : "INCOMPATIBLE (已保护阻断)"}`,
-			"• 发音风险     : 全局抢占/停播，未确认物理播放完成（VOICE-001）",
-			"• 参数命令     : /voice voice | speed | gateway | default | mode",
-			"• 完整帮助     : /voice help",
-			"• 全局快捷键   : F2 (持续输入切换) | Alt+X (紧急停播/停录)",
+			`• Extension switch: ${info.enabled ? "ENABLED (ON)" : "DISABLED (OFF)"}`,
+			`• New session default: ${info.defaultEnabled ? "ON (Live is not started automatically)" : "OFF"}`,
+			`• Continuous input: ${info.live ? "RUNNING (🔴 LIVE ON)" : "STOPPED (⏸ OFF)"}`,
+			`• Active task: ${info.activeTool ? `BUSY (${info.activeTool})` : "IDLE"}`,
+			`• Transcript delivery: ${mode}`,
+			`• Gateway URL: ${info.gatewayUrl}`,
+			`• Default voice: ${info.defaultVoiceId} (${info.speed}x speed)`,
+			`• Speaker service: ${info.speakerSupported ? "routed by catalog engine (not probed)" : "INCOMPATIBLE (blocked for safety)"}`,
+			"• Playback risk: global preemption and stop; physical playback completion is not confirmed (VOICE-001)",
+			"• Parameter commands: /voice voice | speed | gateway | default | mode",
+			"• Full help: /voice help",
+			"• Global shortcuts: F2 (toggle continuous input) | Alt+X (emergency stop)",
 		], onClose, { maxWidth: 74, maxHeight: 20, center: true });
 	}
 
@@ -455,7 +455,7 @@ export class VoiceRuntime {
 		run?.controller.abort();
 	}
 	public setLive(enabled: boolean): void {
-		if (enabled && !this.enabled) throw new Error("请先执行 /voice on");
+		if (enabled && !this.enabled) throw new Error("Run /voice on first");
 		this.live = enabled;
 		if (!enabled) {
 			// 关闭 Live 时：不粗暴 abort 当前正在录音或正在转写的请求，允许当前正在说的这句顺利完成并出字！
@@ -551,7 +551,7 @@ export class VoiceRuntime {
 		const reason = errorText(error);
 		return { reason: reason === "busy" || reason === "disabled" ? reason : "gateway_error",
 			message: reason === "busy" ? "Audio channel busy: another audio tool is active." :
-				reason === "disabled" ? "语音扩展已关闭；用户可执行 /voice on" : reason };
+				reason === "disabled" ? "The voice extension is off; the user can run /voice on" : reason };
 	}
 	/** Best-effort questionnaire reminder. Never blocks the dialog or opens a microphone. */
 	public promptQuestion(prompt: QuestionVoicePrompt): void {
@@ -563,19 +563,19 @@ export class VoiceRuntime {
 			if (!this.enabled || epoch !== this.generationEpoch || prompt.signal.aborted) return;
 			const result = await this.speak({ text: prompt.text }, prompt.signal);
 			if (result.status === "error" && this.enabled && epoch === this.generationEpoch && !prompt.signal.aborted) {
-				this.showToast(`问题语音提醒未播放：${result.message}`);
+				this.showToast(`The spoken question reminder was not played: ${result.message}`);
 			}
 		}).catch(() => { /* A reminder failure must not affect question/answer delivery. */ });
 	}
 	public async speak(params: VoiceSpeakParams, signal?: AbortSignal): Promise<VoiceSpeakResult> {
 		let task: AudioTask;
 		try { task = this.begin("speak", signal); }
-		catch (error) { return signal?.aborted ? { status: "cancelled", message: "发音已被取消" } : { status: "error", ...this.failure(error) }; }
+		catch (error) { return signal?.aborted ? { status: "cancelled", message: "Speech was cancelled" } : { status: "error", ...this.failure(error) }; }
 		const unlink = this.linkSignal(task, signal);
 		let expired = false;
 		const timer = setTimeout(() => { expired = true; task.controller.abort(); }, 120000);
 		try {
-			if (!params.text.trim()) throw new Error("发音文本不能为空");
+			if (!params.text.trim()) throw new Error("Speech text must not be empty");
 			await abortable(task.gateway.speak(params.text, {
 				voiceId: params.voice_id ?? task.config.defaultVoiceId, instruct: params.instruct,
 				speed: params.speed ?? task.config.speed, signal: task.controller.signal,
@@ -583,12 +583,12 @@ export class VoiceRuntime {
 			if (!this.isCurrent(task)) throw abortError();
 			await delay(150, task.controller.signal);
 			if (!this.isCurrent(task)) throw abortError();
-			return { status: "success", message: "音频已提交网关；尚未确认扬声器物理播放完成（VOICE-001）" };
+			return { status: "success", message: "Audio was submitted to the gateway; speaker playback completion is not confirmed (VOICE-001)" };
 		} catch (error) {
 			if (expired && this.active === task && task.epoch === this.generationEpoch && this.enabled) {
-				return { status: "error", reason: "deadline_exceeded", message: "发音总等待超时，已取消自身任务；不要自动重试" };
+				return { status: "error", reason: "deadline_exceeded", message: "Timed out waiting for speech and cancelled this task; do not retry automatically" };
 			}
-			if (!this.isCurrent(task)) return { status: "cancelled", message: "发音已被取消" };
+			if (!this.isCurrent(task)) return { status: "cancelled", message: "Speech was cancelled" };
 			return { status: "error", reason: errorText(error) === UNSUPPORTED_SPEAKER ? "incompatible_gateway" : "gateway_error", message: errorText(error) };
 		} finally { clearTimeout(timer); unlink(); this.finish(task); }
 	}
@@ -596,7 +596,7 @@ export class VoiceRuntime {
 		let task: AudioTask;
 		try { task = this.begin("listen", signal); }
 		catch (error) {
-			if (signal?.aborted) return { status: "cancelled", text: "", message: "收音已被用户取消" };
+			if (signal?.aborted) return { status: "cancelled", text: "", message: "Recording was cancelled by the user" };
 			const failure = this.failure(error);
 			return { status: "error", text: "", message: failure.message,
 				...(failure.reason === "busy" || failure.reason === "disabled" ? { reason: failure.reason } : {}) };
@@ -605,17 +605,17 @@ export class VoiceRuntime {
 		const timeout = Math.max(3, Math.min(60, params.timeout_sec ?? 15));
 		let expired = false;
 		const timer = setTimeout(() => { expired = true; task.controller.abort(); }, timeout * 1000);
-		this.notify(`🎙️ ${params.prompt || "请说出这一次答复"}（${timeout}s 总时限）`);
+		this.notify(`🎙️ ${params.prompt || "Say your answer now"} (${timeout}s total limit)`);
 		try {
 			const result = await abortable(task.gateway.recordAndTranscribe({ maxDurationSec: timeout, signal: task.controller.signal }), task.controller.signal);
 			if (!this.isCurrent(task)) throw abortError();
-			if (!result.text.trim()) return { status: "timeout", reason: "deadline_exceeded", text: "", message: "本次未获得有效转写；无法判断是否已说话" };
+			if (!result.text.trim()) return { status: "timeout", reason: "deadline_exceeded", text: "", message: "No usable transcript was produced, so whether the user spoke cannot be determined" };
 			return { status: "success", text: result.text.trim(), duration_ms: result.durationMs };
 		} catch (error) {
 			if (expired && this.active === task && task.epoch === this.generationEpoch && this.enabled) {
-				return { status: "timeout", reason: "deadline_exceeded", text: "", message: "收音／转写总等待超时；网关未提供说话起始状态，无法判断是否已说话" };
+				return { status: "timeout", reason: "deadline_exceeded", text: "", message: "Timed out waiting for recording and transcription; the gateway reports no speech-start state, so whether the user spoke cannot be determined" };
 			}
-			if (!this.isCurrent(task)) return { status: "cancelled", text: "", message: "收音已被用户取消" };
+			if (!this.isCurrent(task)) return { status: "cancelled", text: "", message: "Recording was cancelled by the user" };
 			return { status: "error", text: "", message: errorText(error) };
 		} finally { clearTimeout(timer); unlink(); this.finish(task); }
 	}
@@ -654,7 +654,7 @@ export class VoiceRuntime {
 		} catch (error) {
 			if (this.live && run.epoch === this.generationEpoch && !run.controller.signal.aborted) {
 				this.live = false;
-				this.showToast(`Live 已停止: ${errorText(error)}`);
+				this.showToast(`Live stopped: ${errorText(error)}`);
 			}
 		} finally {
 			if (this.liveRun === run) {
@@ -666,7 +666,7 @@ export class VoiceRuntime {
 	private deliver(text: string, mode: DeliveryMode): void {
 		const ctx = this.context;
 		if (mode === "editor") {
-			if (!ctx?.hasUI) throw new Error("editor 模式需要交互终端；不会自动降级为提交");
+			if (!ctx?.hasUI) throw new Error("editor mode requires an interactive terminal and does not fall back to submit");
 			if (typeof ctx.ui.pasteToEditor === "function") {
 				const draft = ctx.ui.getEditorText();
 				const prefix = draft && !/\s$/.test(draft) ? " " : "";
@@ -677,13 +677,13 @@ export class VoiceRuntime {
 				ctx.ui.setEditorText(newText);
 			}
 			// 在输入框上方靠左底部显示已识别提示，同时触发 TUI 即时重绘刷新输入框！
-			this.showToast(`🎙️ 已识别: "${text}"`);
+			this.showToast(`🎙️ Heard: "${text}"`);
 		} else if (ctx?.isIdle()) {
 			this.pi.sendUserMessage(text);
-			this.showToast(`🎙️ 语音已提交: "${text}"`);
+			this.showToast(`🎙️ Voice submitted: "${text}"`);
 		} else {
 			this.pi.sendUserMessage(text, { deliverAs: "followUp" });
-			this.showToast(`📥 语音已排队: "${text}"`);
+			this.showToast(`📥 Voice queued: "${text}"`);
 		}
 	}
 	private directory(url: string): VoiceDirectory {
@@ -703,7 +703,7 @@ export class VoiceRuntime {
 							return { ...current, voicesCacheByGateway: { ...current.voicesCacheByGateway, [url]: voices } };
 						}, signal);
 					}
-				} catch (error) { checkSignal(signal); if (epoch !== this.generationEpoch || this.config.get().gatewayUrl !== url) throw abortError(); warning = `目录获取成功，但持久化失败: ${errorText(error)}`; }
+				} catch (error) { checkSignal(signal); if (epoch !== this.generationEpoch || this.config.get().gatewayUrl !== url) throw abortError(); warning = `Catalog fetched, but persisting it failed: ${errorText(error)}`; }
 				return { voices, warning };
 			});
 			this.directories.set(url, directory);
@@ -716,7 +716,7 @@ export class VoiceRuntime {
 			if (!this.completionGateway || this.completionGateway.expires < Date.now()) this.completionGateway = { url: this.config.get().gatewayUrl, expires: Date.now() + 5000 };
 			const snapshot = await this.directory(this.completionGateway.url).get();
 			const voices = voicePage(snapshot.voices, { query, limit: 20 }, snapshot.index).voices;
-			return voices.length ? voices.map(v => ({ value: `${command} ${v.id}`, label: `${v.name} · ${v.id}`, description: `${v.engine ?? "引擎未知"}${v.ready === false ? " · 未就绪" : ""}` })) : null;
+			return voices.length ? voices.map(v => ({ value: `${command} ${v.id}`, label: `${v.name} · ${v.id}`, description: `${v.engine ?? "unknown engine"}${v.ready === false ? " · not ready" : ""}` })) : null;
 		} catch { return null; }
 	}
 	public async listVoices(params: VoiceListVoicesParams, signal?: AbortSignal, allowDisabled = false): Promise<VoiceListVoicesResult> {
@@ -724,8 +724,8 @@ export class VoiceRuntime {
 		try { cfg = this.config.get(); voicePage([], params); }
 		catch (error) { return { success: false, default_voice_id: "", voices: [], message: errorText(error) }; }
 		const empty = { success: false, default_voice_id: cfg.defaultVoiceId, voices: [] };
-		if (!this.enabled && !allowDisabled) return { ...empty, message: "语音扩展已关闭" };
-		if (signal?.aborted) return { ...empty, message: "音色查询已取消" };
+		if (!this.enabled && !allowDisabled) return { ...empty, message: "The voice extension is off" };
+		if (signal?.aborted) return { ...empty, message: "The voice catalog query was cancelled" };
 		const epoch = this.generationEpoch;
 		const directory = this.directory(cfg.gatewayUrl);
 		const before = directory.peek();
@@ -734,9 +734,9 @@ export class VoiceRuntime {
 			if (epoch !== this.generationEpoch) throw abortError();
 			return { success: true, default_voice_id: this.config.get().defaultVoiceId, ...voicePage(snapshot.voices, params, snapshot.index), source: snapshot === before ? "memory" : "live", stale: false, checked_at: new Date(snapshot.checkedAt).toISOString(), ...(snapshot.warning ? { warning: snapshot.warning } : {}) };
 		} catch (error) {
-			if (signal?.aborted || epoch !== this.generationEpoch) return { ...empty, message: "音色查询已取消" };
+			if (signal?.aborted || epoch !== this.generationEpoch) return { ...empty, message: "The voice catalog query was cancelled" };
 			const cached = cfg.voicesCacheByGateway[cfg.gatewayUrl] ?? null;
-			return cached === null ? { ...empty, message: `无可用音色缓存: ${errorText(error)}` } : { success: true, default_voice_id: cfg.defaultVoiceId, ...voicePage(cached, params), source: "cache", stale: true, warning: `刷新失败，展示历史缓存，不能据此保存选择或确认可用: ${errorText(error)}` };
+			return cached === null ? { ...empty, message: `No usable voice cache: ${errorText(error)}` } : { success: true, default_voice_id: cfg.defaultVoiceId, ...voicePage(cached, params), source: "cache", stale: true, warning: `Refresh failed; this stale cache must not be used to save a selection or confirm availability: ${errorText(error)}` };
 		}
 	}
 	private async selectVoice(argument: string, ctx: ExtensionContext): Promise<void> {
@@ -752,7 +752,7 @@ export class VoiceRuntime {
 		else {
 			if (!ctx.hasUI || ctx.mode === "rpc" || !ctx.ui?.custom) {
 				const matches = voicePage(snapshot.voices, { query: argument, limit: 10 }, snapshot.index);
-				throw new Error(`请指定唯一音色 ID；匹配 ${matches.matched} 项: ${matches.voices.map(v => `${v.id} (${v.name})`).join(", ")}`);
+				throw new Error(`Specify a single voice ID; ${matches.matched} voices matched: ${matches.voices.map(v => `${v.id} (${v.name})`).join(", ")}`);
 			}
 			interactive = true;
 			id = await ctx.ui.custom<string | undefined>((tui, theme, _keys, done) => new VoicePickerComponent(snapshot.voices, argument, theme, () => tui.requestRender(), done, Math.min(10, Math.max(2, (tui.terminal.rows || 24) - 8))), { overlay: true, overlayOptions: { width: "90%", maxHeight: "90%" } });
@@ -760,15 +760,15 @@ export class VoiceRuntime {
 		}
 		// Recheck after an interactive wait; never trust stale/offline choices.
 		if (epoch !== this.generationEpoch) throw abortError();
-		if (this.config.get().gatewayUrl !== cfg.gatewayUrl) throw new Error("网关已变更，请重新选择音色");
+		if (this.config.get().gatewayUrl !== cfg.gatewayUrl) throw new Error("The gateway changed; choose a voice again");
 		const latest = interactive ? await this.directory(cfg.gatewayUrl).get(true) : snapshot;
 		const voice = resolveVoice(latest.voices, id);
 		await this.config.update(current => {
 			if (epoch !== this.generationEpoch) throw abortError();
-			if (current.gatewayUrl !== cfg.gatewayUrl) throw new Error("网关已变更，请重新选择音色");
+			if (current.gatewayUrl !== cfg.gatewayUrl) throw new Error("The gateway changed; choose a voice again");
 			return { ...current, defaultVoiceId: voice.id };
 		});
-		this.notify(`默认音色已保存: ${voice.name} (${voice.id}, ${voice.engine ?? "cosyvoice"})；仅后续请求生效，语音开关及当前句不变`);
+		this.notify(`Default voice saved: ${voice.name} (${voice.id}, ${voice.engine ?? "cosyvoice"}). It applies to later requests only; the switch state and the current utterance are unchanged`);
 	}
 	public openStatusModal(ctx: ExtensionContext): void {
 		this.attach(ctx);
@@ -786,7 +786,7 @@ export class VoiceRuntime {
 		};
 
 		if (!ctx.hasUI || ctx.mode === "rpc" || !ctx.ui?.custom) {
-			const text = `Voice: ${info.enabled ? "ON" : "OFF"}\nDefault: ${info.defaultEnabled ? "ON" : "OFF"}\nLive: ${info.live ? "ON" : "OFF"}\nGateway: ${info.gatewayUrl}\nMode: ${info.deliveryMode}\nVoice: ${info.defaultVoiceId}\nSpeed: ${info.speed}x\n连接状态: 未探测\n发音风险: 全局抢占/停播，未确认物理播放完成（VOICE-001）\n帮助: /voice help\n快捷键: F2 / Alt+X`;
+			const text = `Voice: ${info.enabled ? "ON" : "OFF"}\nDefault: ${info.defaultEnabled ? "ON" : "OFF"}\nLive: ${info.live ? "ON" : "OFF"}\nGateway: ${info.gatewayUrl}\nMode: ${info.deliveryMode}\nVoice: ${info.defaultVoiceId}\nSpeed: ${info.speed}x\nConnection: not probed\nPlayback risk: global preemption and stop; physical playback completion is not confirmed (VOICE-001)\nHelp: /voice help\nShortcuts: F2 / Alt+X`;
 			if (ctx.hasUI) ctx.ui?.notify?.(text, "info");
 			else console.log(text);
 			return;
@@ -829,47 +829,47 @@ export class VoiceRuntime {
 		const action = rawAction.toLowerCase() || "status";
 		try {
 			switch (action) {
-				case "on": this.enable(); this.notify("语音工具已启用；Live 需单独开启。共享网关存在全局停播风险，详见 /voice status"); break;
-				case "off": this.stop(true); this.notify("语音已关闭，后续新调用将拒绝"); break;
-				case "stop": this.stop(); this.notify("现有活动已取消；扩展开关不变，开启时仍接受新调用"); break;
+				case "on": this.enable(); this.notify("Voice tools are enabled. Live must be enabled separately. A shared gateway carries a global-stop risk; see /voice status"); break;
+				case "off": this.stop(true); this.notify("Voice is disabled; further calls are refused"); break;
+				case "stop": this.stop(); this.notify("Current activity cancelled. The extension switch is unchanged, and calls are still accepted while it is on"); break;
 				case "live":
-					if (param && param !== "on" && param !== "off") throw new Error("用法: /voice live [on|off]");
+					if (param && param !== "on" && param !== "off") throw new Error("Usage: /voice live [on|off]");
 					this.setLive(param ? param === "on" : !this.live);
-					this.notify(`Live: ${this.live ? "ON（请求边界交接可能丢弃当前半句）" : "OFF"}`);
+					this.notify(`Live: ${this.live ? "ON (a handoff at a request boundary may drop the current half-sentence)" : "OFF"}`);
 					break;
 				case "speed": {
 					if (!param) { this.openStatusModal(ctx); break; }
 					const speed = Number(param);
-					if (extra || !Number.isFinite(speed) || speed < 0.5 || speed > 2) throw new Error("用法: /voice speed <0.5–2>");
+					if (extra || !Number.isFinite(speed) || speed < 0.5 || speed > 2) throw new Error("Usage: /voice speed <0.5-2>");
 					await this.config.update(current => ({ ...current, speed }));
-					this.notify(`语速已保存: ${speed}x（后续发音生效）`); break;
+					this.notify(`Speed saved: ${speed}x (applies to later speech)`); break;
 				}
 				case "gateway": {
 					if (!param) { this.openStatusModal(ctx); break; }
-					if (extra) throw new Error("用法: /voice gateway <HTTP(S) URL>");
+					if (extra) throw new Error("Usage: /voice gateway <HTTP(S) URL>");
 					const url = gatewayKey(param);
 					await this.config.update(current => ({ ...current, gatewayUrl: url }));
 					this.stop();
 					if (this.enabled) this.initializeVoices();
-					this.notify("网关地址已保存，旧语音任务及 Live 已停止；总开关不变"); break;
+					this.notify("Gateway URL saved. Previous voice tasks and Live were stopped; the extension switch is unchanged"); break;
 				}
 				case "default":
 					if (!param) { this.openStatusModal(ctx); break; }
-					if (extra || (param !== "on" && param !== "off")) throw new Error("用法: /voice default on|off");
+					if (extra || (param !== "on" && param !== "off")) throw new Error("Usage: /voice default on|off");
 					await this.config.update(current => ({ ...current, defaultEnabled: param === "on" }));
-					this.notify(`新会话默认开关已保存: ${param.toUpperCase()}（当前开关及 Live 不变）`); break;
+					this.notify(`New session default saved: ${param.toUpperCase()} (current switch and Live are unchanged)`); break;
 				case "mode":
-					if (param !== "editor" && param !== "submit") throw new Error("用法: /voice mode editor|submit");
+					if (param !== "editor" && param !== "submit") throw new Error("Usage: /voice mode editor|submit");
 					await this.config.update(current => ({ ...current, deliveryMode: param }));
-					this.notify(`投递模式已更新: ${param}`); break;
+					this.notify(`Delivery mode updated: ${param}`); break;
 				case "voice":
 				case "set-voice":
 					await this.selectVoice(raw.slice(rawAction.length).trim(), ctx); break;
 				case "voices": {
 					const result = await this.listVoices({ query: raw.slice(rawAction.length).trim(), refresh: true }, undefined, true);
-					await this.showInfo(ctx, "Voice 音色目录", result.success
-						? [result.warning, `默认: ${result.default_voice_id} · 匹配 ${result.matched}/${result.total} · 本页 ${result.voices.length} 项`, ...result.voices.map(v => `${v.id}: ${v.name} · ${v.engine ?? "引擎未知"}${v.ready === false ? " · 未就绪" : ""}`), "更多：/voice voice [关键词] 搜索选择；工具 voice_list_voices 支持 offset/limit 分页"].filter((line): line is string => Boolean(line))
-						: [result.message || "查询失败"]);
+					await this.showInfo(ctx, "Voice catalog", result.success
+						? [result.warning, `Default: ${result.default_voice_id} · ${result.matched}/${result.total} matched · ${result.voices.length} on this page`, ...result.voices.map(v => `${v.id}: ${v.name} · ${v.engine ?? "unknown engine"}${v.ready === false ? " · not ready" : ""}`), "More: /voice voice [keywords] searches and selects; the voice_list_voices tool pages with offset/limit"].filter((line): line is string => Boolean(line))
+						: [result.message || "Query failed"]);
 					break;
 				}
 				case "status": {
@@ -877,9 +877,9 @@ export class VoiceRuntime {
 					break;
 				}
 				case "help":
-					await this.showInfo(ctx, "Voice 命令帮助", VOICE_HELP);
+					await this.showInfo(ctx, "Voice command help", VOICE_HELP);
 					break;
-				default: throw new Error("未知语音命令；用 /voice help 查看用法");
+				default: throw new Error("Unknown voice command; run /voice help for usage");
 			}
 		} catch (error) { this.notify(errorText(error), "error"); }
 	}
@@ -892,34 +892,34 @@ function toolResult<T extends { status?: string; success?: boolean }>(details: T
 	};
 }
 const VOICE_HELP = [
-	"/voice 或 /voice status — 查看当前开关、默认开关及全部参数（不探测网关）",
-	"/voice on | off — 仅启用/禁用当前会话；off 同时取消现有语音任务",
-	"/voice stop — 取消当前任务并关闭 Live，保留当前总开关；快捷键 Alt+X",
-	"/voice live [on|off] — 切换持续收音；快捷键 F2；需先 on",
-	"/voice mode editor|submit — 转写填入草稿或直接发送（持久化）",
-	"/voice voice [ID或关键词] — 实时搜索选择默认音色；不自动开启语音或试听",
-	"/voice set-voice [ID或关键词] — 兼容入口，同上；Esc 不更改配置",
-	"/voice voices [关键词] — 实时查询，最多展示20项；工具可用 offset/limit 分页",
-	"/voice speed <0.5–2> — 保存默认语速；仅影响后续发音",
-	"/voice gateway <HTTP(S) URL> — 保存网关并取消旧任务/Live；总开关不变",
-	"/voice default on|off — 保存新会话默认开关；当前开关不变，不自动开启 Live",
-	"speed / gateway / default 不带参数时打开状态窗；参数保存到 agent 目录的 voice.json",
-	"发音风险 VOICE-001：取消可能全局停播，无法确认物理播放完成；共享网关请谨慎",
+	"/voice or /voice status - show the current switch, the default switch and all parameters (no gateway probe)",
+	"/voice on | off - enable or disable only this session; off also cancels current voice tasks",
+	"/voice stop - cancel the current task and turn Live off, keeping the extension switch; shortcut Alt+X",
+	"/voice live [on|off] - toggle continuous listening; shortcut F2; requires on",
+	"/voice mode editor|submit - put transcripts in the draft or send them directly (persisted)",
+	"/voice voice [ID or keywords] - search live and pick the default voice; never enables voice or previews",
+	"/voice set-voice [ID or keywords] - compatible alias for the above; Esc changes nothing",
+	"/voice voices [keywords] - live query, up to 20 items; the tool pages with offset/limit",
+	"/voice speed <0.5-2> - save the default speed; affects later speech only",
+	"/voice gateway <HTTP(S) URL> - save the gateway and cancel old tasks and Live; the switch is unchanged",
+	"/voice default on|off - save the new-session default; the current switch and Live are unchanged",
+	"speed, gateway and default open the status modal without an argument; parameters are saved to voice.json in the agent directory",
+	"Playback risk VOICE-001: a cancellation may stop audio globally and physical playback completion cannot be confirmed; be careful with shared gateways",
 ];
 const VOICE_SUBCOMMANDS: AutocompleteItem[] = [
-	{ value: "help", label: "help", description: "查看全部语音命令与参数说明" },
-	{ value: "speed", label: "speed", description: "保存默认语速 (speed 0.5–2)；无参数查看状态" },
-	{ value: "gateway", label: "gateway", description: "保存 HTTP(S) 网关地址，停止旧任务及 Live" },
-	{ value: "default", label: "default", description: "新会话默认开关 (default on | default off)，当前会话不变" },
-	{ value: "status", label: "status", description: "打开语音配置与状态模态窗" },
-	{ value: "on", label: "on", description: "启用语音扩展" },
-	{ value: "off", label: "off", description: "关闭语音扩展" },
-	{ value: "stop", label: "stop", description: "立即停止当前语音活动（播报或收音）" },
-	{ value: "live", label: "live", description: "持续收音模式开关 (live on | live off)" },
-	{ value: "mode", label: "mode", description: "转写投递模式 (mode editor | mode submit)" },
-	{ value: "voice", label: "voice", description: "实时搜索选择默认音色；不启用语音、不自动试听" },
-	{ value: "voices", label: "voices", description: "实时查询目录 (voices [关键词])；最多20项" },
-	{ value: "set-voice", label: "set-voice", description: "设置默认音色 (用法: /voice set-voice <id>)" },
+	{ value: "help", label: "help", description: "Show every voice command and its parameters" },
+	{ value: "speed", label: "speed", description: "Save the default speed (speed 0.5-2); no argument shows the status" },
+	{ value: "gateway", label: "gateway", description: "Save the HTTP(S) gateway URL and stop old tasks and Live" },
+	{ value: "default", label: "default", description: "New session default (default on | default off); the current session is unchanged" },
+	{ value: "status", label: "status", description: "Open the voice configuration and status modal" },
+	{ value: "on", label: "on", description: "Enable the voice extension" },
+	{ value: "off", label: "off", description: "Disable the voice extension" },
+	{ value: "stop", label: "stop", description: "Stop the current voice activity immediately (speech or listening)" },
+	{ value: "live", label: "live", description: "Toggle continuous listening (live on | live off)" },
+	{ value: "mode", label: "mode", description: "Transcript delivery mode (mode editor | mode submit)" },
+	{ value: "voice", label: "voice", description: "Search live and pick the default voice; neither enables voice nor previews" },
+	{ value: "voices", label: "voices", description: "Query the catalog live (voices [keywords]); up to 20 items" },
+	{ value: "set-voice", label: "set-voice", description: "Set the default voice (usage: /voice set-voice <id>)" },
 ];
 
 export function getVoiceArgumentCompletions(
@@ -932,8 +932,8 @@ export function getVoiceArgumentCompletions(
 	if (prefix.startsWith(toggleCommand)) {
 		const sub = prefix.slice(toggleCommand.length).trimStart().toLowerCase();
 		const options: AutocompleteItem[] = [
-			{ value: `${toggleCommand} on`, label: "on", description: toggleCommand === "live" ? "开启持续语音输入模式" : "保存新会话默认开启（不自动录音）" },
-			{ value: `${toggleCommand} off`, label: "off", description: toggleCommand === "live" ? "关闭持续语音输入模式" : "保存新会话默认关闭" },
+			{ value: `${toggleCommand} on`, label: "on", description: toggleCommand === "live" ? "Turn continuous voice input on" : "Save the new-session default as on (does not start recording)" },
+			{ value: `${toggleCommand} off`, label: "off", description: toggleCommand === "live" ? "Turn continuous voice input off" : "Save the new-session default as off" },
 		];
 		const filtered = options.filter(
 			(o) => o.label.toLowerCase().startsWith(sub) || o.value.toLowerCase().startsWith(prefix.toLowerCase()),
@@ -944,8 +944,8 @@ export function getVoiceArgumentCompletions(
 	if (prefix.startsWith("mode")) {
 		const sub = prefix.slice(4).trimStart().toLowerCase();
 		const options: AutocompleteItem[] = [
-			{ value: "mode editor", label: "editor", description: "转写结果填入输入框（可编辑后再发送）" },
-			{ value: "mode submit", label: "submit", description: "转写结果直接提交给 Agent" },
+			{ value: "mode editor", label: "editor", description: "Put the transcript in the input box for editing before sending" },
+			{ value: "mode submit", label: "submit", description: "Send the transcript to the agent directly" },
 		];
 		const filtered = options.filter(
 			(o) => o.label.toLowerCase().startsWith(sub) || o.value.toLowerCase().startsWith(prefix.toLowerCase()),
@@ -1003,8 +1003,8 @@ export default function voiceExtension(pi: ExtensionAPI, options: VoiceRuntimeOp
 		getArgumentCompletions: (prefix) => getVoiceArgumentCompletions(prefix, runtime),
 		handler: (args, ctx) => runtime.command(args, ctx),
 	});
-	pi.registerShortcut("alt+x", { description: "取消现有语音活动，保留开关", handler: async ctx => { runtime.attach(ctx); runtime.stop(); } });
-	pi.registerShortcut("f2", { description: "切换持续语音输入", handler: ctx => runtime.command("live", ctx) });
+	pi.registerShortcut("alt+x", { description: "Cancel current voice activity and keep the switch", handler: async ctx => { runtime.attach(ctx); runtime.stop(); } });
+	pi.registerShortcut("f2", { description: "Toggle continuous voice input", handler: ctx => runtime.command("live", ctx) });
 	pi.on("session_start", (_event, ctx) => runtime.start(ctx));
 	pi.on("session_shutdown", () => runtime.stop(true));
 	pi.on("session_before_switch", () => runtime.stop(true));

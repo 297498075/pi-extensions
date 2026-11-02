@@ -232,10 +232,10 @@ await test("cache null/empty/refresh/failure and startup fetch deduplication", a
 		h.voiceRequests[0].resolve([]); assert.equal((await p).success, true);
 		assert.deepEqual((await h.runtime.listVoices({})).voices, []); assert.equal(h.voiceRequests.length, 1);
 		const refresh = h.runtime.listVoices({ refresh: true }); h.voiceRequests[1].reject(Error("offline"));
-		assert.match((await refresh).warning, /历史缓存/);
+		assert.match((await refresh).warning, /stale cache must not be used/);
 		h.change({ voicesCacheByGateway: {} });
 		const noCache = h.runtime.listVoices({}); h.voiceRequests[2].reject(Error("offline"));
-		assert.match((await noCache).message, /无可用音色缓存/);
+		assert.match((await noCache).message, /No usable voice cache/);
 		const cancelled = h.runtime.listVoices({}); h.runtime.stop(true);
 		assert.equal((await cancelled).success, false); assert(h.voiceRequests[3].signal.aborted);
 		h.voiceRequests[3].resolve([{ id: "late", name: "Late" }]); await tick();
@@ -285,13 +285,13 @@ await test("config lock contention fails without writing or blocking event loop;
 		const manager = new VoiceConfigManager(dir, 70);
 		await writeFile(join(dir, "voice.json.lock"), "another live owner");
 		let heartbeat = false; const timer = setTimeout(() => { heartbeat = true; }, 5);
-		await assert.rejects(manager.update(c => ({ ...c, speed: 1.5 })), /锁超时/);
+		await assert.rejects(manager.update(c => ({ ...c, speed: 1.5 })), /lock timed out/);
 		clearTimeout(timer); assert(heartbeat);
 		await assert.rejects(readFile(join(dir, "voice.json")), { code: "ENOENT" });
 		assert.equal(await readFile(join(dir, "voice.json.lock"), "utf8"), "another live owner");
 		await rm(join(dir, "voice.json.lock"));
 		await writeFile(join(dir, "voice.json"), "{broken config");
-		await assert.rejects(manager.update(c => ({ ...c, speed: 1.5 })), /读取/);
+		await assert.rejects(manager.update(c => ({ ...c, speed: 1.5 })), /Could not read/);
 		assert.equal(await readFile(join(dir, "voice.json"), "utf8"), "{broken config");
 		await assert.rejects(readFile(join(dir, "voice.json.lock")), { code: "ENOENT" });
 	} finally { await rm(dir, { recursive: true, force: true }); }
@@ -389,11 +389,11 @@ await test("status modal component renders nicely and handles key/click close", 
 	const lines = comp.render(80);
 	assert(lines.length >= 15, "Should render full status dialog box");
 	assert(lines.some(l => l.includes("Pi Voice Extension Status")));
-	assert(lines.some(l => l.includes("扩展总开关")));
+	assert(lines.some(l => l.includes("Extension switch: ")));
 	assert(lines.some(l => l.includes("ENABLED (ON)")));
-	assert(lines.some(l => l.includes("扬声发音服务")));
-	assert(lines.some(l => l.includes("未探测连接")));
-	assert(lines.some(l => l.includes("新会话默认")));
+	assert(lines.some(l => l.includes("Speaker service: ")));
+	assert(lines.join(" ").includes("not probed"), "status must not claim probed connectivity");
+	assert(lines.some(l => l.includes("New session default: ")));
 	assert(!lines.some(l => l.includes("ONLINE")), "status must not claim unprobed connectivity");
 
 	// Keyboard input triggers close
@@ -521,7 +521,7 @@ await test("help and bare parameter queries are local; voices explicitly refresh
 		const pending = h.runtime.command("voices", ctx);
 		h.voiceRequests.at(-1).resolve([]); await pending;
 		assert.equal(rendered.length, 7);
-		assert(rendered[5].includes("/voice speed")); assert(rendered[6].includes("Voice 音色目录"));
+		assert(rendered[5].includes("/voice speed")); assert(rendered[6].includes("Voice catalog"));
 		assert.equal(h.notices.length, 0); assert.equal(h.gatewayUrls.length, 1);
 		for (const command of ["help", "speed", "gateway", "default"]) assert(getVoiceArgumentCompletions(command).some(item => item.value === command || item.value.startsWith(command + " ")));
 		assert.deepEqual(getVoiceArgumentCompletions("default o").map(item => item.value), ["default on", "default off"]);

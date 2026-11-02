@@ -46,7 +46,7 @@ export function openFileCommand(filePath: string, platform: NodeJS.Platform = pr
 /** Resolve every process failure, including async spawn and stdin errors; never throw into the TUI. */
 export function runDesktopCommand(spec: DesktopCommand, signal?: AbortSignal, timeoutMs = 5000): Promise<DesktopResult> {
 	return new Promise(resolve => {
-		if (signal?.aborted) { resolve({ ok: false, error: "操作已取消" }); return; }
+		if (signal?.aborted) { resolve({ ok: false, error: "Operation cancelled" }); return; }
 		let settled = false;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		let child: ReturnType<typeof spawn> | undefined;
@@ -66,7 +66,7 @@ export function runDesktopCommand(spec: DesktopCommand, signal?: AbortSignal, ti
 			finish({ ok: false, error: error instanceof Error ? error.message : String(error) });
 			stop();
 		};
-		const onAbort = () => { if (settled) return; finish({ ok: false, error: "操作已取消" }); stop(); };
+		const onAbort = () => { if (settled) return; finish({ ok: false, error: "Operation cancelled" }); stop(); };
 		try {
 			child = spawn(spec.command, spec.args, {
 				shell: false,
@@ -79,11 +79,11 @@ export function runDesktopCommand(spec: DesktopCommand, signal?: AbortSignal, ti
 			child.stderr?.on("error", fail);
 			child.stderr?.on("data", chunk => { if (stderr.length < 4096) stderr += String(chunk).slice(0, 4096 - stderr.length); });
 			child.once("close", (code, reason) => {
-				finish(code === 0 ? { ok: true } : { ok: false, error: stderr.trim() || `${spec.command} 退出失败 (${reason || code})` });
+				finish(code === 0 ? { ok: true } : { ok: false, error: stderr.trim() || `${spec.command} exited with failure (${reason || code})` });
 			});
 			signal?.addEventListener("abort", onAbort, { once: true });
 			if (signal?.aborted) { onAbort(); return; }
-			timer = setTimeout(() => { finish({ ok: false, error: `${spec.command} 等待超时` }); stop(); }, timeoutMs);
+			timer = setTimeout(() => { finish({ ok: false, error: `${spec.command} timed out` }); stop(); }, timeoutMs);
 			timer.unref?.();
 			child.stdin?.end(spec.input ?? "", "utf8");
 		} catch (error) { fail(error); }
@@ -96,7 +96,7 @@ export function copyToClipboard(text: string, signal?: AbortSignal): Promise<Des
 
 export function openLocalFile(filePath: string, signal?: AbortSignal): Promise<DesktopResult> {
 	if (!isAbsolute(filePath) || !existsSync(filePath)) {
-		return Promise.resolve({ ok: false, error: "只能打开存在的本地绝对路径" });
+		return Promise.resolve({ ok: false, error: "Only an existing local absolute path can be opened" });
 	}
 	return runDesktopCommand(openFileCommand(filePath), signal);
 }

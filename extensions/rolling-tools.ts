@@ -502,30 +502,30 @@ function migrateConfigToLatest(cwd: string): {
  * - v2 → v3：通知统一收敛到 footer，提示新字段与默认值（不写配置文件也可用）。
  */
 function buildLegacyNotice(legacyPath?: string, fromVersion = 1): string {
-	const where = legacyPath ? `\n• 配置文件: ${legacyPath}` : "";
+	const where = legacyPath ? `\n• config file: ${legacyPath}` : "";
 
 	if (fromVersion < 2) {
 		return [
-			"rolling-tools: 检测到旧版配置，已自动保持原有行为（未强制切换为全工具）。",
-			"新版默认会将所有工具（含 edit / write / codemode / 三方工具）收入滚动块并隐藏正文。",
-			"如需启用新语义，请将配置中的 managedTools / silencedTools / widgetTools 设为 [\"*\"]，",
-			`或执行 /rolling-tools migrate 自动升级。${where}`,
+			"rolling-tools: legacy configuration detected; the previous behavior is kept (no forced switch to all tools).",
+			"The new default collects every tool (including edit, write, codemode and third-party tools) in the rolling block and hides the body.",
+			"To enable the new semantics, set managedTools / silencedTools / widgetTools to [\"*\"] in the configuration,",
+			`or run /rolling-tools migrate to upgrade automatically.${where}`,
 		].join("\n");
 	}
 
 	// v2 → v3
 	return [
-		"rolling-tools: 检测到 v2 配置，已按 v3 新默认运行（旧字段自动忽略，不写配置文件也可用）。",
-		"v3 变化：",
-		"• 所有插件的 info 提示只在界面最下方显示（error / warning 与关键词例外仍保留）",
-		"• 工具行里重复的 “Money saved” 提示头已自动隐藏",
-		"• 常驻状态（blackhole / mcp）不受影响；需要“一闪而过”的 tips 请显式配 durationMs",
-		"如需自定义，可在配置文件中添加以下字段（全部可选，省略即用默认值）：",
+		"rolling-tools: v2 configuration detected; running with the v3 defaults (legacy fields are ignored and no config file is required).",
+		"v3 changes:",
+		"• info notifications from every extension now appear only in the bottom status line (error and warning, plus keyword exceptions, still pass through)",
+		"• duplicated “Money saved” headers inside tool rows are hidden automatically",
+		"• persistent statuses (blackhole, mcp) are unaffected; for short-lived tips set durationMs explicitly",
+		"To customize, add the following fields to the configuration file (all optional; omit them to keep the defaults):",
 		'  "interceptNotifications": [{ "match": "*", "suppressToast": true }]',
 		'  "statusEnhancements": [{ "keyPattern": "*", "showRelativeTime": false, "colorize": true, "persistentKeys": ["blackhole", "mcp"] }]',
 		'  "notificationKeywords": ["error", "failed", "failure", "warning", "错误", "失败", "警告", "⚠", "❌", "🔴"]',
 		'  "stripToolNotificationHeaders": true',
-		`或执行 /rolling-tools migrate 写入完整默认配置。${where}`,
+		`or run /rolling-tools migrate to write the full default configuration.${where}`,
 	].join("\n");
 }
 
@@ -1070,7 +1070,7 @@ function isPendingTool(item: ToolItem): boolean {
 }
 
 function toolDisplayLabel(item: ToolItem): string {
-	return `${item.displayName || item.name}${item.status === "preparing" ? " [生成参数]" : ""}`;
+	return `${item.displayName || item.name}${item.status === "preparing" ? " [preparing]" : ""}`;
 }
 
 /**
@@ -1229,16 +1229,16 @@ class RollingToolsWidgetComponent implements Component {
 			} else if (this.state.headerStatus.type === "waiting_server") {
 				const elapsedSec = ((Date.now() - this.state.headerStatus.startTime) / 1000).toFixed(1);
 				const spinner = SPINNER_FRAMES[Math.floor(Date.now() / 150) % SPINNER_FRAMES.length];
-				statusText = ` ${theme.fg("accent", "🌐")} ${theme.bold(theme.fg("toolTitle", `${spinner} 等待服务器响应...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`;
+				statusText = ` ${theme.fg("accent", "🌐")} ${theme.bold(theme.fg("toolTitle", `${spinner} waiting for the server...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`;
 			} else if (this.state.headerStatus.type === "thinking") {
 				const elapsedSec = ((Date.now() - this.state.headerStatus.startTime) / 1000).toFixed(1);
 				const spinner = SPINNER_FRAMES[Math.floor(Date.now() / 150) % SPINNER_FRAMES.length];
-				statusText = ` ${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", `${spinner} 思考中...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`;
+				statusText = ` ${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", `${spinner} thinking...`))} ${theme.fg("muted", `(${elapsedSec}s)`)}`;
 			} else if (this.state.headerStatus.type === "thinking_completed") {
 				const elapsedSec = (this.state.headerStatus.durationMs / 1000).toFixed(1);
-				statusText = ` ${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", "思考完成"))} ${theme.fg("muted", `(${elapsedSec}s)`)}`;
+				statusText = ` ${theme.fg("accent", "💡")} ${theme.bold(theme.fg("toolTitle", "thought"))} ${theme.fg("muted", `(${elapsedSec}s)`)}`;
 			} else {
-				statusText = ` ${theme.fg("accent", "•")} ${theme.fg("muted", "就绪")}`;
+				statusText = ` ${theme.fg("accent", "•")} ${theme.fg("muted", "ready")}`;
 			}
 
 			statusText = truncateToWidth(statusText, availableWidth);
@@ -1394,8 +1394,8 @@ class RollingToolsWidgetComponent implements Component {
 	private triggerCopy(textToCopy: string, label: string): void {
 		void copyToClipboard(textToCopy, this.actionSignal).then(result => {
 			this.showActionFeedback(result.ok
-				? `✓ 已复制${label}至剪贴板: ${truncate(textToCopy, 45)}`
-				: `✗ 复制失败: ${result.error}`);
+				? `✓ Copied ${label} to the clipboard: ${truncate(textToCopy, 45)}`
+				: `✗ Copy failed: ${result.error}`);
 		});
 	}
 
@@ -1458,12 +1458,12 @@ class RollingToolsWidgetComponent implements Component {
 			// 1. 点击了可复制行（包括 SoL-Pi 节省行或工具详情输出）
 			if (lineEntry?.kind === "detail_copyable" && lineEntry.textToCopy) {
 				const label = targetItem?.fullPath
-					? "完整路径"
+					? "full path"
 					: targetItem?.fullCommand
-						? "完整命令"
+						? "full command"
 						: targetItem
-							? "输出内容"
-							: "详情信息";
+							? "output"
+							: "details";
 				this.triggerCopy(lineEntry.textToCopy, label);
 				return { handled: true };
 			}
@@ -1473,7 +1473,7 @@ class RollingToolsWidgetComponent implements Component {
 				if (event.ctrl && event.button === "left" && targetItem.fullPath) {
 					const filePath = targetItem.fullPath;
 					void openLocalFile(filePath, this.actionSignal).then(result => {
-						this.showActionFeedback(result.ok ? `✓ 已发送打开请求: ${filePath}` : `✗ 打开失败: ${result.error}`);
+						this.showActionFeedback(result.ok ? `✓ Open request sent: ${filePath}` : `✗ Open failed: ${result.error}`);
 					});
 					return { handled: true };
 				}
@@ -1487,7 +1487,7 @@ class RollingToolsWidgetComponent implements Component {
 						targetItem.output ||
 						targetItem.summaryDisplay;
 					if (textToCopy) {
-						const label = targetItem.fullPath ? "完整路径" : targetItem.fullCommand ? "完整命令" : "内容";
+						const label = targetItem.fullPath ? "full path" : targetItem.fullCommand ? "full command" : "content";
 						this.triggerCopy(textToCopy, label);
 						return { handled: true };
 					}
@@ -1673,11 +1673,11 @@ class ToolHistoryOverlayComponent implements Component {
 		const total = this.allItems.length;
 		const loaded = this.loadedCount;
 		const titleHint = loaded < total
-			? theme.fg("dim", `↑ 上滑到顶加载更多 (${loaded}/${total})`)
-			: theme.fg("dim", `已全部加载 (${total})`);
+			? theme.fg("dim", `↑ scroll to the top for more (${loaded}/${total})`)
+			: theme.fg("dim", `all loaded (${total})`);
 		const boxLines: string[] = [];
 		if (framed) {
-			const titleText = ` ${theme.bold(theme.fg("toolTitle", "工具历史"))}  ${titleHint}   ${theme.fg("muted", "[Esc/点击外部 关闭] · 点击左侧行复制详情")}`;
+			const titleText = ` ${theme.bold(theme.fg("toolTitle", "Tool history"))}  ${titleHint}   ${theme.fg("muted", "[Esc or click outside to close] · click a row on the left to copy its details")}`;
 			boxLines.push(frameLine("┌", titleText, "┐"), divider("├", "┤"));
 		}
 
@@ -1728,9 +1728,9 @@ class ToolHistoryOverlayComponent implements Component {
 			if (this.copyFeedback) {
 				hintText = theme.fg(this.copyFeedback.startsWith("✗") ? "error" : "success", this.copyFeedback);
 			} else if (this.detailLineCount > viewportHeight) {
-				hintText = theme.fg("muted", `详情 ${detailStart + 1}-${detailEnd}/${this.detailLineCount} · 滚轮/PgUp/PgDn · ↑↓ 选择 · Esc 关闭`);
+				hintText = theme.fg("muted", `details ${detailStart + 1}-${detailEnd}/${this.detailLineCount} · wheel/PgUp/PgDn · ↑↓ select · Esc closes`);
 			} else {
-				hintText = theme.fg("muted", split ? "滚轮滚动 · ↑↓ 选择 · 点击左侧行复制详情 · Esc 关闭" : "↑↓ 选择工具 · 滚轮/PgUp/PgDn 详情 · Esc 关闭");
+				hintText = theme.fg("muted", split ? "wheel scrolls · ↑↓ selects · click a row on the left to copy its details · Esc closes" : "↑↓ selects a tool · wheel/PgUp/PgDn scrolls details · Esc closes");
 			}
 			boxLines.push(divider("├", "┤"), frameLine("│", ` ${hintText}`, "│"), divider("└", "┘"));
 		}
@@ -1755,15 +1755,15 @@ class ToolHistoryOverlayComponent implements Component {
 		const pushLine = (line: string) => out.push(...this.wrapLine(line, width, value => value));
 		if (!t) {
 			this.detailCache = undefined;
-			pushLine(theme.fg("muted", "(无选中条目)"));
+			pushLine(theme.fg("muted", "(no entry selected)"));
 			return out;
 		}
 
 		pushLine(theme.bold(theme.fg("toolTitle", `${toolDisplayLabel(t)}  [${t.index}]`)));
 		if (t.durationMs !== undefined) {
-			pushLine(theme.fg("muted", `耗时 ${t.durationMs}ms · 状态 ${t.status}`));
+			pushLine(theme.fg("muted", `${t.durationMs}ms · status ${t.status}`));
 		}
-		if (t.fullPath) pushLine(theme.fg("accent", `路径: ${t.fullPath}`));
+		if (t.fullPath) pushLine(theme.fg("accent", `path: ${t.fullPath}`));
 		out.push("");
 
 		// 优先展示 detailContent（edit diff / write 正文 / 三方工具长文本）
@@ -1771,19 +1771,19 @@ class ToolHistoryOverlayComponent implements Component {
 		if (detail && detail.trim().length > 0) {
 			const kindLabel =
 				t.detailKind === "diff"
-					? "变更 diff"
+					? "changed diff"
 					: t.detailKind === "content"
-						? "内容"
+						? "content"
 						: t.detailKind === "command"
-							? "命令"
-							: "详情";
+							? "command"
+							: "details";
 			pushLine(theme.fg("accent", `── ${kindLabel} ──`));
 			for (const raw of detail.split("\n")) {
 				out.push(...this.wrapLine(raw, width, (line) => this.colorizeDetailLine(line, t.detailKind)));
 			}
 			out.push("");
 		} else if (t.fullCommand) {
-			pushLine(theme.fg("accent", "── 命令 ──"));
+			pushLine(theme.fg("accent", "── command ──"));
 			for (const raw of t.fullCommand.split("\n")) {
 				out.push(...this.wrapLine(raw, width, (line) => theme.fg("accent", line)));
 			}
@@ -1796,7 +1796,7 @@ class ToolHistoryOverlayComponent implements Component {
 			inputToShow = tryParseJson(t.summaryDisplay);
 		}
 		if (inputToShow !== undefined && inputToShow !== null) {
-			pushLine(theme.fg("accent", "── 输入参数 ──"));
+			pushLine(theme.fg("accent", "── arguments ──"));
 			const formattedInput = typeof inputToShow === "string"
 				? inputToShow
 				: JSON.stringify(inputToShow, null, 2);
@@ -1808,13 +1808,13 @@ class ToolHistoryOverlayComponent implements Component {
 
 		// 输出内容
 		if (t.output && t.output.trim().length > 0) {
-			pushLine(theme.fg("accent", "── 输出 ──"));
+			pushLine(theme.fg("accent", "── output ──"));
 			for (const raw of t.output.replace(/\r\n/g, "\n").split("\n")) {
 				out.push(...this.wrapLine(raw, width, (line) => theme.fg("muted", line)));
 			}
 		}
 
-		if (out.length === 0) pushLine(theme.fg("muted", "(无详情)"));
+		if (out.length === 0) pushLine(theme.fg("muted", "(no details)"));
 		this.detailCache = { item: t, width, version, lines: out };
 		return out;
 	}
@@ -1901,17 +1901,17 @@ class ToolHistoryOverlayComponent implements Component {
 		const label = t.detailContent
 			? t.detailKind === "diff"
 				? "diff"
-				: "内容"
+				: "content"
 			: t.fullCommand
-				? "命令"
+				? "command"
 				: t.fullPath
-					? "路径"
-					: "输出";
+					? "path"
+					: "output";
 		void copyToClipboard(text, this.actionSignal).then(result => {
 			if (this.actionSignal?.aborted) return;
 			this.copyFeedback = result.ok
-				? `✓ 已复制${label}: ${truncate(text.replace(/\r?\n/g, " "), 50)}`
-				: `✗ 复制失败: ${result.error}`;
+				? `✓ Copied ${label}: ${truncate(text.replace(/\r?\n/g, " "), 50)}`
+				: `✗ Copy failed: ${result.error}`;
 			if (this.copyFeedbackTimer) clearTimeout(this.copyFeedbackTimer);
 			this.copyFeedbackTimer = setTimeout(() => {
 				this.copyFeedback = null;
@@ -2193,14 +2193,14 @@ function ensureGlobalPrototypeHooksInstalled(): void {
 }
 
 const ROLLING_TOOLS_SUBCOMMANDS: AutocompleteItem[] = [
-	{ value: "status", label: "status", description: "查看当前运行状态、视图模式与配置信息" },
-	{ value: "mode", label: "mode", description: "切换视图模式 (running | fixed)" },
-	{ value: "clear", label: "clear", description: "清空当前工具历史记录与错误提示" },
-	{ value: "history", label: "history", description: "打开工具历史大窗体 (Overlay)" },
-	{ value: "on", label: "on", description: "启用工具静音与滚动条" },
-	{ value: "off", label: "off", description: "禁用工具静音与滚动条" },
-	{ value: "reload", label: "reload", description: "从磁盘重新载入配置" },
-	{ value: "migrate", label: "migrate", description: "升级配置文件到最新规范 (v3)" },
+	{ value: "status", label: "status", description: "Show the current status, view mode and configuration" },
+	{ value: "mode", label: "mode", description: "Switch the view mode (running | fixed)" },
+	{ value: "clear", label: "clear", description: "Clear the current tool history and error hints" },
+	{ value: "history", label: "history", description: "Open the tool history overlay" },
+	{ value: "on", label: "on", description: "Enable tool silencing and the scrollbar" },
+	{ value: "off", label: "off", description: "Disable tool silencing and the scrollbar" },
+	{ value: "reload", label: "reload", description: "Reload the configuration from disk" },
+	{ value: "migrate", label: "migrate", description: "Upgrade the configuration file to the latest schema (v3)" },
 ];
 
 /**
@@ -2212,8 +2212,8 @@ export function getRollingToolsArgumentCompletions(argumentPrefix: string): Auto
 	if (prefix.startsWith("mode")) {
 		const sub = prefix.slice(4).trimStart();
 		const options: AutocompleteItem[] = [
-			{ value: "mode running", label: "running", description: "仅显示正在执行的任务（单行状态行）" },
-			{ value: "mode fixed", label: "fixed", description: "固定展示最近 N 行工具历史" },
+			{ value: "mode running", label: "running", description: "Show only the running task (single status line)" },
+			{ value: "mode fixed", label: "fixed", description: "Always show the last N lines of tool history" },
 		];
 		const filtered = options.filter(
 			(o) => o.label.toLowerCase().startsWith(sub.toLowerCase()) || o.value.toLowerCase().startsWith(prefix.toLowerCase()),
@@ -2444,7 +2444,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	 */
 	function openHistoryOverlay(ctx: any, initialItem?: ToolItem): void {
 		if (!ctx?.hasUI || ctx.mode === "rpc" || !ctx.ui?.custom) {
-			ctx?.ui?.notify?.("rolling-tools: 当前环境不支持大窗体", "warning");
+			ctx?.ui?.notify?.("rolling-tools: this environment does not support the overlay", "warning");
 			return;
 		}
 		if (activeOverlay) {
@@ -2456,7 +2456,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 			return;
 		}
 		if (state.recentTools.length === 0) {
-			ctx.ui.notify("rolling-tools: 暂无工具历史", "info");
+			ctx.ui.notify("rolling-tools: no tool history yet", "info");
 			return;
 		}
 		const step = currentConfig.lazyLoadStep && currentConfig.lazyLoadStep > 0 ? currentConfig.lazyLoadStep : 10;
@@ -2774,7 +2774,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		const wasRunning = item.status === "running";
 		item.status = "error";
 		item.durationMs = wasRunning ? Math.max(0, Date.now() - item.startTime) : undefined;
-		item.output = item.output || (wasRunning ? `执行中断：${reason}` : `未执行：${reason}`);
+		item.output = item.output || (wasRunning ? `Interrupted: ${reason}` : `Not executed: ${reason}`);
 	}
 
 	function closeUnfinishedTools(reason: string): boolean {
@@ -2800,8 +2800,8 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		const previews = new Set(streamedDrafts);
 		streamedDrafts.clear();
 		const reason = failed
-			? message.errorMessage || (message.stopReason === "aborted" ? "模型响应已取消" : "模型响应失败")
-			: "流式草稿未进入最终工具调用";
+			? message.errorMessage || (message.stopReason === "aborted" ? "the model response was cancelled" : "the model response failed")
+			: "the streaming draft did not produce a final tool call";
 		for (const item of state.recentTools) {
 			// Final errors may omit their partial content entirely. Also retire
 			// preview calls retracted by a successful final message, but never
@@ -2822,7 +2822,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		for (const message of event.messages) {
 			if (message.role === "toolResult") recordToolCompletion(message, true);
 		}
-		closeUnfinishedTools("本轮已结束，未收到该工具的完成事件");
+		closeUnfinishedTools("the turn ended without a completion event for this tool");
 		stopStatusTimer();
 		if (state.headerStatus.type === "waiting_server" || state.headerStatus.type === "thinking") {
 			state.headerStatus = { type: "idle" };
@@ -2832,7 +2832,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
-		const changed = closeUnfinishedTools("Agent 已停止，未收到该工具的完成事件");
+		const changed = closeUnfinishedTools("the agent stopped without a completion event for this tool");
 		stopStatusTimer();
 		if (state.headerStatus.type === "waiting_server" || state.headerStatus.type === "thinking") {
 			state.headerStatus = { type: "idle" };
@@ -2923,7 +2923,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		status: dynamicHooks.handleSetExtensionStatus,
 	};
 	pi.on("session_shutdown", async () => {
-		closeUnfinishedTools("扩展运行时已关闭");
+		closeUnfinishedTools("the extension runtime shut down");
 		persistHistory();
 		hooksActive = false;
 		desktopActions.abort();
@@ -2951,7 +2951,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				if (loaded.legacyDetected) {
 					ctx.ui?.notify?.(buildLegacyNotice(loaded.legacyPath, loaded.legacyVersion), "warning");
 				} else {
-					ctx.ui?.notify?.("✓ rolling-tools: 配置已重载", "info");
+					ctx.ui?.notify?.("✓ rolling-tools: configuration reloaded", "info");
 				}
 			} else if (action === "migrate") {
 				const result = migrateConfigToLatest(ctx?.cwd || process.cwd());
@@ -2960,37 +2960,37 @@ export default function rollingTools(pi: ExtensionAPI): void {
 					currentConfig = result.config!;
 					refreshToolActivity(ctx);
 					ctx.ui?.notify?.(
-						`✓ rolling-tools: 已升级到全工具语义（v${CONFIG_VERSION}）\n• 静音/收录规则已设为 ["*"]\n• 已写入: ${result.path}`,
+						`✓ rolling-tools: upgraded to the all-tools semantics (v${CONFIG_VERSION})\n• silencing and collection rules set to ["*"]\n• written to: ${result.path}`,
 						"info",
 					);
 				} else {
-					ctx.ui?.notify?.(`rolling-tools: 升级失败 - ${result.error}`, "error");
+					ctx.ui?.notify?.(`rolling-tools: upgrade failed - ${result.error}`, "error");
 				}
 			} else if (action === "off") {
 				currentConfig.enabled = false;
 				stopStatusTimer();
 				clearTransientStatuses();
 				syncWidget(ctx);
-				ctx.ui?.notify?.("rolling-tools: 已禁用正文静音与滚动条", "info");
+				ctx.ui?.notify?.("rolling-tools: body silencing and the scrollbar are disabled", "info");
 			} else if (action === "on") {
 				currentConfig.enabled = true;
 				refreshToolActivity(ctx);
-				ctx.ui?.notify?.("rolling-tools: 已启用正文静音与滚动条", "info");
+				ctx.ui?.notify?.("rolling-tools: body silencing and the scrollbar are enabled", "info");
 			} else if (action === "status") {
 				const info = [
-					`rolling-tools 状态:`,
-					`• 运行状态: ${currentConfig.enabled ? "已开启" : "已关闭"}`,
-					`• 当前视图模式: ${state.viewMode === "running" ? "仅显示正在执行的任务" : `固定最近 ${currentConfig.maxRecentTools} 行`}`,
-					`• widget 展示条数: ${currentConfig.maxRecentTools}（历史共 ${state.recentTools.length} 条）`,
-					`• 默认视图模式: ${currentConfig.defaultViewMode ?? "fixed"}`,
-					`• 静音工具规则: ${(currentConfig.silencedTools ?? currentConfig.managedTools).join(", ")}`,
-					`• 收录工具规则: ${(currentConfig.widgetTools ?? currentConfig.managedTools).join(", ")}`,
-					`• 懒加载步长: ${currentConfig.lazyLoadStep ?? 10} 条/次`,
-					`• 跨会话持久化: ${currentConfig.persistAcrossSessions ? "已开启" : "已关闭"}`,
-					`• 配置版本: v${currentConfig.configVersion ?? 1}${(currentConfig.configVersion ?? 1) < CONFIG_VERSION ? "（旧版，可执行 /rolling-tools migrate 升级）" : ""}`,
-					`• 通知拦截: ${currentConfig.interceptNotifications.map((r) => r.match).join(", ") || "（无）"}（例外关键词 ${(currentConfig.notificationKeywords ?? []).length} 个）`,
-					`• status 时长: ${currentConfig.statusEnhancements?.[0]?.durationMs ?? "默认"}ms`,
-					`• 剥离工具行提示头: ${currentConfig.stripToolNotificationHeaders !== false ? "已开启" : "已关闭"}`,
+					`rolling-tools status:`,
+					`• Enabled: ${currentConfig.enabled ? "yes" : "no"}`,
+					`• View mode: ${state.viewMode === "running" ? "running task only" : `last ${currentConfig.maxRecentTools} lines`}`,
+					`• Widget rows: ${currentConfig.maxRecentTools} (${state.recentTools.length} in history)`,
+					`• Default view mode: ${currentConfig.defaultViewMode ?? "fixed"}`,
+					`• Silenced tools: ${(currentConfig.silencedTools ?? currentConfig.managedTools).join(", ")}`,
+					`• Collected tools: ${(currentConfig.widgetTools ?? currentConfig.managedTools).join(", ")}`,
+					`• Lazy-load step: ${currentConfig.lazyLoadStep ?? 10} rows`,
+					`• Persist across sessions: ${currentConfig.persistAcrossSessions ? "yes" : "no"}`,
+					`• Config version: v${currentConfig.configVersion ?? 1}${(currentConfig.configVersion ?? 1) < CONFIG_VERSION ? " (legacy; run /rolling-tools migrate to upgrade)" : ""}`,
+					`• Intercepted notifications: ${currentConfig.interceptNotifications.map((r) => r.match).join(", ") || "(none)"} (${(currentConfig.notificationKeywords ?? []).length} exception keywords)`,
+					`• Status duration: ${currentConfig.statusEnhancements?.[0]?.durationMs ?? "default"}ms`,
+					`• Strip tool-row headers: ${currentConfig.stripToolNotificationHeaders !== false ? "yes" : "no"}`,
 				].join("\n");
 				await showStatusModal(ctx, "Rolling Tools", info.split("\n"));
 			} else if (action === "mode" || action.startsWith("mode ")) {
@@ -3005,7 +3005,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				syncWidget(ctx);
 				persistHistory();
 				ctx.ui?.notify?.(
-					`rolling-tools: 视图模式已切换为「${state.viewMode === "running" ? "仅显示正在执行的任务" : `固定最近 ${currentConfig.maxRecentTools} 行`}」`,
+					`rolling-tools: view mode set to "${state.viewMode === "running" ? "running task only" : `last ${currentConfig.maxRecentTools} lines`}"`,
 					"info",
 				);
 			} else if (action === "clear") {
@@ -3019,14 +3019,14 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				persistHistory();
 				syncWidget(ctx);
 				activeOverlay?.refresh();
-				ctx.ui?.notify?.("✓ rolling-tools: 工具历史已清空", "info");
+				ctx.ui?.notify?.("✓ rolling-tools: tool history cleared", "info");
 			} else if (action === "history" || action === "open") {
 				openHistoryOverlay(ctx);
 			} else {
 				currentConfig.enabled = !currentConfig.enabled;
 				if (!currentConfig.enabled) clearTransientStatuses();
 				refreshToolActivity(ctx);
-				ctx.ui?.notify?.(`rolling-tools: ${currentConfig.enabled ? "已开启" : "已关闭"}`, "info");
+				ctx.ui?.notify?.(`rolling-tools: ${currentConfig.enabled ? "enabled" : "disabled"}`, "info");
 			}
 		},
 	});

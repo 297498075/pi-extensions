@@ -39,6 +39,7 @@
 - Extension 必须默认导出接收 `ExtensionAPI` 的 factory function。
 - 只在 `session_start` 或实际需要时启动 watcher、timer、socket、child process 等长生命周期资源，并在 `session_shutdown` 中释放。
 - 注册 custom tool 时为参数提供完整 schema；tool 的可持久状态放在结果的 `details` 中，确保 session fork 后可以恢复。
+- 上下文成本按需支付：低频、schema 较大的工具（多媒体生成、定时任务、本机文件搜索、结构化提问）用 `exposure: "deferred"` 注册，并调用 `extensions/lib/tool-exposure.ts` 的 `deferTools(pi, [...])`：`session_start` 时激活 `tool_search`，让模型按名字搜索加载；没有可搜索工具时改为激活这些工具本身，避免它们悄悄变成不可达（显式 `--tools` 允许清单会排除未列出的工具，此时以用户选择为准）。只写 `exposure: "deferred"` 而不调用 `deferTools` 会让工具永远不可达。同时要在机器的 `AGENTS.md` 中列出这些工具名，否则模型不知道它们存在。
 - 状态与配置查询交互规范：所有提供 `/command status` 或类似只读配置/状态查询的扩展，**统一使用 `ctx.ui.custom()` 模态悬浮窗口（Modal Component）呈现**，不得依赖 `ctx.ui.notify(info)` 打印长文本。因为长文本通知容易被 `rolling-tools` 的通知静音拦截规则吞掉，且在终端中没有结构化视觉焦点。无 UI 降级环境（如非交互终端）方可回退到控制台或 notify。
 - Extension 运行时拥有完整系统权限，涉及写文件、执行命令、网络请求或凭据时，必须在文档中说明风险。
 

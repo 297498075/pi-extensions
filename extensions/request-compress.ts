@@ -590,10 +590,10 @@ export function resetStats(): void {
 }
 
 const REQUEST_COMPRESS_SUBCOMMANDS: AutocompleteItem[] = [
-	{ value: "status", label: "status", description: "查看当前压缩状态、算法与流量节省统计" },
-	{ value: "on", label: "on", description: "开启 HTTP 请求体压缩" },
-	{ value: "off", label: "off", description: "关闭 HTTP 请求体压缩" },
-	{ value: "reload", label: "reload", description: "从磁盘重新载入压缩配置" },
+	{ value: "status", label: "status", description: "Show the current compression status, algorithm and traffic savings" },
+	{ value: "on", label: "on", description: "Enable HTTP request body compression" },
+	{ value: "off", label: "off", description: "Disable HTTP request body compression" },
+	{ value: "reload", label: "reload", description: "Reload the compression configuration from disk" },
 ];
 
 export function getRequestCompressArgumentCompletions(argumentPrefix: string): AutocompleteItem[] | null {
@@ -611,7 +611,7 @@ export default function requestCompressExtension(pi: ExtensionAPI): void {
 	updateLiveContext(activeConfig, activeEnvCtx);
 	pi.on("session_start", (_event, ctx) => {
 		updateLiveContext(loadConfig(ctx.cwd), resolvePiEnvironment());
-		if (!setupFetchHook()) ctx.ui.notify("request-compress: 旧版 fetch hook 无法安全热替换，已关闭压缩；请重启 Pi 后重新启用。", "warning");
+		if (!setupFetchHook()) ctx.ui.notify("request-compress: the legacy fetch hook cannot be hot-swapped safely, so compression is off; restart Pi and enable it again.", "warning");
 	});
 	pi.on("session_shutdown", () => teardownFetchHook());
 
@@ -624,7 +624,7 @@ export default function requestCompressExtension(pi: ExtensionAPI): void {
 
 			if (sub === "on") {
 				if (hasLegacyFetchHook()) {
-					ctx.ui.notify("request-compress: 请先重启 Pi，清理旧版 fetch hook。", "warning");
+					ctx.ui.notify("request-compress: restart Pi first to remove the legacy fetch hook.", "warning");
 					return;
 				}
 				currentConfig.enabled = true;

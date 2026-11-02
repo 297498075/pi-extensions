@@ -4,6 +4,11 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- chore(i18n): write every model- and user-facing string in English (tool descriptions, prompt guidelines, parameter schemas, tool results, status modals, slash-command help and completion), keeping the functional Chinese values that match Chinese plugin notifications and Chinese time-unit input.
+
+- feat(exposure): register the `listary`, `timer`, `media-gen` and `ask-user` tools as `deferred`, so their schemas (about 11 KB, roughly 2.7K prompt tokens per request) stay out of every request until the model searches for one; `extensions/lib/tool-exposure.ts` activates `tool_search` on session start, keeps already loaded tools declared, and falls back to activating the tools themselves when no search tool can reach them.
+- test(exposure): assert all four extensions register exactly their tools deferred with schema and `execute` intact, and cover `deferTools` activation, idempotence, an already active dispatcher, a missing or inert search tool, branch-local declarations and the empty list.
+
 - feat(ask-user): automatically speak questionnaire reminders while voice is enabled; optional `voice_prompt` lets the LLM choose a callout or spoken question, with a generic fallback, FIFO presentation, request-owned cancellation and no automatic recording.
 - test(ask-user): cover the voice bridge with isolated gateway mocks, including load order, disabled/missing voice, busy/failing audio, detached requests, cancellation, session isolation and TUI/RPC/headless modes. VOICE-001 remains unchanged.
 

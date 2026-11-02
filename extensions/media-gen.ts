@@ -6,6 +6,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
+import { deferTools } from "./lib/tool-exposure.ts";
 
 // ============================================================================
 // Schemas (Strictly English descriptions, width/height driven, no duration)
@@ -966,6 +967,7 @@ async function loadBackgroundWorkRegistration(): Promise<(provider: ImageBackgro
 }
 
 export default function mediaGenExtension(pi: ExtensionAPI): void {
+	deferTools(pi, ["generate_image", "generate_video", "image_job_status"]);
 	// Retain final results for read-only queries within this session/branch only.
 	const imageJobs = new Map<string, ImageJob>();
 	const providerName = `media-gen-${randomUUID()}`;
@@ -1004,6 +1006,7 @@ export default function mediaGenExtension(pi: ExtensionAPI): void {
 		label: "Image Job Status",
 		description: "Query an asynchronous image job without waiting. Returns running, completed (with image path) or failed (with error). Final results can be read repeatedly in the current session/branch; reload, session replacement or tree navigation clears the cache. Unknown IDs return not_found. Completion is still delivered automatically; do not busy-poll. Does not cancel, retry or start generation.",
 		parameters: ImageJobStatusSchema,
+		exposure: "deferred",
 		async execute(_toolCallId, params) {
 			const jobId = params.jobId.trim();
 			const job = imageJobs.get(jobId);
@@ -1035,6 +1038,7 @@ export default function mediaGenExtension(pi: ExtensionAPI): void {
 		description:
 			"Generate or edit an image. By default starts a background job and returns its ID immediately, not an image path. Completion or failure is delivered automatically to the Agent; use image_job_status for an on-demand status/result lookup, not busy-polling or resubmission. Use async:false to wait for the final result. Uses a 10-minute total deadline, automatic aspect ratio and configured fallback models.",
 		parameters: GenerateImageSchema,
+		exposure: "deferred",
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const typedParams = params as GenerateImageParams;
@@ -1185,6 +1189,7 @@ export default function mediaGenExtension(pi: ExtensionAPI): void {
 		description:
 			"Generate dynamic video clips from text descriptions (Text-to-Video) or animate a reference image / first frame (Image-to-Video). Automatically computes aspect ratio and handles configured fallback models.",
 		parameters: GenerateVideoSchema,
+		exposure: "deferred",
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const typedParams = params as GenerateVideoParams;

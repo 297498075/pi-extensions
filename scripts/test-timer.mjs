@@ -19,7 +19,7 @@ console.log("=== Test 1: parseTimerArgs Parsing Capabilities ===");
 	if (res.success) {
 		assert.equal(res.data.seconds, 150, "30s + 2m = 150s");
 		assert.equal(res.data.prompt, "执行代码检查");
-		assert.equal(res.data.rawTime, "30秒 2分 0时");
+		assert.equal(res.data.rawTime, "30s 2m 0h");
 	}
 }
 
@@ -122,9 +122,9 @@ console.log("=== Test 1: parseTimerArgs Parsing Capabilities ===");
 console.log("✓ parseTimerArgs all tests passed!");
 
 console.log("\n=== Test 2: Formatting Helpers ===");
-assert.equal(formatDuration(45), "45秒");
-assert.equal(formatDuration(150), "2分30秒");
-assert.equal(formatDuration(3665), "1小时1分5秒");
+assert.equal(formatDuration(45), "45s");
+assert.equal(formatDuration(150), "2m30s");
+assert.equal(formatDuration(3665), "1h1m5s");
 assert.equal(formatClockTime(45), "00:45");
 assert.equal(formatClockTime(150), "02:30");
 assert.equal(formatClockTime(3665), "01:01:05");
@@ -173,7 +173,7 @@ console.log("\n=== Test 3: TimerManager Lifecycle & Dispatch ===");
 	assert.equal(appendedEntries[0].data.taskId, task.id);
 	assert.ok(widgetSet !== null, "Widget should be set");
 	assert.equal(widgetSet.key, TIMER_WIDGET_KEY);
-	assert.ok(widgetSet.lines[0].includes("定时任务倒计时"));
+	assert.ok(widgetSet.lines[0].includes("[timer]"), "Widget shows the timer line");
 
 	// 2. 状态模态渲染验证
 	const fakeTui = { terminal: { rows: 30 } };
@@ -188,7 +188,7 @@ console.log("\n=== Test 3: TimerManager Lifecycle & Dispatch ===");
 	});
 	const rendered = modal.render(80);
 	assert.ok(rendered.length > 5, "Modal should render multiple lines");
-	assert.ok(rendered.some((l) => l.includes("定时任务管理器")), "Modal should contain title");
+	assert.ok(rendered.some((l) => l.includes("Scheduled Tasks")), "Modal should contain title");
 	assert.ok(rendered.some((l) => l.includes("测试任务1")), "Modal should contain active task");
 
 	// 触发按键关闭

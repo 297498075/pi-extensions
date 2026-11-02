@@ -127,7 +127,7 @@ try {
 		const keepAlive = setTimeout(() => {}, 100);
 		try {
 			const result = await runDesktopCommand({ command: "fixture", args: [] }, undefined, 10);
-			assert.equal(result.ok, false); assert.match(result.error, /超时/); assert.equal(child.kills, 1);
+			assert.equal(result.ok, false); assert.match(result.error, /timed out/); assert.equal(child.kills, 1);
 		} finally { clearTimeout(keepAlive); }
 	});
 	console.log("✓ missing executables, nonzero exit, stdin EPIPE, timeout, cancellation and late errors resolve safely");
@@ -185,12 +185,12 @@ try {
 			widget.render(140);
 			widget.handleMouse({ type: "click", button: "left", ctrl: true, x: 4, y: 1 });
 			await tick();
-			assert.ok(widget.render(80).some(line => line.includes("打开失败")), "failed open must be visible without crashing");
+			assert.ok(widget.render(80).some(line => line.includes("Open failed")), "failed open must be visible without crashing");
 			widget.render(140);
 			widget.handleMouse({ type: "click", button: "right", x: 4, y: 1 });
 			await tick(); const lines = widget.render(80);
-			assert.ok(lines.some(line => line.includes("复制失败")), "failed copy must never claim success");
-			assert.ok(!lines.some(line => line.includes("已复制")));
+			assert.ok(lines.some(line => line.includes("Copy failed")), "failed copy must never claim success");
+			assert.ok(!lines.some(line => line.includes("Copied")));
 			bounded(widget, widths);
 			await env.command("history");
 			const overlayLines = env.overlay().render(100);
@@ -198,7 +198,7 @@ try {
 			const left = overlayLines[top].indexOf("┌");
 			env.overlay().handleMouse({ type: "click", button: "left", x: left + 4, y: top + 2 });
 			await tick();
-			assert.ok(env.overlay().render(100).some(line => line.includes("复制失败")), "overlay must also report failure safely");
+			assert.ok(env.overlay().render(100).some(line => line.includes("Copy failed")), "overlay must also report failure safely");
 		});
 		let shutdownChild;
 		await withSpawn(() => { shutdownChild = fakeChild(); return shutdownChild; }, async () => {

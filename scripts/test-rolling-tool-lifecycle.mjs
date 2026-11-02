@@ -46,12 +46,12 @@ try {
 		await draft(h, [failed]);
 		let item = (await h.snapshot()).items[0];
 		assert.equal(item.status, "preparing");
-		assert.ok(h.lines().some(line => line.includes("生成参数") && line.includes("✎")));
+		assert.ok(h.lines().some(line => line.includes("preparing") && line.includes("✎")));
 		now += 30_000;
 		assert.ok(!h.lines().some(line => line.includes("30.0s")), "stream time is not read execution time");
 		await h.emit("message_end", { message: { role: "assistant", stopReason: "error", errorMessage: "The server is overloaded or not ready yet. Please try again later.", content: [failed] } });
 		item = (await h.snapshot()).items[0];
-		assert.equal(item.status, "error"); assert.match(item.output, /未执行/); assert.equal(item.durationMs, undefined);
+		assert.equal(item.status, "error"); assert.match(item.output, /Not executed/); assert.equal(item.durationMs, undefined);
 		await h.emit("agent_end", { messages: [] });
 		assert.equal(h.snapshots.at(-1).data.items[0].status, "error", "failed stream is never persisted as running");
 		await start(h, "retry-read"); await end(h, "retry-read", "read", false, 7);
@@ -63,7 +63,7 @@ try {
 
 		const aborted = call("aborted-read"); await draft(h, [aborted]);
 		await h.emit("message_end", { message: { role: "assistant", stopReason: "aborted", content: [aborted] } });
-		assert.match((await h.snapshot()).items.find(tool => tool.id === aborted.id).output, /未执行/);
+		assert.match((await h.snapshot()).items.find(tool => tool.id === aborted.id).output, /Not executed/);
 		await draft(h, [call("lost-error-content")]);
 		await h.emit("message_end", { message: { role: "assistant", stopReason: "error", errorMessage: "stream ended", content: [] } });
 		assert.equal((await h.snapshot()).items.find(tool => tool.id === "lost-error-content").status, "error", "empty final errors must retire their earlier partial previews");
@@ -233,7 +233,7 @@ try {
 		const snapshot = await cancelled.snapshot();
 		assert.equal(snapshot.items.find(tool => tool.id === "cancelled-execution").status, "error");
 		assert.equal(snapshot.items.find(tool => tool.id === "never-dispatched").status, "error");
-		assert.match(snapshot.items.find(tool => tool.id === "never-dispatched").output, /未执行/);
+		assert.match(snapshot.items.find(tool => tool.id === "never-dispatched").output, /Not executed/);
 	} finally { abortAgent.abort(); if (abortRun) await abortRun; await cancelled.emit("session_shutdown"); }
 	console.log("✓ native sequential cancellation closes later drafts that were never dispatched");
 } finally {

@@ -46,6 +46,14 @@ pi --extension ./extensions/example.ts
 
 命名使用小写 kebab-case；运行时依赖放在 `dependencies`，Pi core 依赖放在 `peerDependencies`。完整规则见 [`AGENTS.md`](AGENTS.md) 和 [`docs/development.md`](docs/development.md)。
 
+## 工具曝光与上下文成本
+
+Pi 每个请求都会带上所有已声明工具的 JSON Schema。低频但 schema 较大的工具（`generate_image`、`generate_video`、`image_job_status`、`timer_schedule`、`timer_cancel`、`timer_list`、`listary_search`、`ask_user_question`、`get_user_answer`、`wait_user_answer`）以 `exposure: "deferred"` 注册：schema 不进请求，模型先用 `tool_search` 搜索，匹配到的工具在下一个请求才会声明。实测这 10 个工具约占 11 KB schema（≈2.7K token）。
+
+`extensions/lib/tool-exposure.ts` 的 `deferTools(pi, [...])` 会在 `session_start` 时确保 `tool_search` 处于激活状态，因此无需额外配置即可生效；`deferred` 工具同时仍可被 `codemode` 脚本直接调用。若当前会话里没有任何可搜索工具（例如显式 `--tools` 允许清单排除了 `tool_search`），则改为激活这些工具本身，避免它们变成不可达。
+
+模型并不知道被推迟工具的精确名字，建议在机器的 `AGENTS.md` 里列一份简短目录，提示用 `tool_search` 按名字加载。回归用例见 `scripts/test-tool-exposure.mjs`。
+
 ## Listary：本机文件搜索
 
 `extensions/listary.ts` 注册 `listary_search`，让 agent 通过 Listary Local HTTP API 按名称/路径查找本机文件和目录，支持目录、类型、扩展名过滤与分页。需在同一主机启动 Listary 并启用其本地 API（`127.0.0.1:38431`，默认关闭）。

@@ -11,6 +11,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import { ASK_USER_VOICE_PROMPT, DEFAULT_QUESTION_VOICE_PROMPT, type QuestionVoicePrompt } from "./lib/ask-user-voice.ts";
+import { deferTools } from "./lib/tool-exposure.ts";
 
 // ==========================================
 // Schema 定义
@@ -19,34 +20,34 @@ import { ASK_USER_VOICE_PROMPT, DEFAULT_QUESTION_VOICE_PROMPT, type QuestionVoic
 export const OptionSchema = Type.Object({
 	label: Type.String({
 		maxLength: 80,
-		description: "简明选项显示文本 (1-5个词)",
+		description: "Concise option label, 1-5 words.",
 	}),
 	description: Type.Optional(
 		Type.String({
-			description: "每个选项都应填写：具体会怎么做、影响的行为/范围、主要收益与代价或风险、适用场景。推荐项必须结合用户当前需求解释为什么比其他项更合适；避免只写‘更好/推荐/更灵活’或复述标签。不确定的影响要明确说明。",
+			description: "Required for every option: what will actually be done, affected behavior and scope, main benefits and costs or risks, and when the option fits. A recommended option must explain why it suits the current request better than the alternatives; never merely restate its label or claim it is better, recommended or more flexible without reasons. State material unknowns explicitly.",
 		}),
 	),
 });
 
 export const QuestionItemSchema = Type.Object({
 	question: Type.String({
-		description: "向用户提出的完整具体问题，以问号结尾",
+		description: "Complete, specific question for the user, ending with a question mark.",
 	}),
 	header: Type.Optional(
 		Type.String({
 			maxLength: 24,
-			description: "短标签/类别名 (如 '架构选择', '数据库', '确认')",
+			description: "Short label or category name, such as 'Architecture', 'Database' or 'Confirm'.",
 		}),
 	),
 	options: Type.Array(OptionSchema, {
 		minItems: 1,
 		maxItems: 12,
-		description: "可供选择的选项列表 (1-12项)。'Type something.' 会由系统自动追加，请勿手动添加 Other",
+		description: "Options the user can choose from (1-12). A 'Type something...' choice is appended automatically, so never author an 'Other' option yourself.",
 	}),
 	multiSelect: Type.Optional(
 		Type.Boolean({
 			default: false,
-			description: "是否允许多选 (默认为 false 单选)",
+			description: "Allow selecting several options; defaults to false (single choice).",
 		}),
 	),
 });
@@ -55,16 +56,16 @@ export const AskUserQuestionSchema = Type.Object({
 	voice_prompt: Type.Optional(Type.String({
 		minLength: 1,
 		maxLength: 500,
-		description: "voice 开启时自动播放的口语提醒。由你结合当前场景决定：简短呼叫用户、直接提问或概括需要确认的选择，限 1–2 句，不读代码、路径或长选项。省略则使用简短呼叫；无需另外调用 voice_speak，不会自动录音。",
+		description: "Spoken reminder played automatically when voice is enabled. Decide from the situation: call the user over, ask the question aloud, or summarize the decision in 1-2 sentences; do not read code, paths or long options. Omit it for a generic spoken alert. Do not also call voice_speak, and this never starts recording.",
 	})),
 	blocking: Type.Optional(Type.Boolean({
 		default: true,
-		description: "默认 true：等待用户回答。false：立即返回 requestId，让用户回答的同时继续不依赖该答案的工作；答案自动通知。需要答案才能继续时调用 wait_user_answer，勿把未回答或取消当成同意。",
+		description: "Defaults to true, which waits for the answer. false returns a requestId immediately so work that does not depend on the answer can continue; the answer is delivered automatically. Call wait_user_answer when the answer is required. Never treat an unanswered or cancelled question as consent.",
 	})),
 	questions: Type.Array(QuestionItemSchema, {
 		minItems: 1,
 		maxItems: 4,
-		description: "需要向用户询问的问题列表 (1-4个)",
+		description: "Questions to ask the user (1-4).",
 	}),
 });
 
@@ -87,7 +88,7 @@ interface QuestionnaireResult {
 const ANSWER_MESSAGE = "ask-user-answer";
 
 export const AnswerRequestSchema = Type.Object({
-	requestId: Type.String({ minLength: 1, description: "ask_user_question 返回的 requestId" }),
+	requestId: Type.String({ minLength: 1, description: "requestId returned by ask_user_question." }),
 });
 
 const RequestSnapshotSchema = Type.Object({
@@ -158,11 +159,11 @@ function notifyPrompt(title: string, ctx: ExtensionContext): void {
 		process.stdout.write("\x07");
 		// 2. OSC 9 终端原生弹窗通知 (Windows Terminal / WezTerm / iTerm2 原生支持)
 		const cleanTitle = title.replace(/[\x00-\x1f]/g, " ").slice(0, 80);
-		process.stdout.write(`\x1b]9;Pi 需要决策: ${cleanTitle}\x07`);
+		process.stdout.write(`\x1b]9;Pi needs a decision: ${cleanTitle}\x07`);
 	} catch {
 		// ignore
 	}
-	ctx.ui.notify?.(`需要用户决策: ${title.slice(0, 40)}`, "info");
+	ctx.ui.notify?.(`User decision needed: ${title.slice(0, 40)}`, "info");
 }
 
 // ==========================================
@@ -170,6 +171,7 @@ function notifyPrompt(title: string, ctx: ExtensionContext): void {
 // ==========================================
 
 export default function askUserQuestion(pi: ExtensionAPI): void {
+	deferTools(pi, ["ask_user_question", "get_user_answer", "wait_user_answer"]);
 	const requests = new Map<string, LiveRequest>();
 	let queue: LiveRequest[] = [];
 	let active: LiveRequest | undefined;
@@ -195,7 +197,7 @@ export default function askUserQuestion(pi: ExtensionAPI): void {
 			}, { triggerTurn: true, deliverAs: "steer" });
 		} catch {
 			// A delivery failure must not discard the answer or reject a detached task.
-			request.ctx.ui.notify?.("答案已保存，可通过 get_user_answer 获取；自动通知失败。", "warning");
+			request.ctx.ui.notify?.("The answer was saved and can be read with get_user_answer; automatic delivery failed.", "warning");
 		}
 	}
 
@@ -276,6 +278,7 @@ export default function askUserQuestion(pi: ExtensionAPI): void {
 				? "Wait for an ask_user_question request only when further work requires its answer. Returns immediately if already answered/cancelled/failed. Aborting this wait does not cancel the question. Never treat cancellation as consent."
 				: "Check an ask_user_question request by requestId without waiting. Returns pending, answered, cancelled, or error. Do not busy-poll: continue independent work or call wait_user_answer when the answer is required.",
 			parameters: AnswerRequestSchema,
+			exposure: "deferred",
 			async execute(_id, { requestId }, signal) {
 				const request = requests.get(requestId);
 				if (!request) return {
@@ -308,6 +311,7 @@ Guidelines:
 - Set voice_prompt to a concise, conversational reminder suited to the moment: call the user over, ask the question aloud, or summarize the decision in 1-2 sentences. When voice is enabled it plays automatically alongside the questionnaire; do not also call voice_speak for the same question. Omit it for a generic spoken alert. This does not start recording or accept spoken answers.
 `,
 		parameters: AskUserQuestionSchema,
+		exposure: "deferred",
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (!ctx.hasUI || !params.questions?.length || signal?.aborted) {
@@ -467,8 +471,8 @@ async function presentQuestionnaire(typedParams: AskUserQuestionParams, _signal:
 
 					const states: QuestionState[] = typedParams.questions.map(() => {
 						const input = new Input({
-							prompt: "自定义: ",
-							placeholder: "直接打字输入，Enter确认",
+							prompt: "Custom: ",
+							placeholder: "Type directly, Enter confirms",
 						});
 						return {
 							cursorIndex: 0,
@@ -493,7 +497,7 @@ async function presentQuestionnaire(typedParams: AskUserQuestionParams, _signal:
 
 					function getDisplayOptions(q: QuestionItem): Array<{ label: string; description?: string; isCustom?: boolean }> {
 						const list = q.options.map((o) => ({ label: o.label, description: o.description, isCustom: false }));
-						list.push({ label: "Type something...", description: "输入自定义回复 (键入即选中，支持 ←→ 移动光标)", isCustom: true });
+						list.push({ label: "Type something...", description: "Type a custom reply (typing selects it; ←→ moves the cursor)", isCustom: true });
 						return list;
 					}
 
@@ -510,7 +514,7 @@ async function presentQuestionnaire(typedParams: AskUserQuestionParams, _signal:
 								if (st.selectedIndices.has(i)) {
 									if (i === customIdx) {
 										if (customVal) {
-											results.push(`[自定义] ${customVal}`);
+											results.push(`[custom] ${customVal}`);
 										}
 									} else {
 										results.push(opts[i].label);
@@ -522,7 +526,7 @@ async function presentQuestionnaire(typedParams: AskUserQuestionParams, _signal:
 							if (st.singleSelectedIndex !== undefined && opts[st.singleSelectedIndex]) {
 								if (st.singleSelectedIndex === customIdx) {
 									if (customVal) {
-										results.push(`[自定义] ${customVal}`);
+										results.push(`[custom] ${customVal}`);
 									}
 								} else {
 									results.push(opts[st.singleSelectedIndex].label);
@@ -542,7 +546,7 @@ async function presentQuestionnaire(typedParams: AskUserQuestionParams, _signal:
 							finalAnswers.push({
 								question: q.question,
 								header: q.header,
-								selected: selected.length > 0 ? selected : ["(未作答)"],
+								selected: selected.length > 0 ? selected : ["(unanswered)"],
 								customText: customVal || undefined,
 							});
 						}
@@ -772,7 +776,7 @@ async function presentQuestionnaire(typedParams: AskUserQuestionParams, _signal:
 
 						// 1. 最小化呈现
 						if (isMinimized) {
-							const hint = " [⏸ Agent 等待决策中... 按 Ctrl+] 或 任意键 展开 | Esc 放弃] ";
+							const hint = " [⏸ Agent waiting for a decision... press Ctrl+] or any key to expand | Esc to discard] ";
 							lines.push(theme.style(hint.padEnd(renderWidth, " "), { fg: "accent", bold: true }));
 							cachedLines = lines;
 							return lines;
@@ -795,9 +799,9 @@ async function presentQuestionnaire(typedParams: AskUserQuestionParams, _signal:
 						// 加上 Review Tab
 						const isReviewActive = currentTab === reviewTabIndex;
 						if (isReviewActive) {
-							tabsList.push(theme.style("[ 📋 提交确认 ]", { fg: "warning", bold: true }));
+							tabsList.push(theme.style("[ 📋 Review ]", { fg: "warning", bold: true }));
 						} else {
-							tabsList.push(theme.fg("muted", " 📋 提交确认 "));
+							tabsList.push(theme.fg("muted", " 📋 Review "));
 						}
 
 						const tabsStr = tabsList.join(" ");
@@ -810,7 +814,7 @@ async function presentQuestionnaire(typedParams: AskUserQuestionParams, _signal:
 
 						// 3. 视图分支 A：Review 提交确认页
 						if (currentTab === reviewTabIndex) {
-							lines.push(`│ ${theme.style("📋 请检查并确认您的所有选择 (Review Answers)", { fg: "text", bold: true })}`);
+							lines.push(`│ ${theme.style("📋 Review every answer before submitting", { fg: "text", bold: true })}`);
 							lines.push("│");
 
 							for (let i = 0; i < totalQuestions; i++) {
@@ -820,7 +824,7 @@ async function presentQuestionnaire(typedParams: AskUserQuestionParams, _signal:
 								lines.push(`│ ${theme.fg("accent", `${i + 1}. `)}${theme.style(`${tag}${q.question}`, { fg: "text", bold: true })}`);
 
 								if (selected.length === 0) {
-									lines.push(`│    ${theme.fg("warning", "⚠ (未作答 / 跳过)")}`);
+									lines.push(`│    ${theme.fg("warning", "⚠ (unanswered / skipped)")}`);
 								} else {
 									for (const item of selected) {
 										lines.push(`│    ${theme.fg("success", "✓")} ${theme.fg("text", item)}`);
@@ -830,11 +834,11 @@ async function presentQuestionnaire(typedParams: AskUserQuestionParams, _signal:
 							}
 
 							lines.push("│");
-							const submitBtn = theme.style(" [ 🚀 确认并提交所有答案 (Enter / S) ] ", { fg: "accent", bold: true });
-							const backBtn = theme.fg("dim", " [ ↩ 返回上一题修改 (Left / [) ] ");
+							const submitBtn = theme.style(" [ 🚀 Submit all answers (Enter / S) ] ", { fg: "accent", bold: true });
+							const backBtn = theme.fg("dim", " [ ↩ Back to the previous question (Left / [) ] ");
 							lines.push(`│  ${submitBtn}  ${backBtn}`);
 							lines.push("│");
-							lines.push(`│ ${theme.fg("dim", "Enter/S 提交 · ← 或 Shift+Tab 回退 · 1-9 跳回对应题目 · Esc 取消")}`);
+							lines.push(`│ ${theme.fg("dim", "Enter/S submits · ← or Shift+Tab goes back · 1-9 jumps to that question · Esc cancels")}`);
 							lines.push(theme.fg("accent", "╰" + "─".repeat(renderWidth - 2) + "╯"));
 
 							cachedLines = lines;
@@ -847,8 +851,8 @@ async function presentQuestionnaire(typedParams: AskUserQuestionParams, _signal:
 						const q = getCurrentQ()!;
 						const st = getCurrentState()!;
 						const modeBadge = q.multiSelect
-							? theme.style(" [多选: 空格勾选, Enter进入下一题] ", { fg: "warning", bold: true })
-							: theme.fg("dim", " [单选: Enter/数字键确认] ");
+							? theme.style(" [multi-select: Space toggles, Enter moves on] ", { fg: "warning", bold: true })
+							: theme.fg("dim", " [single choice: Enter or a number confirms] ");
 
 						lines.push(`│ ${theme.style("❓ " + q.question, { fg: "text", bold: true })}${modeBadge}`);
 						lines.push("│");
@@ -870,7 +874,7 @@ async function presentQuestionnaire(typedParams: AskUserQuestionParams, _signal:
 						const visibleEnd = Math.min(totalOpts, visibleStart + maxVisibleOptions);
 
 						if (visibleStart > 0) {
-							lines.push(`│   ${theme.fg("dim", "▲ ... 更多上方选项 ...")}`);
+							lines.push(`│   ${theme.fg("dim", "▲ ... more options above ...")}`);
 						}
 
 						for (let i = visibleStart; i < visibleEnd; i++) {
@@ -915,19 +919,19 @@ async function presentQuestionnaire(typedParams: AskUserQuestionParams, _signal:
 						}
 
 						if (visibleEnd < totalOpts) {
-							lines.push(`│   ${theme.fg("dim", "▼ ... 更多下方选项 ...")}`);
+							lines.push(`│   ${theme.fg("dim", "▼ ... more options below ...")}`);
 						}
 
 						// 底部操作提示
 						lines.push("│");
 						const multiHints = q.multiSelect
-							? "Space 切换勾选 · Enter 下一题 · "
-							: "Enter 确认本题 · ";
+							? "Space toggles · Enter next question · "
+							: "Enter confirms this question · ";
 						const isAtCustomRow = st.cursorIndex === customIndex;
 						const navHints = isAtCustomRow
-							? "←/→ 移动文字光标 · Tab 切换题目 · "
-							: (totalTabs > 1 ? "←/→ 或 Tab 切换题目 · " : "");
-						const footerHints = `↑/↓ 移动 · ${multiHints}${navHints}Ctrl+] 最小化 · Esc 取消`;
+							? "←/→ moves the text cursor · Tab switches questions · "
+							: (totalTabs > 1 ? "←/→ or Tab switches questions · " : "");
+						const footerHints = `↑/↓ moves · ${multiHints}${navHints}Ctrl+] minimizes · Esc cancels`;
 
 						lines.push(`│ ${theme.fg("dim", footerHints)}`);
 						lines.push(theme.fg("accent", "╰" + "─".repeat(renderWidth - 2) + "╯"));

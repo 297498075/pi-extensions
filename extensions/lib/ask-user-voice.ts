@@ -1,6 +1,6 @@
 /** In-process, best-effort bridge; never persisted or sent as a model message. */
 export const ASK_USER_VOICE_PROMPT = "ask-user:voice-prompt";
-export const DEFAULT_QUESTION_VOICE_PROMPT = "有个问题需要你确认，请看一下终端。";
+export const DEFAULT_QUESTION_VOICE_PROMPT = "There is a question for you to confirm, please check the terminal.";
 
 export interface QuestionVoicePrompt {
 	text: string;

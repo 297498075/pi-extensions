@@ -5,7 +5,7 @@ import { filterVoices, voiceSearchIndex, voiceUnavailableReason, type VoiceItem 
 const clean = (s: string) => stripVTControlCharacters(s).replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 256);
 /** Local indexed search; no API or configuration operations occur while typing. */
 export class VoicePickerComponent implements Component, Focusable {
-	private readonly input = new Input({ prompt: "搜索: ", placeholder: "名称 / ID / 引擎（空格分词）" });
+	private readonly input = new Input({ prompt: "Search: ", placeholder: "name / ID / engine (space separated)" });
 	private list!: SelectList;
 	private readonly voices: VoiceItem[];
 	private readonly index: string[];
@@ -23,8 +23,8 @@ export class VoicePickerComponent implements Component, Focusable {
 	private update(): void {
 		const matches = filterVoices(this.voices, this.input.getValue(), this.index);
 		this.matched = matches.length;
-		this.list = new SelectList(matches.map(v => ({ value: v.id, label: clean(`${v.name} · ${v.id}`), description: clean(`${v.engine ?? "引擎未知"}${voiceUnavailableReason(v) ? ` · 不可选：${voiceUnavailableReason(v)}` : ""}`) })), this.maxVisible, {
-			selectedPrefix: (s: string) => this.theme.fg("accent", s), selectedText: (s: string) => this.theme.fg("accent", s), description: (s: string) => this.theme.fg("dim", s), scrollInfo: (s: string) => this.theme.fg("dim", s), noMatch: () => this.theme.fg("warning", "无匹配音色；请修改关键词"),
+		this.list = new SelectList(matches.map(v => ({ value: v.id, label: clean(`${v.name} · ${v.id}`), description: clean(`${v.engine ?? "unknown engine"}${voiceUnavailableReason(v) ? ` · unavailable: ${voiceUnavailableReason(v)}` : ""}`) })), this.maxVisible, {
+			selectedPrefix: (s: string) => this.theme.fg("accent", s), selectedText: (s: string) => this.theme.fg("accent", s), description: (s: string) => this.theme.fg("dim", s), scrollInfo: (s: string) => this.theme.fg("dim", s), noMatch: () => this.theme.fg("warning", "No matching voice; change the keywords"),
 		});
 		this.list.onSelect = item => this.done(item.value);
 		this.list.onCancel = () => this.done(undefined);
@@ -42,6 +42,6 @@ export class VoicePickerComponent implements Component, Focusable {
 	invalidate(): void { this.input.invalidate(); this.list.invalidate(); }
 	render(width: number): string[] {
 		width = Math.max(1, width);
-		return [this.theme.fg("accent", "选择默认音色"), ...this.input.render(width), this.theme.fg("dim", `匹配 ${this.matched} / ${this.voices.length} · 已实时获取目录`), ...this.list.render(width), this.theme.fg("dim", "↑↓ 选择 · Enter 在线确认并保存 · Esc 不更改"), this.theme.fg("dim", "仅选择音色，不开启语音、不试听；当前在途发音不受影响")].map(line => truncateToWidth(line, width));
+		return [this.theme.fg("accent", "Select the default voice"), ...this.input.render(width), this.theme.fg("dim", `${this.matched} / ${this.voices.length} matched · catalog fetched live`), ...this.list.render(width), this.theme.fg("dim", "↑↓ select · Enter confirms online and saves · Esc changes nothing"), this.theme.fg("dim", "Selects a voice only: no speech is enabled, nothing is previewed, and speech already in flight is unaffected")].map(line => truncateToWidth(line, width));
 	}
 }

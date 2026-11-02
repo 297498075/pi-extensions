@@ -342,19 +342,19 @@ fakeUi.notify = (msg) => {
 };
 
 await registeredCommand.handler("status", fakeCtx);
-assert.ok(lastCmdNotification?.includes("rolling-tools 状态:"), "status command works");
+assert.ok(lastCmdNotification?.includes("rolling-tools status:"), "status command works");
 
 await registeredCommand.handler("off", fakeCtx);
-assert.ok(lastCmdNotification?.includes("已禁用"), "off command works");
+assert.ok(lastCmdNotification?.includes("disabled"), "off command works");
 
 await registeredCommand.handler("on", fakeCtx);
-assert.ok(lastCmdNotification?.includes("已启用"), "on command works");
+assert.ok(lastCmdNotification?.includes("enabled"), "on command works");
 
 await registeredCommand.handler("reload", fakeCtx);
-assert.ok(lastCmdNotification?.includes("配置已重载"), "reload command works");
+assert.ok(lastCmdNotification?.includes("configuration reloaded"), "reload command works");
 
 await registeredCommand.handler("clear", fakeCtx);
-assert.ok(lastCmdNotification?.includes("已清空"), "clear command works");
+assert.ok(lastCmdNotification?.includes("cleared"), "clear command works");
 const clearedWidgetLines = widgetContent(dummyTui, dummyTheme).render(100);
 assert.equal(clearedWidgetLines.slice(1).filter((l) => l.includes("[") && l.includes("]")).length, 0, "history must be empty after clear");
 
@@ -448,8 +448,8 @@ console.log("  ✓ clicking ➕ opens an overlay dialog via ui.custom.");
 // 构建 overlay 组件并验证边框 + 懒加载 + 滚轮
 const overlayComp = overlayFactory(dummyTui, dummyTheme, {}, () => {});
 let oLines = overlayComp.render(120);
-assert.ok(oLines.some((l) => l.includes("工具历史")), "overlay must render a title");
-assert.ok(oLines.some((l) => l.includes("上滑到顶加载更多")), "overlay must advertise lazy-load when more history exists");
+assert.ok(oLines.some((l) => l.includes("Tool history")), "overlay must render a title");
+assert.ok(oLines.some((l) => l.includes("scroll to the top for more")), "overlay must advertise lazy-load when more history exists");
 // 全屏画布中的居中方框：找到带 ┌ / └ 的行
 const stripTheme = (s) => s.replace(/\[[a-zA-Z]+\]/g, "");
 const topIdx = oLines.findIndex((l) => stripTheme(l).includes("┌"));
@@ -475,7 +475,7 @@ console.log("  ✓ overlay renders a centered box on a full-screen canvas.");
 const boxLeftCol = stripTheme(oLines[topIdx]).indexOf("┌");
 const boxInnerX = boxLeftCol + 3; // 左栏内部
 const boxInnerY = topIdx + 3; // 标题/分隔之后的内容行
-const beforeHint = oLines.find((l) => l.includes("加载更多")) || "";
+const beforeHint = oLines.find((l) => l.includes("scroll to the top for more")) || "";
 overlayComp.handleMouse({
 	type: "wheel",
 	button: "none",
@@ -491,12 +491,12 @@ overlayComp.handleMouse({
 	wheelDelta: -1,
 });
 oLines = overlayComp.render(120);
-const afterHint = oLines.find((l) => l.includes("加载更多")) || "";
+const afterHint = oLines.find((l) => l.includes("scroll to the top for more")) || "";
 assert.notEqual(beforeHint, afterHint, "wheel-up at top must load more history (lazy load)");
 console.log("  ✓ wheel-up at top triggers lazy loading of more history.");
 
 // 实时更新：agent 运行中新增工具应能反映到已打开的大窗体
-const beforeLiveCount = (oLines.find((l) => l.includes("已全部加载") || l.includes("加载更多")) || "").match(/\((\d+)\/(\d+)\)/);
+const beforeLiveCount = (oLines.find((l) => l.includes("all loaded") || l.includes("scroll to the top for more")) || "").match(/\((\d+)\/(\d+)\)/);
 const totalBefore = beforeLiveCount ? Number(beforeLiveCount[2]) : 0;
 for (const h of toolCallHandlers) {
 	await h({ toolCallId: "call_live_1", toolName: "read", input: { path: "src/live_new.ts" } }, fakeCtx);
@@ -514,7 +514,7 @@ for (const h of toolResultHandlers) {
 }
 // syncWidget 会自动调用 activeOverlay.refresh()；这里直接重渲染验证
 const oLinesLive = overlayComp.render(120);
-const afterLiveCount = (oLinesLive.find((l) => l.includes("已全部加载") || l.includes("加载更多")) || "").match(/\((\d+)\/(\d+)\)/);
+const afterLiveCount = (oLinesLive.find((l) => l.includes("all loaded") || l.includes("scroll to the top for more")) || "").match(/\((\d+)\/(\d+)\)/);
 const totalAfter = afterLiveCount ? Number(afterLiveCount[2]) : 0;
 assert.ok(
 	totalAfter > totalBefore,
@@ -597,7 +597,7 @@ try {
 	const afterClick = overlayCompCopy.render(120);
 	assert.ok(copiedText, "clipboard helper receives the selected detail via stdin");
 	assert.ok(
-		afterClick.some((l) => l.includes("已复制")),
+		afterClick.some((l) => l.includes("Copied")),
 		"copy success feedback is shown only after the helper exits successfully",
 	);
 } finally {
@@ -670,7 +670,7 @@ assert.ok(overlayFactory, "overlay opened for edit diff verification");
 const overlayComp3 = overlayFactory(dummyTui, dummyTheme, {}, () => {});
 const oLines3 = overlayComp3.render(140);
 assert.ok(
-	oLines3.some((l) => l.includes("new line") || l.includes("变更 diff") || l.includes("diff")),
+	oLines3.some((l) => l.includes("new line") || l.includes("changed diff") || l.includes("diff")),
 	"overlay must display the edit diff from tool_result.details",
 );
 console.log("  ✓ edit diff captured from details and shown in overlay.");
@@ -736,7 +736,7 @@ rollingTools(fakePi2);
 for (const h of handlers2.get("session_start") || []) await h({ reason: "startup" }, ctx2);
 await new Promise((r) => setTimeout(r, 1000));
 
-const legacyNotice = notices2.find((n) => n.type === "warning" && n.msg.includes("旧版配置"));
+const legacyNotice = notices2.find((n) => n.type === "warning" && n.msg.includes("legacy configuration"));
 assert.ok(legacyNotice, "legacy config must trigger a one-time migration notice");
 console.log("  ✓ legacy config triggers a migration notice.");
 
@@ -1285,7 +1285,7 @@ for (const h of handlers13.get("message_update") || []) {
 
 let w13 = widgetFactory13(dummyTui, dummyTheme);
 let lines13 = w13.render(100);
-assert.ok(lines13[0].includes("思考完成"), "header shows 思考完成 right after thinking_end");
+assert.ok(lines13[0].includes("thought"), "header shows 思考完成 right after thinking_end");
 
 // 3. 模拟模型开始流式输出 toolCall（此时本地尚未真正 execute，tool_call 事件尚未触发）：
 // 先吐出 toolCall 骨架（arguments 还是空的）
@@ -1311,7 +1311,7 @@ lines13 = w13.render(100);
 const fixedToolLines = lines13.slice(1).filter((l) => l.includes("[") && l.includes("]"));
 assert.equal(fixedToolLines.length, 1, "tool is visible in fixed list immediately during streaming before tool_call");
 assert.ok(fixedToolLines[0].includes("bash"), "streaming tool name is visible in widget");
-assert.ok(fixedToolLines[0].includes("生成参数") && fixedToolLines[0].includes("✎"), "a streamed draft must not be labelled executing");
+assert.ok(fixedToolLines[0].includes("preparing") && fixedToolLines[0].includes("✎"), "a streamed draft must not be labelled executing");
 console.log("  ✓ streaming tool call captured immediately after thinking completed (before execution).");
 
 // 4. 模拟参数流式注入（toolcall_delta），验证参数在 widget 中实时更新

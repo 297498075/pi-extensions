@@ -673,18 +673,18 @@ export function pageOutContextImages(
  * 命令行自动补全配置项
  */
 export const SUBCOMMAND_COMPLETIONS: AutocompleteItem[] = [
-	{ value: "status", label: "status", description: "查看当前换页状态与节省统计（模态窗口）" },
-	{ value: "on", label: "on", description: "开启智能图片换页" },
-	{ value: "off", label: "off", description: "关闭智能图片换页" },
-	{ value: "strategy turn-boundary", label: "strategy turn-boundary", description: "Cache-Friendly 模式 (保护前缀缓存)" },
-	{ value: "strategy fifo", label: "strategy fifo", description: "FIFO 数量滑动窗口模式" },
-	{ value: "keep 1", label: "keep 1", description: "保留 1 张活跃图片 (默认推荐)" },
-	{ value: "keep 2", label: "keep 2", description: "保留 2 张活跃图片" },
-	{ value: "keep 0", label: "keep 0", description: "换出所有历史图片 (极省模式)" },
-	{ value: "lang en", label: "lang en", description: "智能指针使用英文提示词 (遵从度高)" },
-	{ value: "lang zh", label: "lang zh", description: "智能指针使用中文提示词" },
-	{ value: "reload", label: "reload", description: "从磁盘重新载入配置" },
-	{ value: "reset", label: "reset", description: "重置统计计数器" },
+	{ value: "status", label: "status", description: "Show the current paging status and savings (modal window)" },
+	{ value: "on", label: "on", description: "Enable smart image paging" },
+	{ value: "off", label: "off", description: "Disable smart image paging" },
+	{ value: "strategy turn-boundary", label: "strategy turn-boundary", description: "Cache-friendly mode (protects the prefix cache)" },
+	{ value: "strategy fifo", label: "strategy fifo", description: "FIFO count-based sliding window" },
+	{ value: "keep 1", label: "keep 1", description: "Keep 1 active image (recommended default)" },
+	{ value: "keep 2", label: "keep 2", description: "Keep 2 active images" },
+	{ value: "keep 0", label: "keep 0", description: "Page out all history images (max savings)" },
+	{ value: "lang en", label: "lang en", description: "Smart pointer notices in English (best model compliance)" },
+	{ value: "lang zh", label: "lang zh", description: "Smart pointer notices in Chinese" },
+	{ value: "reload", label: "reload", description: "Reload the configuration from disk" },
+	{ value: "reset", label: "reset", description: "Reset the statistics" },
 ];
 
 /**
@@ -696,8 +696,8 @@ export function getPagerArgumentCompletions(argumentPrefix: string): Autocomplet
 	if (prefix.startsWith("strategy ")) {
 		const sub = prefix.slice(9).trim();
 		const options: AutocompleteItem[] = [
-			{ value: "strategy turn-boundary", label: "turn-boundary", description: "Cache-Friendly 模式 (轮次边界不可变前缀)" },
-			{ value: "strategy fifo", label: "fifo", description: "FIFO 模式 (数量滑动窗口)" },
+			{ value: "strategy turn-boundary", label: "turn-boundary", description: "Cache-friendly mode (immutable prefix at turn boundaries)" },
+			{ value: "strategy fifo", label: "fifo", description: "FIFO mode (count sliding window)" },
 		];
 		const filtered = options.filter((o) => (o.label || o.value).startsWith(sub));
 		return filtered.length > 0 ? filtered : options;
@@ -706,10 +706,10 @@ export function getPagerArgumentCompletions(argumentPrefix: string): Autocomplet
 	if (prefix.startsWith("keep ")) {
 		const sub = prefix.slice(5).trim();
 		const options: AutocompleteItem[] = [
-			{ value: "keep 0", label: "0", description: "换出全部历史图片" },
-			{ value: "keep 1", label: "1", description: "保留 1 张最新图片 (默认推荐)" },
-			{ value: "keep 2", label: "2", description: "保留 2 张最新图片" },
-			{ value: "keep 3", label: "3", description: "保留 3 张最新图片" },
+			{ value: "keep 0", label: "0", description: "Page out every history image" },
+			{ value: "keep 1", label: "1", description: "Keep 1 most recent image (recommended default)" },
+			{ value: "keep 2", label: "2", description: "Keep 2 most recent images" },
+			{ value: "keep 3", label: "3", description: "Keep 3 most recent images" },
 		];
 		const filtered = options.filter((o) => (o.label || o.value).startsWith(sub));
 		return filtered.length > 0 ? filtered : options;
@@ -718,8 +718,8 @@ export function getPagerArgumentCompletions(argumentPrefix: string): Autocomplet
 	if (prefix.startsWith("lang ")) {
 		const sub = prefix.slice(5).trim();
 		const options: AutocompleteItem[] = [
-			{ value: "lang en", label: "en", description: "英文提示词 (大模型遵从度最高)" },
-			{ value: "lang zh", label: "zh", description: "中文提示词" },
+			{ value: "lang en", label: "en", description: "English notices (highest model compliance)" },
+			{ value: "lang zh", label: "zh", description: "Chinese notices" },
 		];
 		const filtered = options.filter((o) => (o.label || o.value).startsWith(sub));
 		return filtered.length > 0 ? filtered : options;
@@ -804,14 +804,14 @@ export default function (pi: ExtensionAPI) {
 			case "enable": {
 				currentConfig.enabled = true;
 				saveConfig(currentConfig, getProjectConfigPath(ctx.cwd));
-				ctx.ui.notify("image-pager: Enabled (智能图片换页已开启)", "info");
+				ctx.ui.notify("image-pager: Enabled (smart image paging is on)", "info");
 				break;
 			}
 			case "off":
 			case "disable": {
 				currentConfig.enabled = false;
 				saveConfig(currentConfig, getProjectConfigPath(ctx.cwd));
-				ctx.ui.notify("image-pager: Disabled (智能图片换页已关闭)", "info");
+				ctx.ui.notify("image-pager: Disabled (smart image paging is off)", "info");
 				break;
 			}
 			case "strategy": {
@@ -822,7 +822,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				currentConfig.strategy = strat;
 				saveConfig(currentConfig, getProjectConfigPath(ctx.cwd));
-				ctx.ui.notify(`image-pager: 换页策略已切换为 ${strat} (${strat === "turn-boundary" ? "Cache-Friendly 模式" : "FIFO 模式"})`, "info");
+				ctx.ui.notify(`image-pager: paging strategy set to ${strat} (${strat === "turn-boundary" ? "cache-friendly mode" : "FIFO mode"})`, "info");
 				break;
 			}
 			case "keep": {
@@ -833,7 +833,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				currentConfig.keepRecentImages = num;
 				saveConfig(currentConfig, getProjectConfigPath(ctx.cwd));
-				ctx.ui.notify(`image-pager: 保留活跃图片数已设为 ${num} (更早历史图片自动换出)`, "info");
+				ctx.ui.notify(`image-pager: keeping ${num} active image(s); older history images are paged out automatically`, "info");
 				break;
 			}
 			case "lang": {
@@ -844,7 +844,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				currentConfig.noticeLanguage = lang;
 				saveConfig(currentConfig, getProjectConfigPath(ctx.cwd));
-				ctx.ui.notify(`image-pager: 提示词语言已切换为 ${lang}`, "info");
+				ctx.ui.notify(`image-pager: notice language set to ${lang}`, "info");
 				break;
 			}
 			case "reload": {
@@ -865,23 +865,23 @@ export default function (pi: ExtensionAPI) {
 			}
 			case "status":
 			default: {
-				const statusText = currentConfig.enabled ? "已开启 (Enabled)" : "已关闭 (Disabled)";
+				const statusText = currentConfig.enabled ? "Enabled" : "Disabled";
 				const stratText =
 					currentConfig.strategy === "turn-boundary"
-						? "turn-boundary (Cache-Friendly 不可变前缀)"
-						: "fifo (数量滑动窗口)";
+						? "turn-boundary (cache-friendly immutable prefix)"
+						: "fifo (count sliding window)";
 
 				// Read-only status stays in a modal instead of a muted notification or timed widget.
 				const lines = [
-					`[image-pager] 状态: ${statusText} · 策略: ${stratText} · 活跃保留: ${currentConfig.keepRecentImages} 张`,
-					`• 图像统计: 发现 ${stats.totalImagesSeen} 张 · 已换出 ${stats.pagedOutImagesCount} 张 · 活跃常驻 ${stats.hotImagesRetained} 张`,
-					`• 节省收益: 节省 Payload ${formatBytes(stats.savedBytes)} · 估算节省 ~${stats.estimatedTokensSaved.toLocaleString()} Tokens`,
+					`[image-pager] status: ${statusText} · strategy: ${stratText} · keeping ${currentConfig.keepRecentImages} active`,
+					`• Images: ${stats.totalImagesSeen} seen · ${stats.pagedOutImagesCount} paged out · ${stats.hotImagesRetained} active`,
+					`• Savings: ${formatBytes(stats.savedBytes)} of payload · about ${stats.estimatedTokensSaved.toLocaleString()} tokens`,
 				];
 
 				if (stats.recentPagedOutImages.length > 0) {
 					const latest = stats.recentPagedOutImages[0];
 					const shortPath = latest.path.length > 50 ? "..." + latest.path.slice(-47) : latest.path;
-					lines.push(`• 最近换出: ${latest.fileName} (${formatBytes(latest.bytes)}) -> ${shortPath}`);
+					lines.push(`• Last paged out: ${latest.fileName} (${formatBytes(latest.bytes)}) -> ${shortPath}`);
 				}
 
 				await showStatusModal(ctx, "Image Pager", lines);
@@ -891,13 +891,13 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand("image-pager", {
-		description: "管理图像虚拟内存换页（Virtual Memory Paging for Multimodal Images）",
+		description: "Manage virtual memory paging for multimodal images",
 		getArgumentCompletions: getPagerArgumentCompletions,
 		handler: commandHandler,
 	});
 
 	pi.registerCommand("image-paging", {
-		description: "image-pager 别名",
+		description: "Alias for image-pager",
 		getArgumentCompletions: getPagerArgumentCompletions,
 		handler: commandHandler,
 	});
