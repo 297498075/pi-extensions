@@ -204,6 +204,94 @@ try {
 	};
 	await executeImageGeneration({ prompt: "test", image: editPath }, config, provider, cwd);
 	assert.equal(editRequests, 1, "default mode must use the images editing endpoint exactly once");
+
+	let multiChatBody;
+	globalThis.fetch = async (_url, init) => {
+		multiChatBody = JSON.parse(init.body);
+		return Response.json({ choices: [{ message: { content: dataUri } }] });
+	};
+	await executeImageGeneration({ prompt: "test", image: [editPath, editPath] }, { ...config, apiMode: "chat" }, provider, cwd);
+	assert.equal(multiChatBody.messages[0].content.filter(part => part.type === "image_url").length, 2);
+
+	const gptConfig = { ...config, primaryModel: "gpt-image-2.6-sunburst", fallbackModels: [] };
+	let editForm;
+	globalThis.fetch = async (_url, init) => { editForm = init.body; return Response.json({ data: [{ b64_json: pngBase64 }] }); };
+	await executeImageGeneration({
+		prompt: "combine", image: [editPath, editPath], mask: editPath,
+		complexity: "high", quality: "xhigh", outputFormat: "png", background: "transparent",
+	}, gptConfig, provider, cwd);
+	assert.equal(editForm.getAll("image[]").length, 2);
+	assert.equal(editForm.get("image"), null);
+	assert.ok(editForm.get("mask") instanceof Blob);
+	assert.equal(editForm.get("complexity"), "high");
+	assert.equal(editForm.get("quality"), "xhigh");
+	assert.equal(editForm.get("output_format"), "png");
+	assert.equal(editForm.get("background"), "transparent");
+	assert.equal(editForm.get("response_format"), null);
+	await executeImageGeneration({ prompt: "annotated", image: editPath, markup: editPath }, gptConfig, provider, cwd);
+	assert.ok(editForm.get("markup") instanceof Blob);
+	assert.equal(editForm.get("mask"), null);
+
+	let generationBody;
+	globalThis.fetch = async (_url, init) => { generationBody = JSON.parse(init.body); return Response.json({ data: [{ b64_json: pngBase64 }] }); };
+	await executeImageGeneration({ prompt: "defaults", width: 1920, height: 1080 }, gptConfig, provider, cwd);
+	assert.deepEqual(generationBody, { model: "gpt-image-2.6-sunburst", prompt: "defaults", n: 1, size: "1536x1024" });
+	await executeImageGeneration({ prompt: "legacy", width: 1920, height: 1080 }, { ...config, primaryModel: "dall-e-3", fallbackModels: [] }, provider, cwd);
+	assert.equal(generationBody.response_format, "b64_json");
+	assert.equal(generationBody.size, "1792x1024");
+	const optionConfig = {
+		...gptConfig, complexity: "medium", quality: "high", background: "auto",
+		outputFormat: "webp", outputCompression: 75, moderation: "low", safetyIdentifier: "hashed-user",
+	};
+	await executeImageGeneration({ prompt: "options", complexity: "low", quality: "max" }, optionConfig, provider, cwd);
+	assert.deepEqual(generationBody, {
+		model: "gpt-image-2.6-sunburst", prompt: "options", n: 1, size: "1024x1024",
+		complexity: "low", quality: "max", background: "auto", output_format: "webp",
+		output_compression: 75, moderation: "low", safety_identifier: "hashed-user",
+	});
+
+	const svg = Buffer.from('<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0h1v1z"/></svg>');
+	globalThis.fetch = async (_url, init) => { generationBody = JSON.parse(init.body); return Response.json({ data: [{ b64_json: svg.toString("base64") }] }); };
+	const svgResult = await executeImageGeneration({
+		prompt: "vector", outputFormat: "svg", complexity: "high",
+		svg: { model: "gpt-svg-author", reasoning: { effort: "xhigh" } },
+	}, gptConfig, provider, cwd);
+	assert.equal(svgResult.filePath.endsWith(".svg"), true);
+	assert.deepEqual(generationBody.svg, { model: "gpt-svg-author", reasoning: { effort: "xhigh" } });
+	assert.deepEqual(readFileSync(svgResult.filePath), svg);
+
+	const gif = Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64");
+	globalThis.fetch = async (_url, init) => { generationBody = JSON.parse(init.body); return Response.json({ data: [{ b64_json: gif.toString("base64") }] }); };
+	const gifResult = await executeImageGeneration({
+		prompt: "animation", outputFormat: "gif", frameCount: 12, frameDurationMs: 100,
+	}, gptConfig, provider, cwd);
+	assert.equal(gifResult.filePath.endsWith(".gif"), true);
+	assert.equal(generationBody.frame_count, 12);
+	assert.equal(generationBody.frame_duration_ms, 100);
+	assert.deepEqual(readFileSync(gifResult.filePath), gif);
+
+	let invalidRequests = 0;
+	globalThis.fetch = async () => { invalidRequests++; return Response.json({ data: [{ b64_json: pngBase64 }] }); };
+	const invalidCases = [
+		[{ prompt: "x", mask: editPath }, config, /require at least one input image/],
+		[{ prompt: "x", image: editPath, mask: editPath, markup: editPath }, config, /cannot be combined/],
+		[{ prompt: "x", image: editPath, outputFormat: "svg" }, config, /only supported for text-to-image/],
+		[{ prompt: "x", svg: { model: "gpt-svg-author" } }, config, /require outputFormat=svg/],
+		[{ prompt: "x", frameCount: 9 }, config, /require outputFormat=gif/],
+		[{ prompt: "x", outputCompression: 80 }, config, /requires outputFormat=jpeg or webp/],
+		[{ prompt: "x", background: "transparent", outputFormat: "jpeg" }, config, /requires outputFormat=png or webp/],
+		[{ prompt: "x", image: editPath, moderation: "low" }, config, /only supported for image generation/],
+		[{ prompt: "x", image: editPath, mask: editPath, outputFormat: "gif" }, config, /does not support mask/],
+		[{ prompt: "x", image: Array(17).fill(editPath) }, config, /maximum of 16/],
+		[{ prompt: "x" }, { ...config, outputCompression: 101 }, /integer from 0 to 100/],
+		[{ prompt: "x", quality: "max" }, { ...config, apiMode: "chat" }, /not supported with image.apiMode=chat/],
+	];
+	for (const [params, invalidConfig, expected] of invalidCases) {
+		await assert.rejects(executeImageGeneration(params, invalidConfig, provider, cwd), expected);
+	}
+	assert.equal(invalidRequests, 0, "invalid option combinations must fail before any HTTP request");
+	console.log("✓ optional image API options, defaults/overrides, multi-image edits, SVG reasoning and GIF output");
+
 	await assert.rejects(executeImageGeneration({ prompt: "test" }, { ...config, apiMode: "automatic" }, provider, cwd), /apiMode/);
 	assert.equal(editRequests, 1, "invalid mode must fail before sending a request");
 	console.log("✓ explicit images/chat routing, no endpoint/refusal/transient fallback, full redacted HTTP diagnostics");

@@ -21,11 +21,58 @@ export const GenerateImageSchema = Type.Object({
 	prompt: Type.String({
 		description: "Detailed prompt describing the image to generate, or explicit instructions for editing the input image.",
 	}),
-	image: Type.Optional(
-		Type.String({
-			description: "Optional local file path or public URL of an existing image to edit/modify, or use as visual reference.",
+	image: Type.Optional(Type.Union([
+		Type.String({ description: "Local file path or public URL of an existing image to edit, or use as a visual reference." }),
+		Type.Array(Type.String(), {
+			minItems: 1,
+			maxItems: 16,
+			description: "Up to 16 input images. The first is the primary edit target; additional images are visual references.",
 		}),
-	),
+	], { description: "Optional input image or images for editing/reference." })),
+	mask: Type.Optional(Type.String({
+		description: "Optional local path or public URL of a mask image for regional editing. Requires an input image; cannot be combined with markup.",
+	})),
+	markup: Type.Optional(Type.String({
+		description: "Optional transparent PNG annotation layer for GPT Image 2.5/2.6 markup-guided editing. Applies to the first input image; cannot be combined with mask.",
+	})),
+	complexity: Type.Optional(Type.Union([
+		Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"),
+	], { description: "Image planning effort, independent of rendering quality. Higher values can help dense text and complex layouts." })),
+	quality: Type.Optional(Type.Union([
+		Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"),
+		Type.Literal("xhigh"), Type.Literal("max"), Type.Literal("auto"),
+	], { description: "Rendering quality. xhigh/max require support from the selected upstream model." })),
+	background: Type.Optional(Type.Union([
+		Type.Literal("transparent"), Type.Literal("opaque"), Type.Literal("auto"),
+	], { description: "Background behavior. Transparent output requires PNG or WebP." })),
+	outputFormat: Type.Optional(Type.Union([
+		Type.Literal("png"), Type.Literal("jpeg"), Type.Literal("webp"),
+		Type.Literal("gif"), Type.Literal("svg"),
+	], { description: "Output format. SVG is generation-only; GIF supports frameCount/frameDurationMs." })),
+	outputCompression: Type.Optional(Type.Integer({
+		minimum: 0, maximum: 100,
+		description: "JPEG/WebP compression level from 0 to 100. Only sent when explicitly configured or provided.",
+	})),
+	moderation: Type.Optional(Type.Union([
+		Type.Literal("low"), Type.Literal("auto"),
+	], { description: "Moderation level for text-to-image generation only." })),
+	svg: Type.Optional(Type.Object({
+		model: Type.String({ minLength: 1, description: "Model used to author SVG output when outputFormat is svg." }),
+		reasoning: Type.Optional(Type.Object({
+			effort: Type.Optional(Type.Union([
+				Type.Literal("none"), Type.Literal("minimal"), Type.Literal("low"),
+				Type.Literal("medium"), Type.Literal("high"), Type.Literal("xhigh"), Type.Literal("max"),
+			], { description: "Reasoning effort for the SVG author, independent of image complexity." })),
+		})),
+	}, { description: "SVG author model and reasoning settings. Requires outputFormat=svg and n=1." })),
+	frameCount: Type.Optional(Type.Integer({
+		minimum: 2, maximum: 16,
+		description: "GIF frame count (2-16). Only valid with outputFormat=gif.",
+	})),
+	frameDurationMs: Type.Optional(Type.Integer({
+		minimum: 20, maximum: 2000,
+		description: "Requested delay per GIF frame in milliseconds (20-2000). Only valid with outputFormat=gif.",
+	})),
 	width: Type.Optional(
 		Type.Number({
 			minimum: 1,
@@ -153,6 +200,20 @@ export interface MediaToolConfig {
 	defaultWidth?: number;
 	defaultHeight?: number;
 	outputDir?: string;
+	/** Optional image defaults. Omitted values are not sent to the upstream API. */
+	complexity?: "low" | "medium" | "high";
+	quality?: "low" | "medium" | "high" | "xhigh" | "max" | "auto";
+	background?: "transparent" | "opaque" | "auto";
+	outputFormat?: "png" | "jpeg" | "webp" | "gif" | "svg";
+	outputCompression?: number;
+	moderation?: "low" | "auto";
+	svg?: {
+		model: string;
+		reasoning?: { effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" };
+	};
+	frameCount?: number;
+	frameDurationMs?: number;
+	safetyIdentifier?: string;
 }
 
 export interface MediaGenConfigFile {
@@ -369,6 +430,7 @@ async function loadInputImage(input: string, cwd: string = process.cwd(), signal
 	// Validated bytes, not an object-store header or a misleading file suffix,
 	// determine both multipart and data-URI MIME types.
 	const extension = imageExtension(buffer);
+	if (extension === "svg") throw new Error("SVG is not supported as an input image for editing.");
 	return { buffer, mimeType: extension === "jpg" ? "image/jpeg" : `image/${extension}` };
 }
 
@@ -378,7 +440,13 @@ function imageExtension(buffer: Buffer): string {
 	if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "jpg";
 	if (/^GIF8[79]a$/.test(buffer.subarray(0, 6).toString("ascii"))) return "gif";
 	if (buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP") return "webp";
-	throw new Error("API returned an empty or unsupported image payload (expected PNG/JPEG/GIF/WebP).");
+	if (isSvg(buffer)) return "svg";
+	throw new Error("API returned an empty or unsupported image payload (expected PNG/JPEG/GIF/WebP/SVG).");
+}
+
+function isSvg(buffer: Buffer): boolean {
+	const text = buffer.subarray(0, 4096).toString("utf8").replace(/^\uFEFF/, "").trimStart().toLowerCase();
+	return (text.startsWith("<svg") || text.startsWith("<?xml")) && text.includes("<svg");
 }
 
 /** Container-signature validation, not a claim that a decoder has verified playback. */
@@ -463,6 +531,114 @@ class ImageGenerationError extends Error {
 	}
 }
 
+interface ImageApiOptions {
+	mask?: string;
+	markup?: string;
+	complexity?: "low" | "medium" | "high";
+	quality?: "low" | "medium" | "high" | "xhigh" | "max" | "auto";
+	background?: "transparent" | "opaque" | "auto";
+	outputFormat?: "png" | "jpeg" | "webp" | "gif" | "svg";
+	outputCompression?: number;
+	moderation?: "low" | "auto";
+	svg?: MediaToolConfig["svg"];
+	frameCount?: number;
+	frameDurationMs?: number;
+	safetyIdentifier?: string;
+}
+
+function normalizeImageInputs(image: GenerateImageParams["image"]): string[] {
+	if (image === undefined) return [];
+	const values = Array.isArray(image) ? image : [image];
+	if (values.length > 16) throw new Error("A maximum of 16 input images is supported.");
+	return values.filter(value => value.trim().length > 0).map(value => value.trim());
+}
+
+function validateImageChoice(name: string, value: unknown, allowed: readonly string[]): void {
+	if (value !== undefined && (typeof value !== "string" || !allowed.includes(value))) {
+		throw new Error(`image.${name} must be one of: ${allowed.join(", ")}.`);
+	}
+}
+
+function resolveImageApiOptions(
+	params: GenerateImageParams,
+	config: MediaToolConfig,
+	isEdit: boolean,
+	apiMode: "images" | "chat",
+): ImageApiOptions {
+	const options: ImageApiOptions = {
+		mask: params.mask?.trim() || undefined,
+		markup: params.markup?.trim() || undefined,
+		complexity: params.complexity ?? config.complexity,
+		quality: params.quality ?? config.quality,
+		background: params.background ?? config.background,
+		outputFormat: params.outputFormat ?? config.outputFormat,
+		outputCompression: params.outputCompression ?? config.outputCompression,
+		moderation: params.moderation ?? config.moderation,
+		svg: params.svg ?? config.svg,
+		frameCount: params.frameCount ?? config.frameCount,
+		frameDurationMs: params.frameDurationMs ?? config.frameDurationMs,
+		safetyIdentifier: config.safetyIdentifier,
+	};
+
+	validateImageChoice("complexity", options.complexity, ["low", "medium", "high"]);
+	validateImageChoice("quality", options.quality, ["low", "medium", "high", "xhigh", "max", "auto"]);
+	validateImageChoice("background", options.background, ["transparent", "opaque", "auto"]);
+	validateImageChoice("outputFormat", options.outputFormat, ["png", "jpeg", "webp", "gif", "svg"]);
+	validateImageChoice("moderation", options.moderation, ["low", "auto"]);
+	validateImageChoice("svg.reasoning.effort", options.svg?.reasoning?.effort, ["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
+	if (options.outputCompression !== undefined && (!Number.isInteger(options.outputCompression) || options.outputCompression < 0 || options.outputCompression > 100)) {
+		throw new Error("image.outputCompression must be an integer from 0 to 100.");
+	}
+	if (options.frameCount !== undefined && (!Number.isInteger(options.frameCount) || options.frameCount < 2 || options.frameCount > 16)) {
+		throw new Error("image.frameCount must be an integer from 2 to 16.");
+	}
+	if (options.frameDurationMs !== undefined && (!Number.isInteger(options.frameDurationMs) || options.frameDurationMs < 20 || options.frameDurationMs > 2000)) {
+		throw new Error("image.frameDurationMs must be an integer from 20 to 2000.");
+	}
+	if (options.safetyIdentifier !== undefined && (typeof options.safetyIdentifier !== "string" || options.safetyIdentifier.length > 128)) {
+		throw new Error("image.safetyIdentifier must be a string of at most 128 characters.");
+	}
+	if (options.svg !== undefined && (!options.svg || typeof options.svg !== "object" || typeof options.svg.model !== "string" || options.svg.model.trim().length === 0)) {
+		throw new Error("image.svg.model must be a non-empty string.");
+	}
+	if (options.svg?.reasoning !== undefined && (!options.svg.reasoning || typeof options.svg.reasoning !== "object" || Array.isArray(options.svg.reasoning))) {
+		throw new Error("image.svg.reasoning must be an object.");
+	}
+
+	if (apiMode === "chat") {
+		const unsupported = Object.entries(options).filter(([, value]) => value !== undefined).map(([key]) => key);
+		if (unsupported.length > 0) throw new Error(`Image API options are not supported with image.apiMode=chat: ${unsupported.join(", ")}.`);
+		return options;
+	}
+	if (!isEdit && (options.mask || options.markup)) throw new Error("mask and markup require at least one input image.");
+	if (options.mask && options.markup) throw new Error("mask and markup cannot be combined.");
+	if (isEdit && options.moderation !== undefined) throw new Error("moderation is only supported for image generation, not editing.");
+	if (options.outputFormat === "svg" && isEdit) throw new Error("SVG output is only supported for text-to-image generation.");
+	if (options.svg !== undefined && options.outputFormat !== "svg") throw new Error("svg options require outputFormat=svg.");
+	if ((options.frameCount !== undefined || options.frameDurationMs !== undefined) && options.outputFormat !== "gif") {
+		throw new Error("frameCount and frameDurationMs require outputFormat=gif.");
+	}
+	if (options.outputCompression !== undefined && options.outputFormat !== "jpeg" && options.outputFormat !== "webp") {
+		throw new Error("outputCompression requires outputFormat=jpeg or webp.");
+	}
+	if (options.background === "transparent" && options.outputFormat !== undefined && options.outputFormat !== "png" && options.outputFormat !== "webp") {
+		throw new Error("Transparent background requires outputFormat=png or webp.");
+	}
+	if (options.outputFormat === "gif" && options.mask) throw new Error("GIF output does not support mask.");
+	return options;
+}
+
+function isGptImageModel(model: string): boolean {
+	return model === "chatgpt-image-latest" || model.startsWith("gpt-image-");
+}
+
+function imageApiSize(dimensions: ResolvedDimensions, model: string): string {
+	if (!isGptImageModel(model)) return dimensions.openAiSize;
+	if (dimensions.openAiSize === "1792x1024") return "1536x1024";
+	if (dimensions.openAiSize === "1024x1792") return "1024x1536";
+	return "1024x1024";
+}
+
 export async function executeImageGeneration(
 	params: GenerateImageParams,
 	mediaConfig: MediaToolConfig,
@@ -488,9 +664,11 @@ export async function executeImageGeneration(
 	const defaultW = mediaConfig.defaultWidth || 1024;
 	const defaultH = mediaConfig.defaultHeight || 1024;
 	const dims = resolveAspectAndSize(params.width, params.height, defaultW, defaultH);
-	const isEdit = Boolean(params.image && params.image.trim().length > 0);
+	const imageInputs = normalizeImageInputs(params.image);
+	const isEdit = imageInputs.length > 0;
 	const apiMode = mediaConfig.apiMode ?? "images";
 	if (apiMode !== "images" && apiMode !== "chat") throw new Error("image.apiMode must be images or chat.");
+	const imageOptions = resolveImageApiOptions(params, mediaConfig, isEdit, apiMode);
 
 	const attemptErrors: ImageAttemptFailure[] = [];
 
@@ -500,10 +678,11 @@ export async function executeImageGeneration(
 				provider,
 				model,
 				prompt: params.prompt,
-				imageInput: params.image,
+				imageInputs,
 				dimensions: dims,
 				isEdit,
 				apiMode,
+				imageOptions,
 				cwd,
 				signal,
 			});
@@ -555,28 +734,47 @@ async function readImageApiResponse(
 	throw new ImageApiError(endpoint, response, body, apiKey);
 }
 
+function imageApiFields(options: ImageApiOptions): Record<string, unknown> {
+	return {
+		complexity: options.complexity,
+		quality: options.quality,
+		background: options.background,
+		output_format: options.outputFormat,
+		output_compression: options.outputCompression,
+		moderation: options.moderation,
+		svg: options.svg ? {
+			model: options.svg.model.trim(),
+			reasoning: options.svg.reasoning,
+		} : undefined,
+		frame_count: options.frameCount,
+		frame_duration_ms: options.frameDurationMs,
+		safety_identifier: options.safetyIdentifier,
+	};
+}
+
 async function callImageApi(options: {
 	provider: ResolvedProviderInfo;
 	model: string;
 	prompt: string;
-	imageInput?: string;
+	imageInputs: string[];
 	dimensions: ResolvedDimensions;
 	isEdit: boolean;
 	apiMode: "images" | "chat";
+	imageOptions: ImageApiOptions;
 	cwd: string;
 	signal?: AbortSignal;
 }): Promise<Buffer> {
-	const { provider, model, prompt, imageInput, dimensions, isEdit, apiMode, cwd, signal } = options;
+	const { provider, model, prompt, imageInputs, dimensions, isEdit, apiMode, imageOptions, cwd, signal } = options;
 
 	// Chat-capable models must opt in. Never change endpoints after a failed request.
 	if (apiMode === "chat") {
 		let content: string | Array<Record<string, unknown>> = prompt;
-		if (isEdit && imageInput) {
-			const { buffer, mimeType } = await loadInputImage(imageInput, cwd, signal);
-			content = [
-				{ type: "text", text: `Edit this image according to instructions: ${prompt}` },
-				{ type: "image_url", image_url: { url: `data:${mimeType};base64,${buffer.toString("base64")}` } },
-			];
+		if (isEdit) {
+			content = [{ type: "text", text: `Edit this image according to instructions: ${prompt}` }];
+			for (const imageInput of imageInputs) {
+				const { buffer, mimeType } = await loadInputImage(imageInput, cwd, signal);
+				content.push({ type: "image_url", image_url: { url: `data:${mimeType};base64,${buffer.toString("base64")}` } });
+			}
 		}
 		const endpoint = "/chat/completions";
 		const response = await fetch(`${provider.baseUrl}${endpoint}`, {
@@ -587,15 +785,28 @@ async function callImageApi(options: {
 		return readImageApiResponse(response, endpoint, provider.apiKey, signal, true);
 	}
 
-	if (isEdit && imageInput) {
-		const { buffer, mimeType } = await loadInputImage(imageInput, cwd, signal);
+	const fields = imageApiFields(imageOptions);
+	if (isEdit) {
 		const formData = new FormData();
-		const blob = new Blob([new Uint8Array(buffer)], { type: mimeType });
-		formData.append("image", blob, `image.${imageExtension(buffer)}`);
+		for (const [index, imageInput] of imageInputs.entries()) {
+			const { buffer, mimeType } = await loadInputImage(imageInput, cwd, signal);
+			const blob = new Blob([new Uint8Array(buffer)], { type: mimeType });
+			const filename = imageInputs.length === 1 ? `image.${imageExtension(buffer)}` : `image_${index + 1}.${imageExtension(buffer)}`;
+			formData.append(imageInputs.length === 1 ? "image" : "image[]", blob, filename);
+		}
 		formData.append("model", model);
 		formData.append("prompt", prompt);
-		formData.append("size", dimensions.openAiSize);
-		formData.append("response_format", "b64_json");
+		formData.append("size", imageApiSize(dimensions, model));
+		if (!isGptImageModel(model)) formData.append("response_format", "b64_json");
+		for (const [key, value] of Object.entries(fields)) {
+			if (value !== undefined) formData.append(key, String(value));
+		}
+		for (const [field, input] of [["mask", imageOptions.mask], ["markup", imageOptions.markup]] as const) {
+			if (!input) continue;
+			const { buffer, mimeType } = await loadInputImage(input, cwd, signal);
+			if (field === "markup" && mimeType !== "image/png") throw new Error("markup must be a transparent PNG image.");
+			formData.append(field, new Blob([new Uint8Array(buffer)], { type: mimeType }), `${field}.${imageExtension(buffer)}`);
+		}
 		const endpoint = "/images/edits";
 		const response = await fetch(`${provider.baseUrl}${endpoint}`, {
 			signal, method: "POST",
@@ -609,7 +820,11 @@ async function callImageApi(options: {
 	const response = await fetch(`${provider.baseUrl}${endpoint}`, {
 		signal, method: "POST",
 		headers: { Authorization: `Bearer ${provider.apiKey}`, "Content-Type": "application/json" },
-		body: JSON.stringify({ model, prompt, n: 1, size: dimensions.openAiSize, response_format: "b64_json" }),
+		body: JSON.stringify({
+			model, prompt, n: 1, size: imageApiSize(dimensions, model),
+			...(!isGptImageModel(model) ? { response_format: "b64_json" } : {}),
+			...fields,
+		}),
 	});
 	return readImageApiResponse(response, endpoint, provider.apiKey, signal);
 }
