@@ -151,6 +151,7 @@ The extension has no network, external file, command execution, or background-re
 - **Universal tool & MCP support**: Uses dynamic in-place decoration on `ToolExecutionComponent`, supporting built-ins, MCP proxies (`mcp`, `mcp__*`), Rider MCP tools (`rider_execute_tool`), SoL-Pi tools, and arbitrary third-party tools with generic parameter heuristics.
 - **Unified tips handling**: Plugin tips (`ui.notify`) are suppressed from the transcript. `ui.setStatus` tips stay in the footer and are colorized, but are only auto-cleared when their rule sets `durationMs`. Each key has an independent deadline; off, config reload and shutdown clean up transient effects without erasing persistent keys. Persistent keys (`persistentKeys`, default `["blackhole", "mcp"]`) pass through untouched so long-lived gauges such as pi-blackhole's footer bar and the MCP server status keep working. `error` / `warning` messages and any message containing a `notificationKeywords` word always pass through. Plugin headers such as SoL-Pi's `⚡ SoL-Pi · …` / `Money saved · …` are stripped from tool rows.
 - **Configuration file support**: Supports global configuration (`~/.pi/agent/extensions/rolling-tools/config.json`) and local project overrides (`./.pi/rolling-tools.json`).
+- **Disabled inside pi-web by default**: Pi Web renders a widget through `setWidget` as a text snapshot, so the dock's `🔽`/`➕` character buttons never receive browser clicks and the block is squeezed into the bottom status shelf. When the session is bound in RPC mode by Pi Web, the extension now skips the widget, transcript silencing, tip interception, status colorizing and thinking hiding entirely, and the terminal TUI keeps its full behavior. Detection requires both `ctx.mode === "rpc"` and a Pi Web process marker, so other RPC clients stay unaffected. Set `"disableInPiWeb": false` in either config file, or launch with `PI_ROLLING_TOOLS_PI_WEB=on`, to bring the widget back in Pi Web; `PI_ROLLING_TOOLS_PI_WEB=off` forces the host gate. `/rolling-tools off` still works as before in the terminal, and `/rolling-tools on` inside a Pi Web session lifts the host gate for that session only.
 - **Active-call retention**: Genuine preparing/running calls are not evicted by newer completed history. Snapshots retain the recent history tail plus active calls; reload reconciles old orphan spinners against actual results.
 - **Fixed-dock rolling widget**: Shows the latest running/completed tools in a fixed dock above the editor with status (`⏳`/`✓`/`✗`), duration, and arguments summary.
 - **Click-to-expand details**: Click any tool item to toggle details (`▸` / `▾`) such as full paths, multiline commands, and execution outputs without mouse hover flickering. Click details to copy to clipboard, or `Ctrl+Left-click` on paths to open existing local files.
@@ -192,6 +193,7 @@ Example configuration (`~/.pi/agent/extensions/rolling-tools/config.json`):
   "lazyLoadStep": 10,
   "persistAcrossSessions": true,
   "configVersion": 3,
+  "disableInPiWeb": true,
   "managedTools": ["*"],
   "silencedTools": ["*"],
   "widgetTools": ["*"],
@@ -228,6 +230,21 @@ Example configuration (`~/.pi/agent/extensions/rolling-tools/config.json`):
   "stripToolNotificationHeaders": true
 }
 ```
+
+### Pi Web host gate
+
+Pi Web binds extensions with `mode: "rpc"` and renders `setWidget` output as inert text, so the dock's clickable characters cannot work there. Rolling Tools therefore disables itself for Pi Web sessions while leaving the terminal untouched:
+
+| Control | Effect |
+| --- | --- |
+| `"disableInPiWeb": true` (default) | Pi Web sessions get no dock, no transcript silencing, no tip interception, no status colorizing, no thinking hiding. |
+| `"disableInPiWeb": false` | Restore the previous Pi Web behavior, including the bottom-shelf dock. |
+| `PI_ROLLING_TOOLS_PI_WEB=on` | Force the widget inside Pi Web for one launch. |
+| `PI_ROLLING_TOOLS_PI_WEB=off` | Force the host gate inside Pi Web for one launch. |
+| `/rolling-tools on` | Lift the host gate for the current Pi Web session only. |
+| `/rolling-tools status` | Shows the detected host and whether the gate is active. |
+
+Detection combines the RPC binding mode with a Pi Web process marker (`__piWebHttpDispatcherConfigured`, `Symbol.for("pi-web.agentEventStreamInfos")`, or `PI_WEB_HOSTNAME` / `PI_WEB_PASSWORD`), so other RPC or SDK clients keep the dock.
 
 ### Notification and tips handling
 

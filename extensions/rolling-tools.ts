@@ -66,6 +66,11 @@ interface RollingToolsConfig {
 	notificationKeywords?: string[];
 	/** 是否剥掉插件在工具行里重复插入的提示头（如 SoL-Pi 的 “Money saved” 行） */
 	stripToolNotificationHeaders?: boolean;
+	/**
+	 * 是否在 pi-web 前端整体停用：滚动块、静音、通知拦截与状态着色全部不生效。
+	 * 默认 true；设为 false 可在网页端恢复旧行为。终端 TUI 不受影响。
+	 */
+	disableInPiWeb?: boolean;
 	/** 配置结构版本，用于旧版本自动迁移与提示 */
 	configVersion?: number;
 }
@@ -100,6 +105,9 @@ const DEFAULT_CONFIG: RollingToolsConfig = {
 	widgetTools: ["*"],
 	lazyLoadStep: 10,
 	persistAcrossSessions: true,
+	// 网页端渲染的是纯文本快照，组件内的 🔽/➕ 按钮拿不到鼠标事件，
+	// 因此默认在 pi-web 中整体停用，终端 TUI 行为不变。
+	disableInPiWeb: true,
 	configVersion: CONFIG_VERSION,
 	genericPropertyFallbacks: [
 		"command",
@@ -282,6 +290,37 @@ function getLocalConfigPath(cwd: string): string {
 }
 
 /**
+ * 识别当前会话是否由 pi-web 承载。
+ * pi-web 通过 SDK 以 rpc 模式绑定扩展，并在 Node 进程内留下 pi-web 专用全局标记；
+ * 两者同时成立才认定，避免误伤其他 RPC 客户端。
+ */
+function isPiWebHost(ctx: any): boolean {
+	if (ctx?.mode !== "rpc") return false;
+	const g = globalThis as any;
+	if (g.__piWebHttpDispatcherConfigured === true) return true;
+	if (g[Symbol.for("pi-web.agentEventStreamInfos")] !== undefined) return true;
+	if (process.env.PI_WEB_HOSTNAME || process.env.PI_WEB_PASSWORD) return true;
+	return false;
+}
+
+/** `PI_ROLLING_TOOLS_PI_WEB=on|off` 覆盖默认的网页端停用判定。 */
+function piWebProfileOverride(): "enabled" | "disabled" | undefined {
+	const raw = (process.env.PI_ROLLING_TOOLS_PI_WEB || "").trim().toLowerCase();
+	if (["on", "enabled", "1", "true"].includes(raw)) return "enabled";
+	if (["off", "disabled", "0", "false"].includes(raw)) return "disabled";
+	return undefined;
+}
+
+/** 是否需要为当前宿主整体停用本扩展。 */
+function shouldDisableForHost(ctx: any, config: RollingToolsConfig): boolean {
+	if (!isPiWebHost(ctx)) return false;
+	const override = piWebProfileOverride();
+	if (override === "enabled") return false;
+	if (override === "disabled") return true;
+	return config.disableInPiWeb !== false;
+}
+
+/**
  * 合并 statusEnhancements：用户配置优先，但**始终并集**默认的 persistentKeys，
  * 避免用户自定义规则时意外丢掉对常驻状态（blackhole / mcp）的保护。
  */
@@ -368,6 +407,10 @@ function mergeConfig(base: RollingToolsConfig, override: Partial<RollingToolsCon
 			typeof override.stripToolNotificationHeaders === "boolean"
 				? override.stripToolNotificationHeaders
 				: base.stripToolNotificationHeaders,
+		disableInPiWeb:
+			typeof override.disableInPiWeb === "boolean"
+				? override.disableInPiWeb
+				: base.disableInPiWeb,
 		configVersion: CONFIG_VERSION,
 	};
 }
@@ -2234,6 +2277,8 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	let statusTimer: any = null;
 	let lastCtx: any = null;
 	let hooksActive = true;
+	/** pi-web 等无法点击字符按钮的宿主：整体停用（不注册 widget、静音与状态处理）。 */
+	let hostDisabled = false;
 	const activeStatuses = new Map<string, {
 		startTime: number; rawText: string; timer?: ReturnType<typeof setInterval>; clear: () => void;
 	}>();
@@ -2277,7 +2322,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	// 2. 动态更新委派处理函数（支持任意次数的 /reload 即刻生效！）
 	dynamicHooks.shouldHideThinking = (target: any) => hooksActive && currentConfig.enabled && target.hideThinkingBlock === true;
 	dynamicHooks.handleToolRender = (target: any, width: number, origRender: Function) => {
-		if (currentConfig.enabled && !target.expanded && shouldSilenceInTranscript(target.toolName, currentConfig)) {
+		if (hooksActive && currentConfig.enabled && !target.expanded && shouldSilenceInTranscript(target.toolName, currentConfig)) {
 			return [];
 		}
 		return origRender.call(target, width);
@@ -2307,7 +2352,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		text: string | undefined,
 		origFn: Function,
 	) => {
-		if (!currentConfig.enabled) return origFn.call(target, key, text);
+		if (!hooksActive || !currentConfig.enabled) return origFn.call(target, key, text);
 		if (isPersistentStatusKey(key, currentConfig.statusEnhancements)) return origFn.call(target, key, text);
 		const rule = findStatusEnhancementRule(key, currentConfig.statusEnhancements);
 		const duration = rule?.durationMs;
@@ -2408,7 +2453,8 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		if (!ctx?.hasUI) return;
 
 		// 状态行为常驻行，因此只要功能开启就始终显示 widget
-		const hasContent = currentConfig.enabled;
+		// pi-web 等宿主不能点击组件内字符按钮，从一开始就不注册滚动块。
+		const hasContent = currentConfig.enabled && !hostDisabled;
 
 		if (!hasContent) {
 			ctx.ui.setWidget("rolling-tools", undefined);
@@ -2543,6 +2589,19 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		lastCtx = ctx;
 		const loaded = loadConfig(ctx?.cwd || process.cwd());
 		currentConfig = loaded.config;
+		hostDisabled = shouldDisableForHost(ctx, currentConfig);
+		hooksActive = !hostDisabled;
+		if (hostDisabled) {
+			// 网页端整体停用：清掉可能残留的滚动块与计时器，后续事件全部短路。
+			stopStatusTimer();
+			clearTransientStatuses();
+			try {
+				ctx.ui?.setWidget?.("rolling-tools", undefined);
+			} catch {
+				/* UI may already be shutting down */
+			}
+			return;
+		}
 		if (loaded.legacyDetected) {
 			pendingLegacyNotice = buildLegacyNotice(loaded.legacyPath, loaded.legacyVersion);
 		}
@@ -2585,6 +2644,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 	// 3. 用户提问开始（新一轮 Agent 运行）：保留已有滚动历史，仅重置瞬时状态
 	pi.on("agent_start", async (_event, ctx) => {
+		if (hostDisabled) return;
 		lastCtx = ctx;
 		installUiHooks(ctx);
 		(ctx.ui as any)?.setToolsExpanded?.(false);
@@ -2601,6 +2661,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 	// 4. 发起网络请求前：顶层状态行切换为“等待服务器响应”，开启动态计时
 	pi.on("before_provider_request", (_event, ctx) => {
+		if (hostDisabled) return;
 		state.headerStatus = { type: "waiting_server", startTime: Date.now() };
 		startStatusTimer(ctx);
 		syncWidget(ctx);
@@ -2608,6 +2669,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 	// 5. 消息流式事件
 	pi.on("message_update", async (event, ctx) => {
+		if (hostDisabled) return;
 		const ev = (event as any).assistantMessageEvent;
 		if (!ev) return;
 
@@ -2788,6 +2850,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	// A streamed tool-call draft is not proof of dispatch. Failed/aborted
 	// responses can be omitted by core retries without ever emitting tool_result.
 	pi.on("message_end", (event, ctx) => {
+		if (hostDisabled) return;
 		const message = event.message;
 		if (message.role === "toolResult") {
 			recordToolCompletion(message, true);
@@ -2819,6 +2882,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	// Core has awaited all dispatched calls at agent_end. Reconcile finalized
 	// messages first, then close any draft/call missing its terminal event.
 	pi.on("agent_end", async (event, ctx) => {
+		if (hostDisabled) return;
 		for (const message of event.messages) {
 			if (message.role === "toolResult") recordToolCompletion(message, true);
 		}
@@ -2832,6 +2896,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
+		if (hostDisabled) return;
 		const changed = closeUnfinishedTools("the agent stopped without a completion event for this tool");
 		stopStatusTimer();
 		if (state.headerStatus.type === "waiting_server" || state.headerStatus.type === "thinking") {
@@ -2877,18 +2942,21 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	}
 
 	pi.on("tool_execution_start", (event, ctx) => {
+		if (hostDisabled) return;
 		startTool(event.toolCallId, event.toolName, event.args, ctx);
 	});
 
 	// Retain compatibility with hook-only integrations; don't restart a clock
 	// that tool_execution_start has already started.
 	pi.on("tool_call", (event, ctx) => {
+		if (hostDisabled) return;
 		const existing = state.recentTools.find(tool => tool.id === event.toolCallId);
 		if (existing && !isPendingTool(existing)) return;
 		startTool(event.toolCallId, event.toolName, event.input, ctx);
 	});
 
 	pi.on("tool_execution_end", (event, ctx) => {
+		if (hostDisabled) return;
 		recordToolCompletion({
 			toolCallId: event.toolCallId, toolName: event.toolName,
 			isError: event.isError, content: event.result?.content, details: event.result?.details,
@@ -2898,11 +2966,13 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	});
 
 	pi.on("tool_result", (event, ctx) => {
+		if (hostDisabled) return;
 		recordToolCompletion(event);
 		refreshToolActivity(ctx);
 	});
 
 	pi.on("session_tree", (_event, ctx) => {
+		if (hostDisabled) return;
 		streamedDrafts.clear();
 		stopStatusTimer();
 		const restored = currentConfig.persistAcrossSessions ? restoreHistoryFromSession(ctx) : null;
@@ -2947,11 +3017,23 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				clearTransientStatuses();
 				const loaded = loadConfig(ctx?.cwd || process.cwd());
 				currentConfig = loaded.config;
-				refreshToolActivity(ctx);
+				hostDisabled = shouldDisableForHost(ctx, currentConfig);
+				hooksActive = !hostDisabled;
+				if (hostDisabled) {
+					stopStatusTimer();
+					syncWidget(ctx);
+				} else {
+					refreshToolActivity(ctx);
+				}
 				if (loaded.legacyDetected) {
 					ctx.ui?.notify?.(buildLegacyNotice(loaded.legacyPath, loaded.legacyVersion), "warning");
 				} else {
-					ctx.ui?.notify?.("✓ rolling-tools: configuration reloaded", "info");
+					ctx.ui?.notify?.(
+						hostDisabled
+							? "✓ rolling-tools: configuration reloaded (disabled in pi-web)"
+							: "✓ rolling-tools: configuration reloaded",
+						"info",
+					);
 				}
 			} else if (action === "migrate") {
 				const result = migrateConfigToLatest(ctx?.cwd || process.cwd());
@@ -2974,12 +3056,21 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				ctx.ui?.notify?.("rolling-tools: body silencing and the scrollbar are disabled", "info");
 			} else if (action === "on") {
 				currentConfig.enabled = true;
+				// 网页端显式开启：本会话解除宿主闸门，便于比对或临时使用。
+				hostDisabled = false;
+				hooksActive = true;
 				refreshToolActivity(ctx);
 				ctx.ui?.notify?.("rolling-tools: body silencing and the scrollbar are enabled", "info");
 			} else if (action === "status") {
+				const host = isPiWebHost(ctx)
+					? `pi-web${hostDisabled ? " (disabled by disableInPiWeb)" : ""}`
+					: ctx?.mode === "rpc"
+						? "rpc client"
+						: "tui";
 				const info = [
 					`rolling-tools status:`,
-					`• Enabled: ${currentConfig.enabled ? "yes" : "no"}`,
+					`• Host: ${host}`,
+					`• Enabled: ${currentConfig.enabled ? "yes" : "no"}${hostDisabled ? " (host gate active)" : ""}`,
 					`• View mode: ${state.viewMode === "running" ? "running task only" : `last ${currentConfig.maxRecentTools} lines`}`,
 					`• Widget rows: ${currentConfig.maxRecentTools} (${state.recentTools.length} in history)`,
 					`• Default view mode: ${currentConfig.defaultViewMode ?? "fixed"}`,
@@ -2991,6 +3082,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 					`• Intercepted notifications: ${currentConfig.interceptNotifications.map((r) => r.match).join(", ") || "(none)"} (${(currentConfig.notificationKeywords ?? []).length} exception keywords)`,
 					`• Status duration: ${currentConfig.statusEnhancements?.[0]?.durationMs ?? "default"}ms`,
 					`• Strip tool-row headers: ${currentConfig.stripToolNotificationHeaders !== false ? "yes" : "no"}`,
+					`• Disable in pi-web: ${currentConfig.disableInPiWeb !== false ? "yes" : "no"} (override with PI_ROLLING_TOOLS_PI_WEB=on|off)`,
 				].join("\n");
 				await showStatusModal(ctx, "Rolling Tools", info.split("\n"));
 			} else if (action === "mode" || action.startsWith("mode ")) {
