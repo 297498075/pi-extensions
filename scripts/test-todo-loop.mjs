@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import todoLoop from "../extensions/todo-loop.ts";
 
-// In-memory sessions only: no user configuration, filesystem, network or model calls.
+// In-memory sessions and an isolated config directory; no user config, network or model calls.
+const agentDir = mkdtempSync(join(tmpdir(), "pi-todo-loop-"));
+process.env.PI_CODING_AGENT_DIR = agentDir;
+process.once("exit", () => rmSync(agentDir, { recursive: true, force: true }));
 const legacyPrompt = "Continue working on the remaining todo items. Start with the first unfinished item, update the todo list as you progress, and do not stop while any todo remains unfinished. If you truly cannot continue, explicitly say that you cannot continue.";
 const assistant = (text = "Ready.", stopReason = "stop") => ({ role: "assistant", content: [{ type: "text", text }], stopReason, timestamp: 1 });
 const task = (id, extra = {}) => ({ id, subject: `Task ${id}`, status: "pending", ...extra });
@@ -12,6 +18,7 @@ function harness(sm = SessionManager.inMemory(process.cwd()), limit = "20") {
 		ui: { notify: (...args) => notifications.push(args) } };
 	todoLoop({
 		on: (name, handler) => handlers.set(name, handler), registerFlag() {}, getFlag: () => limit,
+		appendEntry: (type, data) => sm.appendCustomEntry(type, data),
 		registerTool: tool => tools.set(tool.name, tool), registerCommand: (name, command) => commands.set(name, command),
 	});
 	const tool = tools.get("todo_loop_control");
@@ -147,7 +154,9 @@ const decision = result => result?.entries.findLast(entry => entry.customType ==
 	assert.equal(decision(h.boundary()).reason, "followup_limit");
 	assert.equal(decision(h.boundary()).followups, 20);
 	h.boundary(); assert.equal(h.notifications.length, 1, "budget warning is not repeated");
-	assert.equal(decision(harness(h.sm).boundary()).reason, "followup_limit", "reload preserves budget");
+	const rehydrated = harness(h.sm);
+	rehydrated.handlers.get("session_start")({ reason: "startup" }, rehydrated.ctx);
+	assert.equal(decision(rehydrated.boundary()).reason, "followup_limit", "automatic startup preserves budget");
 	assert.equal(decision(harness(h.sm, "0").boundary()).reason, "followup_limit");
 	assert.equal(decision(harness(h.sm, "invalid").boundary()).limit, 20);
 	for (const done of [{ status: "cancelled" }, { status: "completed" }, { status: "deleted" }, { status: "done" }, { done: true }, { completed: true }]) {
@@ -155,6 +164,54 @@ const decision = result => result?.entries.findLast(entry => entry.customType ==
 		assert.equal(decision(empty.boundary()).reason, "no_unfinished_tasks");
 	}
 	console.log("✓ structural stop reasons, pending work, composed boundaries, persisted limits and decisions");
+}
+
+// Explicit session transitions reset only the budget, persisting the reset in the active branch.
+{
+	for (const reason of ["reload", "resume", "new", "fork"]) {
+		const h = harness(SessionManager.inMemory(process.cwd()), "2");
+		h.snapshot([task("1"), task("2")]);
+		await h.call(report("1"));
+		h.sm.appendCustomMessageEntry("todo-loop-followup", "old follow-up", true);
+		h.sm.appendMessage({ role: "user", content: legacyPrompt, timestamp: 1 });
+		const oldLeaf = h.sm.getLeafId();
+		assert.equal(decision(h.boundary()).reason, "followup_limit");
+		h.handlers.get("session_start")({ reason }, h.ctx);
+		assert.deepEqual(decision(h.boundary()), { decision: "continue", reason: "unfinished_tasks", remaining: 2, actionable: 2, blocked: 1, followups: 0, limit: 2 });
+		h.sm.appendCustomMessageEntry("todo-loop-followup", "first follow-up after reset", true);
+		const newLeaf = h.sm.getLeafId();
+		const rehydrated = harness(h.sm, "2");
+		rehydrated.handlers.get("session_start")({ reason: "startup" }, rehydrated.ctx);
+		assert.equal(decision(rehydrated.boundary()).followups, 1);
+		h.sm.branch(oldLeaf);
+		rehydrated.handlers.get("session_tree")();
+		assert.equal(decision(rehydrated.boundary()).reason, "followup_limit");
+		h.sm.branch(newLeaf);
+		assert.equal(decision(rehydrated.boundary()).followups, 1);
+	}
+	console.log("✓ explicit session transitions renew the active branch budget and preserve todo state");
+}
+
+// The local setting takes precedence over Pi's carried runtime flag on reload.
+{
+	const folder = join(agentDir, "todo-loop");
+	mkdirSync(folder);
+	const config = join(folder, "config.json"), sm = SessionManager.inMemory(process.cwd());
+	const h = harness(sm, "20");
+	h.snapshot([task("1")]);
+	writeFileSync(config, '{"maxFollowups":100}');
+	assert.equal(decision(h.boundary()).limit, 20, "local config is read at extension load");
+	const reloaded = harness(sm, "20");
+	reloaded.handlers.get("session_start")({ reason: "reload" }, reloaded.ctx);
+	assert.equal(decision(reloaded.boundary()).limit, 100);
+	assert.equal(decision(reloaded.boundary()).followups, 0);
+	writeFileSync(config, '{"maxFollowups":0}');
+	assert.equal(decision(harness(sm, "50").boundary()).reason, "followup_limit");
+	for (const invalid of ['{"maxFollowups":"100"}', '{"maxFollowups":-1}', '{"maxFollowups":1.5}', 'not JSON']) {
+		writeFileSync(config, invalid);
+		assert.equal(decision(harness(sm, "50").boundary()).limit, 50);
+	}
+	console.log("✓ the local limit is loaded on reload, supports zero and falls back for invalid config");
 }
 
 // Status is a modal in the TUI and never a long, potentially muted info notification.

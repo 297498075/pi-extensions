@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
-import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext, type SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { showStatusModal } from "./lib/status-modal.ts";
 
@@ -7,6 +9,7 @@ const DEFAULT_MAX_FOLLOWUPS = 20;
 const MAX_FOLLOWUPS_FLAG = "todo-loop-max-followups";
 const CONTROL_TOOL = "todo_loop_control";
 const DECISION_ENTRY = "todo-loop-decision";
+const BUDGET_RESET_ENTRY = "todo-loop-budget-reset";
 
 // Keep recognizing old user-message follow-ups without inspecting assistant prose.
 const LEGACY_CONTINUE_PROMPT =
@@ -148,24 +151,38 @@ function actionableTasks(state: TodoState | undefined): Task[] {
 }
 
 function followupCount(ctx: ExtensionContext): number {
-	return ctx.sessionManager.getBranch().filter(entry =>
-		(entry.type === "message" && userText(entry.message) === LEGACY_CONTINUE_PROMPT) ||
-		(entry.type === "custom_message" && entry.customType === "todo-loop-followup"),
-	).length;
+	let used = 0;
+	for (const entry of ctx.sessionManager.getBranch()) {
+		if (entry.type === "custom" && entry.customType === BUDGET_RESET_ENTRY) used = 0;
+		else if ((entry.type === "message" && userText(entry.message) === LEGACY_CONTINUE_PROMPT) ||
+			(entry.type === "custom_message" && entry.customType === "todo-loop-followup")) used++;
+	}
+	return used;
 }
 
-function maxFollowups(pi: ExtensionAPI): number {
-	const value = pi.getFlag(MAX_FOLLOWUPS_FLAG);
-	const max = typeof value === "string" ? Number(value) : Number.NaN;
-	return Number.isSafeInteger(max) && max >= 0 ? max : DEFAULT_MAX_FOLLOWUPS;
+function readConfiguredLimit(): number | undefined {
+	try {
+		const config: unknown = JSON.parse(readFileSync(join(getAgentDir(), "todo-loop", "config.json"), "utf8"));
+		const limit = isRecord(config) ? config.maxFollowups : undefined;
+		if (typeof limit === "number" && Number.isSafeInteger(limit) && limit >= 0) return limit;
+	} catch {
+		// A missing or invalid local config leaves the invocation/default budget in effect.
+	}
+	return undefined;
 }
 
 export default function todoLoop(pi: ExtensionAPI): void {
+	const configuredLimit = readConfiguredLimit();
 	pi.registerFlag(MAX_FOLLOWUPS_FLAG, {
-		description: "Maximum automatic todo follow-ups (0 disables)",
+		description: "Maximum automatic todo follow-ups without local config (default 20; 0 disables)",
 		type: "string",
-		default: String(DEFAULT_MAX_FOLLOWUPS),
 	});
+	const maxFollowups = () => {
+		if (configuredLimit !== undefined) return configuredLimit;
+		const value = pi.getFlag(MAX_FOLLOWUPS_FLAG);
+		const limit = typeof value === "string" ? Number(value) : Number.NaN;
+		return Number.isSafeInteger(limit) && limit >= 0 ? limit : DEFAULT_MAX_FOLLOWUPS;
+	};
 
 	pi.registerTool({
 		name: CONTROL_TOOL,
@@ -232,7 +249,7 @@ export default function todoLoop(pi: ExtensionAPI): void {
 			);
 			await showStatusModal(ctx, "Todo Loop", [
 				`Unfinished: ${state?.tasks.length ?? 0}; actionable: ${actionable.length}; blocked: ${actionable.filter(task => state?.blockers.has(task.id)).length}`,
-				`Automatic follow-ups: ${followupCount(ctx)}/${maxFollowups(pi)} (current branch)`,
+				`Automatic follow-ups: ${followupCount(ctx)}/${maxFollowups()} (since last reset on this branch)`,
 				`Last boundary decision (historical): ${latestDecision?.type === "custom" ? JSON.stringify(latestDecision.data) : "none"}`,
 				...actionable.map(task => {
 					const blocker = state?.blockers.get(task.id);
@@ -243,9 +260,14 @@ export default function todoLoop(pi: ExtensionAPI): void {
 	});
 
 	let limitNotified = false;
-	const resetNotification = () => { limitNotified = false; };
-	pi.on("session_start", resetNotification);
-	pi.on("session_tree", resetNotification);
+	pi.on("session_start", ({ reason }) => {
+		limitNotified = false;
+		// Explicit runtime transitions renew the budget, without changing tasks or blockers.
+		if (reason === "reload" || reason === "resume" || reason === "new" || reason === "fork") {
+			pi.appendEntry(BUDGET_RESET_ENTRY, { reason });
+		}
+	});
+	pi.on("session_tree", () => { limitNotified = false; });
 
 	// Only act after core retries, compaction and queued work. Do not infer
 	// control intent from text: even our own old prompt says "cannot continue".
@@ -255,7 +277,7 @@ export default function todoLoop(pi: ExtensionAPI): void {
 		const actionable = actionableTasks(state);
 		const blocked = actionable.filter(task => state.blockers.has(task.id)).length;
 		const used = followupCount(ctx);
-		const limit = maxFollowups(pi);
+		const limit = maxFollowups();
 		const lastAssistant = [...event.context.contextMessages].reverse().find(message => message.role === "assistant");
 		let reason: string;
 		if (event.outcome !== "completed") reason = `outcome_${event.outcome}`;

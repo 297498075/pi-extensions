@@ -17,7 +17,15 @@ The extension requires Pi's `agent_before_settle` boundary API and tool registra
 
 Failed todo tool results do not replace authoritative task state. Completed, cancelled, deleted and example-format done tasks do not count as unfinished.
 
-The default budget is **20 automatic follow-ups per active branch**. The count includes persisted `todo-loop-followup` messages and the exact legacy user-message continuation prompt. It survives reload/resume, does not reset on new user input or task replacement, and follows the selected branch on fork/tree navigation. A limit of `0` disables automatic follow-ups, not the control/status tool. Invalid flag values fall back to 20.
+The default budget is **20 automatic follow-ups**. Set a persistent local override in `~/.pi/agent/todo-loop/config.json` (or under `PI_CODING_AGENT_DIR`):
+
+```json
+{ "maxFollowups": 100 }
+```
+
+The extension reads this file at load time, including on `/reload`. A valid local value takes precedence over the invocation flag, including when Pi carries the previous flag value across reload. Missing or invalid config falls back to the flag; an invalid or absent flag falls back to 20. A limit of `0` disables automatic follow-ups, not the control/status tool.
+
+Explicit `/reload`, `/resume`, `/new`, and fork/clone transitions start a fresh budget without resetting todo or blocker state in the selected session. The count includes persisted `todo-loop-followup` messages and the exact legacy continuation prompt since the latest reset on the active branch. Automatic runtime startup, new user messages, task replacement and compaction preserve that count. Tree navigation reconstructs the count from the selected branch.
 
 ## Separate explanation from control
 
@@ -74,7 +82,7 @@ Blockers are reconstructed from successful control-tool results in the active br
 - A new user message clears existing blockers so the agent reassesses prerequisites. Automatic custom follow-ups and the exact legacy continuation user message do not clear them.
 - Reload/resume and fork/tree navigation reconstruct only the selected branch's controls. No external blocker file is used.
 - Task revisions are conservative change detectors, not a semantic proof that an external dependency has changed. If an external prerequisite is resolved without changing the task or sending user input, the model must clear that blocker explicitly.
-- Clearing blockers or sending user input does not bypass an exhausted follow-up budget.
+- Clearing blockers or sending user input preserves the current follow-up count. Use `/reload` or explicitly reopen the session to renew an exhausted budget.
 
 ## Diagnostics
 
@@ -107,7 +115,7 @@ npm run validate
 npm test
 ```
 
-The focused regression uses in-memory Pi sessions and mocked extension registration/UI only. It covers historical-prompt echoes, prose/JSON non-controls, per-leaf partial/all-blocked state, atomic failures, result persistence, branch/reload restoration, per-task invalidation, user input, alternative todo formats, boundary composition, structural cancellation/errors, budgets and modal/fallback status. It does not access user sessions/configuration, invoke a model, or use the network.
+The focused regression uses in-memory Pi sessions, mocked extension registration/UI, and a temporary local config. It covers historical-prompt echoes, prose/JSON non-controls, per-leaf partial/all-blocked state, atomic failures, result persistence, branch restoration, explicit budget renewal, automatic startup, config precedence, per-task invalidation, user input, alternative todo formats, boundary composition, structural cancellation/errors and modal/fallback status. It does not access user sessions/configuration, invoke a model, or use the network.
 
 Manual smoke check after loading/reloading the extension:
 
@@ -116,8 +124,8 @@ Manual smoke check after loading/reloading the extension:
 3. Register a blocker for the child: the separate task must still run.
 4. Register a blocker for the separate task: automatic continuation must pause; `/todo-loop status` must show both reasons and the decision.
 5. Send new user input or change one blocked task: its effective blocker must be cleared/reassessed, subject to the existing branch budget.
-6. Reload and navigate/fork to before a blocker report: only controls present in that branch may apply.
+6. Reload: status should show zero used follow-ups and the same applicable blockers. Navigate to a branch before the reset: its previous count and only its own blocker reports apply.
 
 ## Permissions and privacy
 
-Like all Pi extensions, this code executes with full process/system permissions. This implementation performs no network requests, external file writes, command execution, timers or background work. It registers a tool and a slash command, reads active session history, and adds control results, decisions and continuation messages to Pi's session log. Blocker reasons and resume conditions become part of that history and may be sent to the configured model; do not put credentials/secrets in them. Task revision hashes are change markers, not privacy/security guarantees.
+Like all Pi extensions, this code executes with full process/system permissions. This implementation performs no network requests, external file writes, command execution, timers or background work. It reads the local budget config and active session history, registers a tool and a slash command, and adds control results, decisions, budget resets and continuation messages to Pi's session log. Blocker reasons and resume conditions become part of that history and may be sent to the configured model; do not put credentials/secrets in them. Task revision hashes are change markers, not privacy/security guarantees.
