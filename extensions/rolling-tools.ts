@@ -8,6 +8,7 @@ import { AssistantMessageComponent, InteractiveMode, ToolExecutionComponent } fr
 import type { AutocompleteItem, Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { isFocusable, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { showStatusModal } from "./lib/status-modal.ts";
+import { isPiWebHost, webDisclosure, WebItemBrowser, webShelfWidget, webSnippet, webText } from "./lib/pi-web.ts";
 import { copyToClipboard, openLocalFile } from "./lib/desktop-actions.ts";
 
 /**
@@ -68,7 +69,7 @@ interface RollingToolsConfig {
 	stripToolNotificationHeaders?: boolean;
 	/**
 	 * 是否在 pi-web 前端整体停用：滚动块、静音、通知拦截与状态着色全部不生效。
-	 * 默认 true；设为 false 可在网页端恢复旧行为。终端 TUI 不受影响。
+	 * 默认 false；设为 true 在网页端停用。终端 TUI 不受影响。
 	 */
 	disableInPiWeb?: boolean;
 	/** 配置结构版本，用于旧版本自动迁移与提示 */
@@ -105,9 +106,8 @@ const DEFAULT_CONFIG: RollingToolsConfig = {
 	widgetTools: ["*"],
 	lazyLoadStep: 10,
 	persistAcrossSessions: true,
-	// 网页端渲染的是纯文本快照，组件内的 🔽/➕ 按钮拿不到鼠标事件，
-	// 因此默认在 pi-web 中整体停用，终端 TUI 行为不变。
-	disableInPiWeb: true,
+	// pi-web uses native command buttons and dialogs instead of TUI mouse targets.
+	disableInPiWeb: false,
 	configVersion: CONFIG_VERSION,
 	genericPropertyFallbacks: [
 		"command",
@@ -289,20 +289,6 @@ function getLocalConfigPath(cwd: string): string {
 	return join(cwd, ".pi", "rolling-tools.json");
 }
 
-/**
- * 识别当前会话是否由 pi-web 承载。
- * pi-web 通过 SDK 以 rpc 模式绑定扩展，并在 Node 进程内留下 pi-web 专用全局标记；
- * 两者同时成立才认定，避免误伤其他 RPC 客户端。
- */
-function isPiWebHost(ctx: any): boolean {
-	if (ctx?.mode !== "rpc") return false;
-	const g = globalThis as any;
-	if (g.__piWebHttpDispatcherConfigured === true) return true;
-	if (g[Symbol.for("pi-web.agentEventStreamInfos")] !== undefined) return true;
-	if (process.env.PI_WEB_HOSTNAME || process.env.PI_WEB_PASSWORD) return true;
-	return false;
-}
-
 /** `PI_ROLLING_TOOLS_PI_WEB=on|off` 覆盖默认的网页端停用判定。 */
 function piWebProfileOverride(): "enabled" | "disabled" | undefined {
 	const raw = (process.env.PI_ROLLING_TOOLS_PI_WEB || "").trim().toLowerCase();
@@ -317,7 +303,7 @@ function shouldDisableForHost(ctx: any, config: RollingToolsConfig): boolean {
 	const override = piWebProfileOverride();
 	if (override === "enabled") return false;
 	if (override === "disabled") return true;
-	return config.disableInPiWeb !== false;
+	return config.disableInPiWeb === true;
 }
 
 /**
@@ -1009,6 +995,23 @@ function serializeHistoryInput(item: ToolItem): { rawInput?: unknown; rawInputTr
 	} catch {
 		return { rawInput: "[Input unavailable for history serialization]", rawInputTruncated: true };
 	}
+}
+
+function formatHistoryArguments(item: ToolItem): string | undefined {
+	const input = item.rawInput ?? tryParseJson(item.summaryDisplay);
+	return typeof input === "string" ? input : input == null ? undefined : JSON.stringify(input, null, 2);
+}
+
+function webToolLabel(item: ToolItem): string {
+	return `#${item.index} ${webSnippet(toolDisplayLabel(item), 60)} · ${item.status} · ${webSnippet(item.summaryDisplay, 110)}`;
+}
+
+function webToolRow(item: ToolItem): string {
+	const section = (name: string, value?: string) => value
+		? `<div><strong>${name}</strong><pre><code>${webText(truncate(value, 8000))}&#10;</code></pre></div>` : "";
+	const body = section("Path", item.fullPath) + section(item.detailContent ? "Details" : "Command", item.detailContent || item.fullCommand)
+		+ section("Arguments", formatHistoryArguments(item)) + section("Output", item.output);
+	return webDisclosure(webToolLabel(item), body || "<p>No details recorded.</p>");
 }
 
 function serializeHistory(
@@ -1834,15 +1837,9 @@ class ToolHistoryOverlayComponent implements Component {
 		}
 
 		// 展示完整输入参数（若存在且与 detailContent 不完全重复）
-		let inputToShow: any = t.rawInput;
-		if (inputToShow === undefined || inputToShow === null) {
-			inputToShow = tryParseJson(t.summaryDisplay);
-		}
-		if (inputToShow !== undefined && inputToShow !== null) {
+		const formattedInput = formatHistoryArguments(t);
+		if (formattedInput !== undefined) {
 			pushLine(theme.fg("accent", "── arguments ──"));
-			const formattedInput = typeof inputToShow === "string"
-				? inputToShow
-				: JSON.stringify(inputToShow, null, 2);
 			for (const raw of formattedInput.split("\n")) {
 				out.push(...this.wrapLine(raw, width, (line) => theme.fg("text", line)));
 			}
@@ -2277,8 +2274,10 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	let statusTimer: any = null;
 	let lastCtx: any = null;
 	let hooksActive = true;
-	/** pi-web 等无法点击字符按钮的宿主：整体停用（不注册 widget、静音与状态处理）。 */
 	let hostDisabled = false;
+	let webHost = false;
+	const publishWebTools = webShelfWidget("Tool details");
+	const webHistory = new WebItemBrowser();
 	const activeStatuses = new Map<string, {
 		startTime: number; rawText: string; timer?: ReturnType<typeof setInterval>; clear: () => void;
 	}>();
@@ -2313,22 +2312,19 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	/** 当前打开的历史大窗体（用于实时刷新与去重） */
 	let activeOverlay: ToolHistoryOverlayComponent | null = null;
 
-	// 1. 安装底层全局原型钩子骨架（单例）
-	ensureGlobalPrototypeHooksInstalled();
+	installToolNotificationStripper(pi, () => !webHost && hooksActive && currentConfig.enabled && currentConfig.stripToolNotificationHeaders !== false);
 
-	// 1.5 注册工具渲染器：剥掉插件在工具行里重复画的提示头（通道 C）
-	installToolNotificationStripper(pi, () => hooksActive && currentConfig.enabled && currentConfig.stripToolNotificationHeaders !== false);
-
-	// 2. 动态更新委派处理函数（支持任意次数的 /reload 即刻生效！）
-	dynamicHooks.shouldHideThinking = (target: any) => hooksActive && currentConfig.enabled && target.hideThinkingBlock === true;
-	dynamicHooks.handleToolRender = (target: any, width: number, origRender: Function) => {
+	// Only terminal clients bind these process-wide delegates, once session_start identifies the host.
+	const ownedHooks: Partial<DynamicHooksState> = {};
+	ownedHooks.shouldHideThinking = (target: any) => hooksActive && currentConfig.enabled && target.hideThinkingBlock === true;
+	ownedHooks.handleToolRender = (target: any, width: number, origRender: Function) => {
 		if (hooksActive && currentConfig.enabled && !target.expanded && shouldSilenceInTranscript(target.toolName, currentConfig)) {
 			return [];
 		}
 		return origRender.call(target, width);
 	};
 
-	dynamicHooks.handleShowExtensionNotify = (
+	ownedHooks.handleShowExtensionNotify = (
 		target: any,
 		message: string,
 		type: string | undefined,
@@ -2346,7 +2342,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		return origFn.call(target, message, type);
 	};
 
-	dynamicHooks.handleSetExtensionStatus = (
+	ownedHooks.handleSetExtensionStatus = (
 		target: any,
 		key: string,
 		text: string | undefined,
@@ -2403,7 +2399,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 	function startStatusTimer(ctx: any): void {
 		stopStatusTimer();
-		if (!currentConfig.enabled || !hooksActive) return;
+		if (webHost || !currentConfig.enabled || !hooksActive) return;
 		statusTimer = setInterval(() => {
 			syncWidget(ctx);
 		}, 100);
@@ -2441,7 +2437,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	 * 将当前滚动历史快照写入 session（不参与 LLM 上下文）。
 	 */
 	function persistHistory(): void {
-		if (!currentConfig.persistAcrossSessions) return;
+		if (hostDisabled || !currentConfig.persistAcrossSessions) return;
 		try {
 			pi.appendEntry(HISTORY_ENTRY_TYPE, serializeHistory(state.recentTools, totalToolCount, state.viewMode));
 		} catch (e) {
@@ -2449,12 +2445,24 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		}
 	}
 
+	function syncWebDock(ctx: ExtensionContext, enabled: boolean): void {
+		if (!enabled) return publishWebTools(ctx);
+		const recent = state.recentTools.slice(-Math.max(1, Math.min(20, Math.floor(currentConfig.maxRecentTools)))).reverse();
+		if (!recent.length) return publishWebTools(ctx, ["No tool history yet."]);
+		const lines = [`Recent tools: ${recent.length}/${state.recentTools.length} · newest first`];
+		for (const item of recent) {
+			lines.push(`#${item.index} ${webSnippet(toolDisplayLabel(item), 60)} · ${item.status}`,
+				`  Input: ${webSnippet(item.fullCommand || item.summaryDisplay || item.fullPath || "—")}`);
+			if (item.output) lines.push(`  Output: ${webSnippet(item.output, 240)}`);
+		}
+		lines.push("Full history when idle: /rolling-tools history");
+		publishWebTools(ctx, lines);
+	}
+
 	function syncWidget(ctx: any): void {
 		if (!ctx?.hasUI) return;
-
-		// 状态行为常驻行，因此只要功能开启就始终显示 widget
-		// pi-web 等宿主不能点击组件内字符按钮，从一开始就不注册滚动块。
 		const hasContent = currentConfig.enabled && !hostDisabled;
+		if (webHost) { syncWebDock(ctx, hasContent); return; }
 
 		if (!hasContent) {
 			ctx.ui.setWidget("rolling-tools", undefined);
@@ -2488,7 +2496,15 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	 * 打开工具历史大窗体（overlay dialog）。
 	 * 支持鼠标滚轮滚动，以及“上滑到顶再加载 step 条”的懒加载。
 	 */
-	function openHistoryOverlay(ctx: any, initialItem?: ToolItem): void {
+	function openHistoryOverlay(ctx: any, initialItem?: ToolItem): void | Promise<void> {
+		if (webHost) {
+			if (!currentConfig.enabled || hostDisabled) return;
+			return webHistory.open(ctx, "Tool History", () => state.recentTools.slice().reverse(), {
+				pageSize: currentConfig.lazyLoadStep ?? 10,
+				label: webToolLabel,
+				body: rows => rows.map(webToolRow).join(""),
+			});
+		}
 		if (!ctx?.hasUI || ctx.mode === "rpc" || !ctx.ui?.custom) {
 			ctx?.ui?.notify?.("rolling-tools: this environment does not support the overlay", "warning");
 			return;
@@ -2589,8 +2605,13 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		lastCtx = ctx;
 		const loaded = loadConfig(ctx?.cwd || process.cwd());
 		currentConfig = loaded.config;
+		webHost = isPiWebHost(ctx);
 		hostDisabled = shouldDisableForHost(ctx, currentConfig);
 		hooksActive = !hostDisabled;
+		if (!webHost) {
+			ensureGlobalPrototypeHooksInstalled();
+			Object.assign(dynamicHooks, ownedHooks);
+		}
 		if (hostDisabled) {
 			// 网页端整体停用：清掉可能残留的滚动块与计时器，后续事件全部短路。
 			stopStatusTimer();
@@ -2605,7 +2626,8 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		if (loaded.legacyDetected) {
 			pendingLegacyNotice = buildLegacyNotice(loaded.legacyPath, loaded.legacyVersion);
 		}
-		installUiHooks(ctx);
+		if (!webHost) installUiHooks(ctx);
+		state.viewMode = currentConfig.defaultViewMode ?? "fixed";
 
 		// 恢复历史：
 		// - reload/new/resume/fork：都尝试从当前 session 的 entries 中恢复。
@@ -2646,8 +2668,10 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	pi.on("agent_start", async (_event, ctx) => {
 		if (hostDisabled) return;
 		lastCtx = ctx;
-		installUiHooks(ctx);
-		(ctx.ui as any)?.setToolsExpanded?.(false);
+		if (!webHost) {
+			installUiHooks(ctx);
+			(ctx.ui as any)?.setToolsExpanded?.(false);
+		}
 
 		stopStatusTimer();
 		// 注意：不再清空 state.recentTools / totalToolCount，使滚动块跨轮次持续存在
@@ -2972,6 +2996,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_tree", (_event, ctx) => {
+		webHistory.close();
 		if (hostDisabled) return;
 		streamedDrafts.clear();
 		stopStatusTimer();
@@ -2986,22 +3011,18 @@ export default function rollingTools(pi: ExtensionAPI): void {
 
 	// Prototype wrappers are process-wide, but their delegates belong to this
 	// runtime. Removing the extension must leave inert pass-through wrappers.
-	const ownedHooks = {
-		thinking: dynamicHooks.shouldHideThinking,
-		render: dynamicHooks.handleToolRender,
-		notify: dynamicHooks.handleShowExtensionNotify,
-		status: dynamicHooks.handleSetExtensionStatus,
-	};
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
+		webHistory.close();
+		if (webHost && ctx?.hasUI) syncWebDock(ctx, false);
 		closeUnfinishedTools("the extension runtime shut down");
 		persistHistory();
 		hooksActive = false;
 		desktopActions.abort();
 		for (const cleanup of uiHookCleanups.splice(0)) cleanup();
-		if (dynamicHooks.shouldHideThinking === ownedHooks.thinking) dynamicHooks.shouldHideThinking = undefined;
-		if (dynamicHooks.handleToolRender === ownedHooks.render) dynamicHooks.handleToolRender = undefined;
-		if (dynamicHooks.handleShowExtensionNotify === ownedHooks.notify) dynamicHooks.handleShowExtensionNotify = undefined;
-		if (dynamicHooks.handleSetExtensionStatus === ownedHooks.status) dynamicHooks.handleSetExtensionStatus = undefined;
+		if (dynamicHooks.shouldHideThinking === ownedHooks.shouldHideThinking) dynamicHooks.shouldHideThinking = undefined;
+		if (dynamicHooks.handleToolRender === ownedHooks.handleToolRender) dynamicHooks.handleToolRender = undefined;
+		if (dynamicHooks.handleShowExtensionNotify === ownedHooks.handleShowExtensionNotify) dynamicHooks.handleShowExtensionNotify = undefined;
+		if (dynamicHooks.handleSetExtensionStatus === ownedHooks.handleSetExtensionStatus) dynamicHooks.handleSetExtensionStatus = undefined;
 		if (legacyNoticeTimer) clearTimeout(legacyNoticeTimer);
 		stopStatusTimer();
 		clearTransientStatuses();
@@ -3014,6 +3035,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			const action = (args || "").trim();
 			if (action === "reload") {
+				webHistory.close();
 				clearTransientStatuses();
 				const loaded = loadConfig(ctx?.cwd || process.cwd());
 				currentConfig = loaded.config;
@@ -3049,18 +3071,19 @@ export default function rollingTools(pi: ExtensionAPI): void {
 					ctx.ui?.notify?.(`rolling-tools: upgrade failed - ${result.error}`, "error");
 				}
 			} else if (action === "off") {
+				webHistory.close();
 				currentConfig.enabled = false;
 				stopStatusTimer();
 				clearTransientStatuses();
 				syncWidget(ctx);
-				ctx.ui?.notify?.("rolling-tools: body silencing and the scrollbar are disabled", "info");
+				ctx.ui?.notify?.(webHost ? "rolling-tools: web dock disabled" : "rolling-tools: body silencing and the scrollbar are disabled", "info");
 			} else if (action === "on") {
 				currentConfig.enabled = true;
 				// 网页端显式开启：本会话解除宿主闸门，便于比对或临时使用。
 				hostDisabled = false;
 				hooksActive = true;
 				refreshToolActivity(ctx);
-				ctx.ui?.notify?.("rolling-tools: body silencing and the scrollbar are enabled", "info");
+				ctx.ui?.notify?.(webHost ? "rolling-tools: web dock enabled" : "rolling-tools: body silencing and the scrollbar are enabled", "info");
 			} else if (action === "status") {
 				const host = isPiWebHost(ctx)
 					? `pi-web${hostDisabled ? " (disabled by disableInPiWeb)" : ""}`
@@ -3071,10 +3094,10 @@ export default function rollingTools(pi: ExtensionAPI): void {
 					`rolling-tools status:`,
 					`• Host: ${host}`,
 					`• Enabled: ${currentConfig.enabled ? "yes" : "no"}${hostDisabled ? " (host gate active)" : ""}`,
-					`• View mode: ${state.viewMode === "running" ? "running task only" : `last ${currentConfig.maxRecentTools} lines`}`,
+					`• ${webHost ? "Terminal view mode" : "View mode"}: ${state.viewMode === "running" ? "running task only" : `last ${currentConfig.maxRecentTools} lines`}`,
 					`• Widget rows: ${currentConfig.maxRecentTools} (${state.recentTools.length} in history)`,
 					`• Default view mode: ${currentConfig.defaultViewMode ?? "fixed"}`,
-					`• Silenced tools: ${(currentConfig.silencedTools ?? currentConfig.managedTools).join(", ")}`,
+					webHost ? "• Chat tool cards: rendered by pi-web (Process details)" : `• Silenced tools: ${(currentConfig.silencedTools ?? currentConfig.managedTools).join(", ")}`,
 					`• Collected tools: ${(currentConfig.widgetTools ?? currentConfig.managedTools).join(", ")}`,
 					`• Lazy-load step: ${currentConfig.lazyLoadStep ?? 10} rows`,
 					`• Persist across sessions: ${currentConfig.persistAcrossSessions ? "yes" : "no"}`,
@@ -3082,7 +3105,7 @@ export default function rollingTools(pi: ExtensionAPI): void {
 					`• Intercepted notifications: ${currentConfig.interceptNotifications.map((r) => r.match).join(", ") || "(none)"} (${(currentConfig.notificationKeywords ?? []).length} exception keywords)`,
 					`• Status duration: ${currentConfig.statusEnhancements?.[0]?.durationMs ?? "default"}ms`,
 					`• Strip tool-row headers: ${currentConfig.stripToolNotificationHeaders !== false ? "yes" : "no"}`,
-					`• Disable in pi-web: ${currentConfig.disableInPiWeb !== false ? "yes" : "no"} (override with PI_ROLLING_TOOLS_PI_WEB=on|off)`,
+					`• Disable in pi-web: ${currentConfig.disableInPiWeb === true ? "yes" : "no"} (override with PI_ROLLING_TOOLS_PI_WEB=on|off)`,
 				].join("\n");
 				await showStatusModal(ctx, "Rolling Tools", info.split("\n"));
 			} else if (action === "mode" || action.startsWith("mode ")) {
@@ -3097,10 +3120,11 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				syncWidget(ctx);
 				persistHistory();
 				ctx.ui?.notify?.(
-					`rolling-tools: view mode set to "${state.viewMode === "running" ? "running task only" : `last ${currentConfig.maxRecentTools} lines`}"`,
+					`rolling-tools: ${webHost ? "terminal view mode" : "view mode"} set to "${state.viewMode === "running" ? "running task only" : `last ${currentConfig.maxRecentTools} lines`}"`,
 					"info",
 				);
 			} else if (action === "clear") {
+				webHistory.close();
 				// The live overlay retains this array; clear it in place as well.
 				state.recentTools.splice(0);
 				streamedDrafts.clear();
@@ -3113,10 +3137,10 @@ export default function rollingTools(pi: ExtensionAPI): void {
 				activeOverlay?.refresh();
 				ctx.ui?.notify?.("✓ rolling-tools: tool history cleared", "info");
 			} else if (action === "history" || action === "open") {
-				openHistoryOverlay(ctx);
+				await openHistoryOverlay(ctx);
 			} else {
 				currentConfig.enabled = !currentConfig.enabled;
-				if (!currentConfig.enabled) clearTransientStatuses();
+				if (!currentConfig.enabled) { webHistory.close(); clearTransientStatuses(); }
 				refreshToolActivity(ctx);
 				ctx.ui?.notify?.(`rolling-tools: ${currentConfig.enabled ? "enabled" : "disabled"}`, "info");
 			}

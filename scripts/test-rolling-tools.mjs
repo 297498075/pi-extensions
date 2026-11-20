@@ -45,6 +45,34 @@ assert.ok(handlers.has("tool_result"), "tool_result handler registered");
 assert.ok(registeredCommand, "rolling-tools command registered");
 console.log("✓ Event handlers and command registered successfully.");
 
+let widgetContent = null;
+let notifiedMessage = null;
+
+const fakeUi = {
+	setWidget(key, content) {
+		widgetContent = content;
+	},
+	notify(msg, type) {
+		notifiedMessage = { msg, type };
+	},
+	setStatus(key, text) {},
+	setToolsExpanded() {},
+	requestRender() {},
+};
+
+const fakeCtx = {
+	hasUI: true,
+	ui: fakeUi,
+	cwd: process.cwd(),
+	sessionManager: {
+		getBranch() {
+			return appendedEntries;
+		},
+	},
+};
+
+for (const h of handlers.get("session_start") || []) await h({ reason: "startup" }, fakeCtx);
+
 console.log("\n=== Test 2: ToolExecutionComponent Silencing & Ctrl+O Expansion ===");
 const testTools = [
 	{ name: "read", shouldSilence: true },
@@ -93,32 +121,6 @@ for (const { name, shouldSilence } of testTools) {
 }
 
 console.log("\n=== Test 3: SoL-Pi Notification Interception ===");
-let widgetContent = null;
-let notifiedMessage = null;
-
-const fakeUi = {
-	setWidget(key, content) {
-		widgetContent = content;
-	},
-	notify(msg, type) {
-		notifiedMessage = { msg, type };
-	},
-	setStatus(key, text) {},
-	setToolsExpanded() {},
-	requestRender() {},
-};
-
-const fakeCtx = {
-	hasUI: true,
-	ui: fakeUi,
-	cwd: process.cwd(),
-	sessionManager: {
-		getBranch() {
-			return appendedEntries;
-		},
-	},
-};
-
 // Trigger agent_start to install UI hooks
 const agentStartHandlers = handlers.get("agent_start") || [];
 for (const h of agentStartHandlers) {

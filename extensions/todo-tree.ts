@@ -5,7 +5,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { AutocompleteItem, Component, KeyId, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { Key, matchesKey, sliceByColumn, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
-import { StatusModalComponent } from "./lib/status-modal.ts";
+import { showStatusModal, StatusModalComponent } from "./lib/status-modal.ts";
+import { isPiWebHost, webDisclosure, WebItemBrowser, webShelfWidget, webSnippet, webText } from "./lib/pi-web.ts";
 
 // ============================================================================
 // 1. Data Models & Constants
@@ -839,6 +840,70 @@ function getStatusGlyph(status: TodoStatus): { glyph: string; colorKey: string }
 		default:
 			return { glyph: "○", colorKey: "text" };
 	}
+}
+
+interface WebTodoRow {
+	node: TreeNode;
+	parent?: WebTodoRow;
+}
+
+function webTodoRows(roots: TreeNode[]): WebTodoRow[] {
+	const rows: WebTodoRow[] = [];
+	const visit = (node: TreeNode, parent?: WebTodoRow) => {
+		const row = { node, parent };
+		rows.push(row);
+		for (const child of node.children) visit(child, row);
+	};
+	for (const root of roots) visit(root);
+	return rows;
+}
+
+const WEB_TODO_PAGE_SIZE = 30;
+
+function webTodoPreview(store: TodoTreeStore): string[] {
+	const flat = store.getFlattenedTree();
+	if (!flat.length) return ["No tasks yet."];
+	const { completed, total, inProgress, cancelled } = store.getProgressStats();
+	const rows = flat.slice(0, WEB_TODO_PAGE_SIZE);
+	const lines = [`${completed}/${total} complete · ${inProgress} in progress · ${cancelled} cancelled`, `Tasks: ${rows.length}/${flat.length}`];
+	for (const { node: { item, depth } } of rows) {
+		const indent = "  ".repeat(Math.min(depth, 4));
+		lines.push(`${indent}${getStatusGlyph(item.status).glyph} #${webSnippet(item.id, 50)} ${webSnippet(item.subject)} · ${item.status}`);
+		if (item.description) lines.push(`${indent}  Description: ${webSnippet(item.description)}`);
+		const notes = item.notes ?? [];
+		if (notes.length > 2) lines.push(`${indent}  … ${notes.length - 2} earlier notes`);
+		for (const note of notes.slice(-2)) lines.push(`${indent}  [${note.author === "user" ? "User" : "Agent"}] ${webSnippet(note.text)}`);
+	}
+	lines.push("Full tree and edits when idle: /todo open");
+	return lines;
+}
+
+function webTodoPage(rows: readonly WebTodoRow[]): string {
+	// A page may start mid-branch. Include its ancestor chain, expanded, without duplicating siblings.
+	const visible = new Set<TreeNode>();
+	const include = (row: WebTodoRow) => {
+		if (visible.has(row.node)) return;
+		if (row.parent) include(row.parent);
+		visible.add(row.node);
+	};
+	rows.forEach(include);
+	const onPage = new Set(rows.map(row => row.node));
+	const render = (node: TreeNode): string => {
+		const { item } = node;
+		const subject = item.subject.length > 120 ? item.subject.slice(0, 119) + "…" : item.subject;
+		const label = `${getStatusGlyph(item.status).glyph} #${item.id} ${subject} · ${item.status}`;
+		let body = subject === item.subject ? "" : `<p>${webText(item.subject)}</p>`;
+		if (item.description) body += `<p>${webText(item.description)}</p>`;
+		for (const note of item.notes ?? []) body += `<div><strong>${webText(note.author)}:</strong> ${webText(note.text)}</div>`;
+		const children = node.children.filter(child => visible.has(child)).map(render);
+		if (children.length) {
+			// Cap physical indentation so deeply nested rows still fit a phone.
+			body += node.depth < 3 ? `<ul>${children.map(child => `<li>${child}</li>`).join("")}</ul>` : children.join("");
+		}
+		if (node.isDepthCapped) body += "<p>Tree depth limit reached.</p>";
+		return body ? webDisclosure(label, body, !onPage.has(node)) : `<div>${webText(label)}</div>`;
+	};
+	return [...visible].filter(node => node.depth === 0).map(render).join("");
 }
 
 // ============================================================================
@@ -1738,6 +1803,9 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 	let activeModal: Component | null = null;
 	let widgetComponent: TodoTreeWidgetComponent | null = null;
 	let isPromptingUser = false;
+	const webTree = new WebItemBrowser();
+	const publishWebTodos = webShelfWidget("📋 Todos");
+	let unsubscribeWebWidget: (() => void) | undefined;
 
 	function persistSnapshot(): void {
 		try {
@@ -1807,6 +1875,11 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 	// Mount widget using TUI factory (guarantees staying stably above rolling-tools)
 	function syncWidget(ctx: ExtensionContext): void {
 		if (!ctx.hasUI || !ctx.ui) return;
+		if (isPiWebHost(ctx)) {
+			if (!config.enabled) webTree.close();
+			publishWebTodos(ctx, config.enabled ? webTodoPreview(store) : undefined);
+			return;
+		}
 
 		if (!config.enabled) {
 			if (widgetComponent) {
@@ -1832,7 +1905,7 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 	}
 
 	// Open Lightweight Status Modal
-	function openStatusModal(ctx: ExtensionContext): void {
+	function openStatusModal(ctx: ExtensionContext): void | Promise<void> {
 		const stats = store.getProgressStats();
 		const activeTools = pi.getActiveTools?.() ?? [];
 		const isToolActive = activeTools.includes("todo");
@@ -1846,6 +1919,7 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 				`• Tasks: ${stats.total + stats.cancelled} (${stats.completed} completed, ${stats.inProgress} in progress, ${stats.pending} pending, ${stats.cancelled} cancelled)`,
 				`• Progress: ${stats.percent}%`,
 			].join("\n");
+			if (isPiWebHost(ctx) && ctx.hasUI) return showStatusModal(ctx, "Todo Tree Status", info.split("\n").slice(1));
 			ctx.ui?.notify?.(info, "info");
 			return;
 		}
@@ -1893,7 +1967,30 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 	}
 
 	// Open Fullscreen / Centered Overlay Modal
-	function openModal(ctx: ExtensionContext): void {
+	function openModal(ctx: ExtensionContext): void | Promise<void> {
+		if (isPiWebHost(ctx)) {
+			return webTree.open(ctx, "Todo Tree", () => webTodoRows(store.buildTree()), {
+				pageSize: WEB_TODO_PAGE_SIZE,
+				body: webTodoPage,
+				label: ({ node: { item } }) => `#${item.id} · ${item.subject}`,
+				edit: async ({ node: { item } }, signal) => {
+					if (store.getTask(item.id) !== item) return true;
+					const complete = item.status === "completed" ? "Reopen task" : "Complete task";
+					const cancel = item.status === "cancelled" ? "Restore task" : "Cancel task";
+					const choice = await ctx.ui.select(`#${item.id} · ${item.status} · ${item.subject.slice(0, 100)}`,
+						[complete, cancel, "Add note", "Back to tree"], { signal });
+					if (signal.aborted || choice === undefined) return false;
+					if (store.getTask(item.id) !== item || choice === "Back to tree") return true;
+					if (choice === "Add note") await promptAddUserNote(ctx, item.id, signal);
+					else if (choice === complete || choice === cancel) {
+						const status = choice === "Complete task" ? "completed" : choice === "Cancel task" ? "cancelled" : "pending";
+						store.updateTask(item.id, { status });
+						persistSnapshot();
+					}
+					return true;
+				},
+			});
+		}
 		if (!ctx.hasUI || ctx.mode === "rpc" || !ctx.ui?.custom) return;
 		if (activeModal || isPromptingUser) return;
 
@@ -1937,7 +2034,7 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 		});
 	}
 
-	async function promptAddUserNote(ctx: ExtensionContext, taskId: string): Promise<void> {
+	async function promptAddUserNote(ctx: ExtensionContext, taskId: string, signal?: AbortSignal): Promise<void> {
 		if (!ctx.ui?.input) return;
 		const task = store.getTask(taskId);
 		if (!task) return;
@@ -1946,11 +2043,12 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 
 		try {
 			const noteText = await ctx.ui.input(
-				`Add Note for Task #${task.id} (${task.subject})`,
+				`Add Note for Task #${task.id} (${signal ? task.subject.slice(0, 80) : task.subject})`,
 				"Type context note (leave blank to cancel)...",
+				{ signal },
 			);
 
-			if (noteText && noteText.trim()) {
+			if (!signal?.aborted && store.getTask(taskId) === task && noteText?.trim()) {
 				store.addUserNote(taskId, noteText.trim());
 				persistSnapshot();
 				ctx.ui.notify?.(`Added note to #${taskId}`, "info");
@@ -1959,8 +2057,9 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 					const notifyAgent = await ctx.ui.confirm(
 						"Remind Agent?",
 						"Send this note to the LLM agent as a prompt message?",
+						{ signal },
 					);
-					if (notifyAgent) {
+					if (notifyAgent && !signal?.aborted && store.getTask(taskId) === task) {
 						pi.sendUserMessage(`[Todo Note for Task #${task.id}]: ${noteText.trim()}`, {
 							deliverAs: "followUp",
 						});
@@ -1969,7 +2068,7 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 			}
 		} finally {
 			isPromptingUser = false;
-			openModal(ctx);
+			if (!signal) openModal(ctx);
 		}
 	}
 
@@ -2110,12 +2209,15 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 	// Lifecycle Events
 	pi.on("session_start", (_event, ctx) => {
 		lastCtx = ctx;
+		unsubscribeWebWidget?.();
 		restoreFromBranch(ctx);
+		if (ctx.hasUI && isPiWebHost(ctx)) unsubscribeWebWidget = store.subscribe(() => syncWidget(ctx));
 		syncActiveTools(config.enabled);
 		syncWidget(ctx);
 	});
 
 	pi.on("session_tree", (_event, ctx) => {
+		webTree.close();
 		lastCtx = ctx;
 		restoreFromBranch(ctx);
 		syncActiveTools(config.enabled);
@@ -2123,7 +2225,10 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 		widgetComponent?.invalidate();
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (_event, ctx) => {
+		unsubscribeWebWidget?.();
+		webTree.close();
+		if (ctx.hasUI && isPiWebHost(ctx)) publishWebTodos(ctx);
 		activeModal = null;
 		if (widgetComponent) {
 			widgetComponent.dispose();
@@ -2169,13 +2274,13 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 			syncWidget(ctx);
 			ctx.ui?.notify?.(`Todo Tree is now ${config.enabled ? "ENABLED" : "DISABLED"}`, "info");
 		} else if (trimmed === "open" || trimmed === "modal") {
-			openModal(ctx);
+			await openModal(ctx);
 		} else if (trimmed === "clear") {
 			store.clear();
 			persistSnapshot();
 			ctx.ui?.notify?.("Todo Tree list cleared.", "info");
 		} else if (trimmed === "status") {
-			openStatusModal(ctx);
+			await openStatusModal(ctx);
 		} else {
 			if (!config.enabled) {
 				config.enabled = true;
@@ -2183,9 +2288,9 @@ export default function todoTreeExtension(pi: ExtensionAPI): void {
 				syncActiveTools(true);
 				persistSnapshot();
 				syncWidget(ctx);
-				ctx.ui?.notify?.("Todo Tree enabled. Click [📋 ] or press shortcut to view.", "info");
+				ctx.ui?.notify?.("Todo Tree enabled. Click 📋 to view.", "info");
 			} else {
-				openModal(ctx);
+				await openModal(ctx);
 			}
 		}
 	};

@@ -151,7 +151,7 @@ The extension has no network, external file, command execution, or background-re
 - **Universal tool & MCP support**: Uses dynamic in-place decoration on `ToolExecutionComponent`, supporting built-ins, MCP proxies (`mcp`, `mcp__*`), Rider MCP tools (`rider_execute_tool`), SoL-Pi tools, and arbitrary third-party tools with generic parameter heuristics.
 - **Unified tips handling**: Plugin tips (`ui.notify`) are suppressed from the transcript. `ui.setStatus` tips stay in the footer and are colorized, but are only auto-cleared when their rule sets `durationMs`. Each key has an independent deadline; off, config reload and shutdown clean up transient effects without erasing persistent keys. Persistent keys (`persistentKeys`, default `["blackhole", "mcp"]`) pass through untouched so long-lived gauges such as pi-blackhole's footer bar and the MCP server status keep working. `error` / `warning` messages and any message containing a `notificationKeywords` word always pass through. Plugin headers such as SoL-Pi's `⚡ SoL-Pi · …` / `Money saved · …` are stripped from tool rows.
 - **Configuration file support**: Supports global configuration (`~/.pi/agent/extensions/rolling-tools/config.json`) and local project overrides (`./.pi/rolling-tools.json`).
-- **Disabled inside pi-web by default**: Pi Web renders a widget through `setWidget` as a text snapshot, so the dock's `🔽`/`➕` character buttons never receive browser clicks and the block is squeezed into the bottom status shelf. When the session is bound in RPC mode by Pi Web, the extension now skips the widget, transcript silencing, tip interception, status colorizing and thinking hiding entirely, and the terminal TUI keeps its full behavior. Detection requires both `ctx.mode === "rpc"` and a Pi Web process marker, so other RPC clients stay unaffected. Set `"disableInPiWeb": false` in either config file, or launch with `PI_ROLLING_TOOLS_PI_WEB=on`, to bring the widget back in Pi Web; `PI_ROLLING_TOOLS_PI_WEB=off` forces the host gate. `/rolling-tools off` still works as before in the terminal, and `/rolling-tools on` inside a Pi Web session lifts the host gate for that session only.
+- **Clickable pi-web controls**: The browser dock uses a native, read-only widget that stays clickable while the agent runs. See [Pi Web controls](#pi-web-controls).
 - **Active-call retention**: Genuine preparing/running calls are not evicted by newer completed history. Snapshots retain the recent history tail plus active calls; reload reconciles old orphan spinners against actual results.
 - **Fixed-dock rolling widget**: Shows the latest running/completed tools in a fixed dock above the editor with status (`⏳`/`✓`/`✗`), duration, and arguments summary.
 - **Click-to-expand details**: Click any tool item to toggle details (`▸` / `▾`) such as full paths, multiline commands, and execution outputs without mouse hover flickering. Click details to copy to clipboard, or `Ctrl+Left-click` on paths to open existing local files.
@@ -193,7 +193,7 @@ Example configuration (`~/.pi/agent/extensions/rolling-tools/config.json`):
   "lazyLoadStep": 10,
   "persistAcrossSessions": true,
   "configVersion": 3,
-  "disableInPiWeb": true,
+  "disableInPiWeb": false,
   "managedTools": ["*"],
   "silencedTools": ["*"],
   "widgetTools": ["*"],
@@ -231,20 +231,20 @@ Example configuration (`~/.pi/agent/extensions/rolling-tools/config.json`):
 }
 ```
 
-### Pi Web host gate
+### Pi Web controls
 
-Pi Web binds extensions with `mode: "rpc"` and renders `setWidget` output as inert text, so the dock's clickable characters cannot work there. Rolling Tools therefore disables itself for Pi Web sessions while leaving the terminal untouched:
+**Tool details** and **📋 Todos** are [native pi-web widgets](https://github.com/agegr/pi-web/blob/v0.17.0/components/ExtensionWidgets.tsx). Click a tab to expand its preview, click it again to collapse, or switch to the other tab. These are browser-local actions: they work while the agent is running, send no command or prompt, and add no chat message. No pi-web patch or browser add-on is required.
 
-| Control | Effect |
+| Preview | Display |
 | --- | --- |
-| `"disableInPiWeb": true` (default) | Pi Web sessions get no dock, no transcript silencing, no tip interception, no status colorizing, no thinking hiding. |
-| `"disableInPiWeb": false` | Restore the previous Pi Web behavior, including the bottom-shelf dock. |
-| `PI_ROLLING_TOOLS_PI_WEB=on` | Force the widget inside Pi Web for one launch. |
-| `PI_ROLLING_TOOLS_PI_WEB=off` | Force the host gate inside Pi Web for one launch. |
-| `/rolling-tools on` | Lift the host gate for the current Pi Web session only. |
-| `/rolling-tools status` | Shows the detected host and whether the gate is active. |
+| **Tool details** | Newest calls first, including running calls, input summaries and output excerpts. Shows `maxRecentTools` entries (up to 20); the native tab itself replaces the separate Show/Hide commands button. |
+| **📋 Todos** | Enable with `/todo on`. Shows progress, up to 30 indented tasks with statuses and descriptions, and the last two notes per task, marked **[Agent]** or **[User]**. |
 
-Detection combines the RPC binding mode with a Pi Web process marker (`__piWebHttpDispatcherConfigured`, `Symbol.for("pi-web.agentEventStreamInfos")`, or `PI_WEB_HOSTNAME` / `PI_WEB_PASSWORD`), so other RPC or SDK clients keep the dock.
+Scroll within the panel to read the published preview. It updates on tool/task changes; pi-web 0.17.0 sends no widget scroll events to extensions, so scrolling does not fetch older entries. For full details when idle, **type** `/rolling-tools history` or `/todo open`. A multi-page index has direct **Next page** / **Previous page** buttons; **View this page** opens its collapsible rows. The TUI retains its wheel-based history loader and its own view mode.
+
+To check the busy state, start a run, click each widget twice, and verify that it opens/closes without a new chat entry. A `command:` status from another extension may be disabled during the same run. Chat tool cards are controlled independently by pi-web's **Process details** (处理详情).
+
+The web dock is enabled by default. An existing `"disableInPiWeb": true` still opts out; change it to `false` and run `/rolling-tools reload`, or use `/rolling-tools on` for the current session. `PI_ROLLING_TOOLS_PI_WEB=on|off` overrides the host gate at launch. `/rolling-tools status` shows the detected host. Only RPC sessions with a pi-web process marker use this UI; terminal and other RPC clients keep their existing views.
 
 ### Notification and tips handling
 
@@ -420,6 +420,8 @@ pi --extension ./extensions/image-pager.ts
 
 `extensions/todo-tree.ts` 为复杂开发任务提供层次化任务拆解（Hierarchy / Parent-Child Subtasks）、主窗体极简状态条与全功能居中弹出窗口（Modal Overlay with Scrollbar）：
 
+- **pi-web 原生预览**：输入 `/todo on` 后，点输入框下方的 **📋 Todos** 可直接查看缩进任务树、状态、描述和带 `[Agent]` / `[User]` 标记的备注。运行中可点；再点一次收起。面板滚动浏览已送达的前 30 个任务，每项最多展示最近两条备注。
+- **完整任务树与编辑**：空闲时手动输入 `/todo open`。单页弹窗内可以逐项展开；点 **确认** 再选任务即可修改状态或添加备注。多页时直接点 **Next page / Previous page** 翻页，选 **View this page** 浏览本页的折叠树；跨页任务保留父级路径。备注保存在当前分支，在 “Remind Agent?” 中确认后才发送给模型。
 - **分支与批次一致性**：快照深拷贝，空分支恢复为空；`batch_create` 整批验证成功后再提交，包括自动清理全部已完成/取消的旧计划（也支持全部取消）；仍有未完成父项时不会清理，失败不留下半棵树。
 - **分层级任务模型与动态演进**：支持多层级树状结构（如 `#1` $\rightarrow$ `#1.1` $\rightarrow$ `#1.1.1`），支持任务随进度中途追加小项或放弃取消（`cancelled`），取消项自动从进度有效项剔除，绝不阻塞整体推进。
 - **主窗体聚焦（仅展示进行中小项）**：输入栏上方仅展示总体进度、字符进度条（`[████░░░░░]`）以及当前所有正在执行的叶子小项（带父级面包屑，如 `[数据层] > 编写测试`）；多并行任务全行展开，不限死组件高度。

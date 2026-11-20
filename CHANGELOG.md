@@ -4,6 +4,8 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+- fix(pi-web): show tool details and annotated tasks in native shelf widgets. They open locally while the session is busy and never send a slash command. Manually opened full views retain collapsible rows and offer direct Next/Previous page navigation.
+
 - fix(exposure): require Pi 1.2.0 or newer, whose `getAllTools()` exposes the `reachesTools` metadata used to detect a real `tool_search`; older supported ranges silently activated every deferred tool and lost the context savings.
 - chore(i18n): write every model- and user-facing string in English (tool descriptions, prompt guidelines, parameter schemas, tool results, status modals, slash-command help and completion), keeping the functional Chinese values that match Chinese plugin notifications and Chinese time-unit input.
 

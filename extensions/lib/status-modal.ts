@@ -1,6 +1,7 @@
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { isPiWebHost, selectWebActions } from "./pi-web.ts";
 
 interface StatusModalOptions {
 	maxWidth?: number;
@@ -97,6 +98,10 @@ export class StatusModalComponent implements Component {
 
 /** Read-only status must remain visible even when transcript notifications are muted. */
 export async function showStatusModal(ctx: ExtensionContext, title: string, lines: string[]): Promise<void> {
+	if (ctx.hasUI && isPiWebHost(ctx) && typeof ctx.ui?.select === "function") {
+		await selectWebActions(ctx, [title, ...lines].join("\n"), ["Close"]);
+		return;
+	}
 	if (!ctx.hasUI || ctx.mode !== "tui" || !ctx.ui?.custom) {
 		ctx.ui?.notify?.([title, ...lines].join("\n"), "info");
 		return;

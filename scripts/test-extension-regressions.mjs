@@ -141,9 +141,9 @@ try {
 	const existingThinking = new AssistantMessageComponent({ role: "assistant", content: [{ type: "thinking", thinking: "existing reasoning" }] }, true);
 	assert.ok(existingThinking.render(80).join("\n").includes("Thinking..."));
 	rollingTools(rolling.pi);
+	await emit(rolling.handlers, "session_start", { reason: "startup" }, rollingCtx);
 	const assistantUpdate = AssistantMessageComponent.prototype.updateContent;
 	const assistantRender = AssistantMessageComponent.prototype.render;
-	await emit(rolling.handlers, "session_start", { reason: "startup" }, rollingCtx);
 	assert.deepEqual(existingThinking.render(80), [], "already-mounted thinking-only messages must disappear without blank lines");
 	assert.ok(!widget(tui, theme).render(100).join("\n").includes("ABANDONED-BRANCH"));
 	await rolling.commands.get("rolling-tools").handler("status", rollingCtx);
@@ -235,6 +235,7 @@ try {
 	assert.ok(hiddenReasoningComponent.render(80).join("\n").includes("Thinking..."), "shutdown must restore native thinking rendering");
 	const reloadedRolling = handlersFor();
 	rollingTools(reloadedRolling.pi);
+	await emit(reloadedRolling.handlers, "session_start", { reason: "reload" }, rollingCtx);
 	assert.equal(AssistantMessageComponent.prototype.updateContent, assistantUpdate, "reload must not stack assistant update hooks");
 	assert.equal(AssistantMessageComponent.prototype.render, assistantRender, "reload must not stack assistant render hooks");
 	assertCompletelyHidden(hiddenReasoningComponent);
