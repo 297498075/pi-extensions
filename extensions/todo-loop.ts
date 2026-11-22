@@ -10,6 +10,9 @@ const MAX_FOLLOWUPS_FLAG = "todo-loop-max-followups";
 const CONTROL_TOOL = "todo_loop_control";
 const DECISION_ENTRY = "todo-loop-decision";
 const BUDGET_RESET_ENTRY = "todo-loop-budget-reset";
+const FOLLOWUP = "todo-loop-followup";
+const BLOCKER_SUMMARY = "todo-loop-blocker-summary";
+const REVIEW_PROMPT = "Review every remaining leaf using any recent subagent results. Separate locally feasible implementation, design and testing from acceptance work that requires external access or approval. Update the todo tree, clear blockers for runnable tasks, and do that work first. If all leaves still require external help, report the specific missing prerequisite and resume condition for each task (group only identical prerequisites).";
 
 // Keep recognizing old user-message follow-ups without inspecting assistant prose.
 const LEGACY_CONTINUE_PROMPT =
@@ -17,8 +20,8 @@ const LEGACY_CONTINUE_PROMPT =
 const CONTINUE_PROMPT =
 	"Continue working on the remaining actionable todo items and update the todo list as you progress. " +
 	"Use todo_loop_control status to inspect actionable task IDs and registered blockers. " +
-	"If a task truly requires user input, access, or an external dependency, use todo_loop_control report_blocker with taskIds, category, reason and resumeWhen; continue other unblocked tasks. " +
-	"Do not mark blocked tasks completed or cancelled. A summary or a statement that you cannot continue does not pause the loop.";
+	"Use todo_loop_control wait_for_background with taskIds and runIds when the only next step depends on a running native subagent. " +
+	"For genuine user input, access, or external dependencies, use report_blocker with taskIds, category, reason and resumeWhen. Continue other runnable tasks; leave waiting and blocked tasks unfinished.";
 
 interface Task {
 	id: string;
@@ -35,9 +38,17 @@ interface Blocker {
 	resumeWhen: string;
 }
 
+interface BackgroundWait {
+	taskId: string;
+	revision: string;
+	runIds: string[];
+}
+
 interface TodoState {
 	tasks: Task[];
 	blockers: Map<string, Blocker>;
+	waiting: Map<string, BackgroundWait>;
+	activeRunIds: Set<string>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -87,24 +98,71 @@ function userText(message: unknown): string | undefined {
 		.join("\n");
 }
 
-// Reconstruct exclusively from the active branch. Successful tool-result details
-// are the durable control protocol; quoted JSON, assistant text and failed calls
-// cannot mutate it. No in-memory blocker cache can leak across forks or reloads.
+// A run can finish while the operator visits a different branch of the same
+// session. Its terminal notice is still authoritative for that exact run ID.
+function finishedRuns(ctx: ExtensionContext, drafts: readonly SessionBoundaryDraft[]): Set<string> {
+	const finished = new Set<string>();
+	for (const entry of [...ctx.sessionManager.getEntries(), ...drafts]) {
+		if (entry.type !== "custom_message" || entry.customType !== "subagent-notify" ||
+			!isRecord(entry.details) || !Array.isArray(entry.details.runs)) continue;
+		for (const run of entry.details.runs) {
+			if (isRecord(run) && typeof run.runId === "string" &&
+				(run.status === "completed" || run.status === "failed" || run.status === "paused" || run.status === "stopped")) {
+				finished.add(run.runId);
+			}
+		}
+	}
+	return finished;
+}
+
+function isAsyncLaunch(details: Record<string, unknown>): boolean {
+	return details.mode !== "management" && typeof details.runId === "string" && details.runId === details.asyncId;
+}
+
+// Controls and launches belong to the active branch. Successful tool results,
+// not quoted JSON or ordinary messages, carry the durable control state.
 function latestTodoState(ctx: ExtensionContext, drafts: readonly SessionBoundaryDraft[] = []): TodoState | undefined {
+	const activeRunIds = new Set<string>();
+	const finished = finishedRuns(ctx, drafts);
+	const sessionId = ctx.sessionManager.getSessionId();
+	const allowLegacyLaunch = !ctx.sessionManager.getHeader()?.parentSession;
 	let state: TodoState | undefined;
 	for (const entry of [...ctx.sessionManager.getBranch(), ...drafts]) {
+		if (entry.type === "custom" && entry.customType === BUDGET_RESET_ENTRY &&
+			isRecord(entry.data) && entry.data.reason === "fork") {
+			activeRunIds.clear();
+			state?.waiting.clear();
+		}
 		let tasks: Task[] | undefined;
 		if (entry.type === "message") {
 			const message = entry.message;
 			if (message.role === "user" && userText(message) !== LEGACY_CONTINUE_PROMPT) state?.blockers.clear();
 			if (message.role !== "toolResult" || message.isError) continue;
 			const details = isRecord(message.details) ? message.details : undefined;
+			if (message.toolName === "subagent" && details && isAsyncLaunch(details) && typeof details.runId === "string" &&
+				(details.todoLoopSessionId === undefined ? allowLegacyLaunch : details.todoLoopSessionId === sessionId) && !finished.has(details.runId)) {
+				activeRunIds.add(details.runId);
+			}
 			if (message.toolName === "todo" || message.toolName === "todos") {
 				tasks = parseTasks(details?.tasks ?? details?.todos, "todo");
 			}
 			if (message.toolName === CONTROL_TOOL && details?.version === 1 && state) {
 				if (details.action === "clear_blocker" && Array.isArray(details.taskIds)) {
 					for (const id of details.taskIds) if (typeof id === "string") state.blockers.delete(id);
+				}
+				if (details.action === "clear_background_wait" && Array.isArray(details.taskIds)) {
+					for (const id of details.taskIds) if (typeof id === "string") state.waiting.delete(id);
+				}
+				if (details.action === "wait_for_background" && details.sessionId === sessionId && Array.isArray(details.waiting)) {
+					for (const wait of details.waiting) {
+						if (!isRecord(wait) || typeof wait.taskId !== "string" || typeof wait.revision !== "string" ||
+							!Array.isArray(wait.runIds) || !wait.runIds.every(id => typeof id === "string")) continue;
+						if (!state.tasks.some(task => task.id === wait.taskId && task.revision === wait.revision)) continue;
+						// A later declaration replaces the prior wait, including when it has already settled.
+						state.waiting.delete(wait.taskId);
+						const runIds = wait.runIds.filter(id => activeRunIds.has(id));
+						if (runIds.length) state.waiting.set(wait.taskId, { taskId: wait.taskId, revision: wait.revision, runIds });
+					}
 				}
 				if (details.action === "report_blocker" && Array.isArray(details.blockers)) {
 					for (const blocker of details.blockers) {
@@ -133,10 +191,13 @@ function latestTodoState(ctx: ExtensionContext, drafts: readonly SessionBoundary
 		}
 		if (tasks !== undefined) {
 			const blockers = state?.blockers ?? new Map<string, Blocker>();
-			for (const [id, blocker] of blockers) {
-				if (!tasks.some(task => task.id === id && task.revision === blocker.revision)) blockers.delete(id);
+			const waiting = state?.waiting ?? new Map<string, BackgroundWait>();
+			for (const controls of [blockers, waiting]) {
+				for (const [id, control] of controls) {
+					if (!tasks.some(task => task.id === id && task.revision === control.revision)) controls.delete(id);
+				}
 			}
-			state = { tasks, blockers };
+			state = { tasks, blockers, waiting, activeRunIds };
 		}
 	}
 	return state;
@@ -150,12 +211,46 @@ function actionableTasks(state: TodoState | undefined): Task[] {
 	return leaves.length ? leaves : tasks;
 }
 
+// Only committed prompts (not diagnostic decisions) spend a review. The most recent
+// review also covers refined blocker wording for the same leaves in its response.
+function blockerReview(ctx: ExtensionContext, drafts: readonly SessionBoundaryDraft[], blockers: Blocker[]) {
+	blockers.sort((a, b) => a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0);
+	const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+	const sessionId = ctx.sessionManager.getSessionId();
+	const leafKey = digest(blockers.map(b => [b.taskId, b.revision]));
+	const blockerKey = digest(blockers.map(b => [b.taskId, b.revision, b.category, b.reason, b.resumeWhen]));
+	let latest = true, reviewed = false, summarized = false;
+	for (const entry of [...ctx.sessionManager.getBranch(), ...drafts].reverse()) {
+		if (entry.type === "message" && entry.message.role === "user" && userText(entry.message) !== LEGACY_CONTINUE_PROMPT) break;
+		if (entry.type !== "custom_message" || (entry.customType !== FOLLOWUP && entry.customType !== BLOCKER_SUMMARY)) continue;
+		const meta = entry.details;
+		if (isRecord(meta) && meta.sessionId === sessionId) {
+			if (entry.customType === FOLLOWUP && (meta.blockerKey === blockerKey || (latest && meta.leafKey === leafKey))) reviewed = true;
+			if (entry.customType === BLOCKER_SUMMARY && meta.blockerKey === blockerKey) {
+				if (latest) summarized = true;
+				if (meta.reviewed === true) reviewed = true;
+			}
+		}
+		latest = false;
+	}
+	const groups = new Map<string, { ids: string[]; blocker: Blocker }>();
+	for (const blocker of blockers) {
+		const key = JSON.stringify([blocker.category, blocker.reason, blocker.resumeWhen]);
+		const group = groups.get(key) ?? { ids: [], blocker };
+		group.ids.push(blocker.taskId);
+		groups.set(key, group);
+	}
+	const summary = ["Todo-loop paused. Remaining tasks and their external prerequisites:", ...Array.from(groups.values(),
+		({ ids, blocker }) => `- ${ids.join(", ")} [${blocker.category}]: ${blocker.reason}\n  Resume when: ${blocker.resumeWhen}`)].join("\n");
+	return { details: { sessionId, blockerKey, leafKey }, reviewed, summarized, summary };
+}
+
 function followupCount(ctx: ExtensionContext): number {
 	let used = 0;
 	for (const entry of ctx.sessionManager.getBranch()) {
 		if (entry.type === "custom" && entry.customType === BUDGET_RESET_ENTRY) used = 0;
 		else if ((entry.type === "message" && userText(entry.message) === LEGACY_CONTINUE_PROMPT) ||
-			(entry.type === "custom_message" && entry.customType === "todo-loop-followup")) used++;
+			(entry.type === "custom_message" && entry.customType === FOLLOWUP)) used++;
 	}
 	return used;
 }
@@ -187,14 +282,16 @@ export default function todoLoop(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: CONTROL_TOOL,
 		label: "Todo Loop Control",
-		description: "Inspect actionable todo IDs (status), register genuine task blockers (report_blocker), or clear blockers (clear_blocker). Report only tasks that require user input, access, or an external dependency; continue other tasks. Reporting does not complete/cancel tasks. New user messages and task changes invalidate blockers. State is stored in successful tool results, not assistant prose.",
-		promptGuidelines: ["When unfinished todos truly cannot proceed, use todo_loop_control report_blocker with task IDs, a concrete reason and resume condition. Continue unblocked tasks; prose alone does not pause todo-loop."],
+		description: "Inspect task IDs, external blockers and native background waits (status). Use report_blocker or clear_blocker for external prerequisites. Use wait_for_background with taskIds and runIds only when no next step on those tasks is useful until the specified native subagents finish. Completion notices release waits automatically; clear_background_wait releases them manually. Continue other runnable tasks.",
+		promptGuidelines: ["Use todo_loop_control wait_for_background after launching native async subagents if the specified tasks must now await their handoff. Register genuine external prerequisites separately with report_blocker and continue all other runnable tasks."],
 		// Nested tools do not have standalone persisted tool-result entries.
 		exposure: "model-only",
 		executionMode: "sequential",
 		parameters: Type.Object({
-			action: Type.Union([Type.Literal("status"), Type.Literal("report_blocker"), Type.Literal("clear_blocker")]),
-			taskIds: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, uniqueItems: true, description: "Actionable IDs from status; required for report_blocker and clear_blocker. ID-less todos use @1, @2, etc." })),
+			action: Type.Union([Type.Literal("status"), Type.Literal("report_blocker"), Type.Literal("clear_blocker"),
+				Type.Literal("wait_for_background"), Type.Literal("clear_background_wait")]),
+			taskIds: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, uniqueItems: true, description: "Task IDs from status; use unfinished leaves when registering blockers or waits." })),
+			runIds: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, uniqueItems: true, description: "Exact active native async run IDs from status; required for wait_for_background." })),
 			category: Type.Optional(Type.Union([Type.Literal("needs_user_input"), Type.Literal("missing_access"), Type.Literal("external_dependency")])),
 			reason: Type.Optional(Type.String({ minLength: 1, description: "Concrete blocker evidence; required for report_blocker." })),
 			resumeWhen: Type.Optional(Type.String({ minLength: 1, description: "What must change to resume; required for report_blocker." })),
@@ -207,19 +304,33 @@ export default function todoLoop(pi: ExtensionAPI): void {
 			});
 			if (params.action === "status") {
 				const details = { version: 1, action: "status", remaining: state?.tasks.length ?? 0,
-					actionable, blockers: [...(state?.blockers.values() ?? [])] };
+					actionable, blockers: [...(state?.blockers.values() ?? [])],
+					waiting: [...(state?.waiting.values() ?? [])], activeRunIds: [...(state?.activeRunIds ?? [])] };
 				return { content: [{ type: "text", text: JSON.stringify(details, null, 2) }], details };
 			}
 			const ids = params.taskIds;
 			if (!ids?.length || new Set(ids).size !== ids.length) return fail("Provide distinct taskIds. Use status to inspect current actionable IDs.");
 			const tasks = state?.tasks ?? [];
-			if (new Set(tasks.map(task => task.id)).size !== tasks.length) return fail("Todo IDs are ambiguous; give every task a unique ID before registering blockers.");
-			const targets = params.action === "report_blocker" ? actionable : tasks;
+			if (new Set(tasks.map(task => task.id)).size !== tasks.length) return fail("Todo IDs are ambiguous; give every task a unique ID.");
+			const clearing = params.action === "clear_blocker" || params.action === "clear_background_wait";
+			const targets = clearing ? tasks : actionable;
 			if (ids.some(id => !targets.some(task => task.id === id))) return fail("Unknown, finished or non-actionable task ID. Use status; register unfinished children, not their parent.");
-			if (params.action === "clear_blocker") return {
-				content: [{ type: "text", text: `Cleared blockers for ${ids.join(", ")}.` }],
+			if (clearing) return {
+				content: [{ type: "text", text: `Cleared ${params.action === "clear_blocker" ? "blockers" : "background waits"} for ${ids.join(", ")}.` }],
 				details: { version: 1, action: params.action, taskIds: ids },
 			};
+			if (params.action === "wait_for_background") {
+				const runIds = params.runIds;
+				if (!runIds?.length || new Set(runIds).size !== runIds.length ||
+					runIds.some(id => !state?.activeRunIds.has(id))) {
+					return fail("Provide distinct active native async run IDs from status. A completed run should be handled now.");
+				}
+				const waiting = ids.map(taskId => ({ taskId, revision: targets.find(task => task.id === taskId)!.revision, runIds }));
+				return {
+					content: [{ type: "text", text: `Waiting for native completion on ${ids.join(", ")}. Continue other runnable tasks, then yield for the completion notification.` }],
+					details: { version: 1, action: params.action, sessionId: ctx.sessionManager.getSessionId(), waiting },
+				};
+			}
 			if (!params.category || !params.reason?.trim() || !params.resumeWhen?.trim()) {
 				return fail("report_blocker requires category, a concrete reason and resumeWhen. No state was changed.");
 			}
@@ -227,16 +338,16 @@ export default function todoLoop(pi: ExtensionAPI): void {
 				taskId: id, revision: targets.find(task => task.id === id)!.revision,
 				category: params.category!, reason: params.reason!.trim(), resumeWhen: params.resumeWhen!.trim(),
 			}));
-			const runnable = actionable.filter(task => !ids.includes(task.id) && !state?.blockers.has(task.id)).length;
+			const runnable = actionable.filter(task => !ids.includes(task.id) && !state?.blockers.has(task.id) && !state?.waiting.has(task.id)).length;
 			return {
-				content: [{ type: "text", text: `Registered blockers for ${ids.join(", ")}. ${runnable} actionable task(s) remain unblocked. Explain the blockers to the user; do not complete/cancel blocked tasks.` }],
+				content: [{ type: "text", text: `Registered blockers for ${ids.join(", ")}. ${runnable} task(s) remain runnable.` }],
 				details: { version: 1, action: params.action, blockers },
 			};
 		},
 	});
 
 	pi.registerCommand("todo-loop", {
-		description: "Inspect todo-loop blockers, budget and latest decision (/todo-loop status)",
+		description: "Inspect todo-loop blockers, background waits, budget and latest decision (/todo-loop status)",
 		async handler(args, ctx) {
 			if (args.trim() && args.trim() !== "status") {
 				ctx.ui.notify("Usage: /todo-loop status", "warning");
@@ -248,15 +359,25 @@ export default function todoLoop(pi: ExtensionAPI): void {
 				entry.type === "custom" && entry.customType === DECISION_ENTRY,
 			);
 			await showStatusModal(ctx, "Todo Loop", [
-				`Unfinished: ${state?.tasks.length ?? 0}; actionable: ${actionable.length}; blocked: ${actionable.filter(task => state?.blockers.has(task.id)).length}`,
+				`Unfinished: ${state?.tasks.length ?? 0}; actionable: ${actionable.length}; blocked: ${actionable.filter(task => state?.blockers.has(task.id)).length}; waiting: ${actionable.filter(task => state?.waiting.has(task.id)).length}`,
 				`Automatic follow-ups: ${followupCount(ctx)}/${maxFollowups()} (since last reset on this branch)`,
 				`Last boundary decision (historical): ${latestDecision?.type === "custom" ? JSON.stringify(latestDecision.data) : "none"}`,
 				...actionable.map(task => {
 					const blocker = state?.blockers.get(task.id);
-					return `${task.id}: ${task.subject}${blocker ? ` — [${blocker.category}] ${blocker.reason}; resume: ${blocker.resumeWhen}` : " — actionable"}`;
+					const wait = state?.waiting.get(task.id);
+					const notes = [blocker && `[${blocker.category}] ${blocker.reason}; resume: ${blocker.resumeWhen}`,
+						wait && `waiting for ${wait.runIds.join(", ")}`].filter(Boolean);
+					return `${task.id}: ${task.subject} — ${notes.join("; ") || "actionable"}`;
 				}),
 			]);
 		},
+	});
+
+	// CLI forks copy launch results but native completion remains routed to the parent.
+	pi.on("tool_result", (event, ctx) => {
+		if (event.toolName === "subagent" && !event.isError && isRecord(event.details) && isAsyncLaunch(event.details)) {
+			return { details: { ...event.details, todoLoopSessionId: ctx.sessionManager.getSessionId() } };
+		}
 	});
 
 	let limitNotified = false;
@@ -276,35 +397,44 @@ export default function todoLoop(pi: ExtensionAPI): void {
 		if (!state) return;
 		const actionable = actionableTasks(state);
 		const blocked = actionable.filter(task => state.blockers.has(task.id)).length;
+		const waiting = actionable.filter(task => !state.blockers.has(task.id) && state.waiting.has(task.id)).length;
 		const used = followupCount(ctx);
 		const limit = maxFollowups();
 		const lastAssistant = [...event.context.contextMessages].reverse().find(message => message.role === "assistant");
+		let review: ReturnType<typeof blockerReview> | undefined;
 		let reason: string;
 		if (event.outcome !== "completed") reason = `outcome_${event.outcome}`;
 		else if (ctx.hasPendingMessages()) reason = "pending_messages";
 		else if (lastAssistant?.role === "assistant" && (lastAssistant.stopReason === "aborted" || lastAssistant.stopReason === "error")) reason = `assistant_${lastAssistant.stopReason}`;
 		else if (state.tasks.length === 0) reason = "no_unfinished_tasks";
 		else if (event.continue) reason = "continuation_already_requested";
-		else if (actionable.length > 0 && blocked === actionable.length) reason = "all_remaining_tasks_blocked";
+		else if (actionable.length > 0 && blocked === actionable.length) {
+			review = blockerReview(ctx, event.entries, actionable.map(task => state.blockers.get(task.id)!));
+			reason = !review.reviewed && used < limit ? "review_external_blockers" : "all_remaining_tasks_blocked";
+		}
+		else if (waiting > 0 && blocked + waiting === actionable.length) reason = "waiting_for_background";
 		else if (used >= limit) reason = "followup_limit";
 		else reason = "unfinished_tasks";
-		const shouldContinue = reason === "unfinished_tasks";
+		const shouldContinue = reason === "unfinished_tasks" || reason === "review_external_blockers";
+		const paused = reason === "all_remaining_tasks_blocked" || reason === "waiting_for_background" || reason === "followup_limit";
 		const decision = {
-			decision: shouldContinue ? "continue" : reason === "all_remaining_tasks_blocked" || reason === "followup_limit" ? "pause" : "skip", reason,
-			remaining: state.tasks.length, actionable: actionable.length, blocked, followups: used, limit,
+			decision: shouldContinue ? "continue" : paused ? "pause" : "skip", reason,
+			remaining: state.tasks.length, actionable: actionable.length, blocked, ...(waiting ? { waiting } : {}), followups: used, limit,
 		};
 		if (reason === "followup_limit" && !limitNotified) {
 			ctx.ui.notify(`todo-loop paused with ${state.tasks.length} unfinished items after ${limit} automatic follow-ups.`, "warning");
 			limitNotified = true;
 		}
-		if (reason === "all_remaining_tasks_blocked") {
-			ctx.ui.notify(`todo-loop paused: all ${actionable.length} actionable tasks are blocked. Use /todo-loop status for reasons and resume conditions.`, "warning");
+		const entries: SessionBoundaryDraft[] = [...event.entries, { type: "custom", customType: DECISION_ENTRY, data: decision }];
+		if (!shouldContinue) {
+			if (review && !review.summarized) entries.push({ type: "custom_message", customType: BLOCKER_SUMMARY,
+				content: review.summary, display: true, details: { ...review.details, reviewed: review.reviewed } });
+			return { entries };
 		}
-		const entries = [...event.entries, { type: "custom" as const, customType: DECISION_ENTRY, data: decision }];
-		if (!shouldContinue) return { entries };
 		// Keep the context message last, and commit atomically at the boundary.
 		return {
-			entries: [...entries, { type: "custom_message" as const, customType: "todo-loop-followup", content: CONTINUE_PROMPT, display: true }],
+			entries: [...entries, { type: "custom_message" as const, customType: FOLLOWUP, content: review ? REVIEW_PROMPT : CONTINUE_PROMPT,
+				display: true, ...(review && { details: review.details }) }],
 			continue: true,
 		};
 	});

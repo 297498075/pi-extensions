@@ -68,7 +68,9 @@ Clear a blocker when its prerequisite is satisfied:
 Pending parents act as containers while they have unfinished children. Register blockers on the actionable unfinished children, not their parent. If a parent remains unfinished after its children finish, it becomes actionable itself. This avoids requiring both a blocked child and its container to be independently blocked before pausing.
 
 - One blocked task does **not** stop unrelated unblocked tasks.
-- Only when **all actionable unfinished tasks** have valid blockers does todo-loop pause its own follow-ups.
+- When every unfinished leaf has an external blocker, todo-loop first spends one available follow-up to review those leaves against recent handoffs. The model should split local implementation, design and tests from externally gated acceptance, clear stale blockers, and do the local work first.
+- If all leaves remain blocked, the extension posts a visible `todo-loop-blocker-summary` in the conversation: task IDs, the registered missing prerequisite and the resume condition. Identical prerequisites are grouped. The summary uses the tool records even if the assistant's final reply omitted them. At zero or exhausted budget the summary is posted immediately.
+- Review prompts and summaries are deduplicated on the active branch. Refining the reasons during the review yields the updated summary instead of another prompt. New user input starts a fresh assessment. If any leaf is runnable the loop continues normally; if the leaves are waiting or a mix of blocked and waiting, it yields to native completion.
 - Blockers do not modify the owning todo extension or mark anything completed/cancelled.
 - Numeric IDs are represented as strings. ID-less example/plan tasks use positional IDs such as `@1`; inspect `status` for the current IDs. Ambiguous IDs must be fixed before reporting blockers.
 
@@ -84,9 +86,27 @@ Blockers are reconstructed from successful control-tool results in the active br
 - Task revisions are conservative change detectors, not a semantic proof that an external dependency has changed. If an external prerequisite is resolved without changing the task or sending user input, the model must clear that blocker explicitly.
 - Clearing blockers or sending user input preserves the current follow-up count. Use `/reload` or explicitly reopen the session to renew an exhausted budget.
 
+## Wait for a native background handoff
+
+After launching a native asynchronous `subagent` run or workflow, call `status` to get `activeRunIds`. Use `wait_for_background` only for leaves on which no independent work remains until those exact runs settle:
+
+```json
+{
+  "action": "wait_for_background",
+  "taskIds": ["1.2"],
+  "runIds": ["<exact active native run ID>"]
+}
+```
+
+New successful native async launch results are stamped with the owning session ID. Forks (including CLI `--fork`) exclude copied parent launches; untagged pre-upgrade launches are eligible only in sessions without a parent. A fork can wait on its own new launches.
+
+The registration is atomic. Exact active run IDs must come from successful native async launch results on this session branch. Launching a run alone leaves the todo loop unchanged. All specified runs must reach a terminal notification to release the wait automatically; a child progress notice does not settle its containing workflow. `clear_background_wait` with `taskIds` releases the specified waits manually without affecting blockers, running children or todo completion. Task edits, removal and reset discard stale waits; reload preserves matching waits, and forks do not inherit wakes routed to the original session. User input reassesses external blockers but leaves waits for the same task revision and run in place.
+
+Todo-loop suppresses only its own follow-up when every unfinished leaf is blocked or waiting. It does not poll or schedule a second wake; `pi-subagents` wakes the parent on native completion. A terminal notice on another branch of the same session still settles the exact launched run. The `waiting_for_background` decision does not spend the follow-up budget.
+
 ## Diagnostics
 
-`/todo-loop status` opens a scrollable TUI modal with current actionable task IDs, blocker reasons/resume conditions, the branch budget and the latest recorded boundary decision. Non-TUI environments fall back to a notification. The latest decision is explicitly historical: current task/control changes may have occurred since that boundary.
+`/todo-loop status` opens a scrollable TUI modal with current actionable task IDs, blocker reasons/resume conditions, registered waits, the branch budget and the latest recorded boundary decision. Non-TUI environments fall back to a notification. The latest decision is explicitly historical: current task/control changes may have occurred since that boundary.
 
 Every settlement boundary with known todo state appends a `todo-loop-decision` session entry. For example:
 
@@ -102,7 +122,7 @@ Every settlement boundary with known todo state appends a `todo-loop-decision` s
 }
 ```
 
-Reasons also distinguish unfinished work, no unfinished tasks, pending messages, structural errors/aborts, a continuation already requested by another extension, and budget exhaustion. Decisions are diagnostic only and are not replayed as control state. A decision does not veto continuations requested by other extensions. All-blocked and budget pauses show concise warnings; inspect the status modal for details.
+Reasons also distinguish unfinished work, background waits, no unfinished tasks, pending messages, structural errors/aborts, a continuation already requested by another extension, and budget exhaustion. Decisions are diagnostic only and are not replayed as control state. A decision does not veto continuations requested by other extensions. `review_external_blockers` requests the one-time review. An all-blocked pause posts its grouped reasons directly in the conversation; budget pauses on runnable work show a concise warning.
 
 There is intentionally no "todos did not change for N turns" detector: source investigation, database inspection and debugging can be real progress without any todo status change. The persisted follow-up budget is the deterministic runaway guard. No secondary model or network request is used to judge assistant intent.
 
@@ -115,14 +135,14 @@ npm run validate
 npm test
 ```
 
-The focused regression uses in-memory Pi sessions, mocked extension registration/UI, and a temporary local config. It covers historical-prompt echoes, prose/JSON non-controls, per-leaf partial/all-blocked state, atomic failures, result persistence, branch restoration, explicit budget renewal, automatic startup, config precedence, per-task invalidation, user input, alternative todo formats, boundary composition, structural cancellation/errors and modal/fallback status. It does not access user sessions/configuration, invoke a model, or use the network.
+The focused regression uses in-memory Pi sessions, one temporary on-disk CLI fork fixture, mocked extension registration/UI, and a temporary local config. It covers historical-prompt echoes, prose/JSON non-controls, per-leaf partial/all-blocked state, atomic failures, result persistence, branch restoration, explicit budget renewal, automatic startup, config precedence, per-task invalidation, user input, alternative todo formats, per-task background waits, native terminal notices and branch scope, boundary composition, structural cancellation/errors and modal/fallback status. It does not access user sessions/configuration, invoke a model, or use the network.
 
 Manual smoke check after loading/reloading the extension:
 
 1. Create a parent with an unfinished child and a separate unfinished task.
 2. Let the model quote the old continuation prompt in a summary: continuation must still run.
 3. Register a blocker for the child: the separate task must still run.
-4. Register a blocker for the separate task: automatic continuation must pause; `/todo-loop status` must show both reasons and the decision.
+4. Register a blocker for the separate task with at least one follow-up left: expect one review. Leave both prerequisites unresolved: the conversation should show the grouped reasons and recovery conditions, with no further automatic turn.
 5. Send new user input or change one blocked task: its effective blocker must be cleared/reassessed, subject to the existing branch budget.
 6. Reload: status should show zero used follow-ups and the same applicable blockers. Navigate to a branch before the reset: its previous count and only its own blocker reports apply.
 

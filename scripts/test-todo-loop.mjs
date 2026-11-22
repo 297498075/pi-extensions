@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import todoLoop from "../extensions/todo-loop.ts";
 
-// In-memory sessions and an isolated config directory; no user config, network or model calls.
+// In-memory sessions plus a temporary on-disk fork fixture; no user config, network or model calls.
 const agentDir = mkdtempSync(join(tmpdir(), "pi-todo-loop-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
 process.once("exit", () => rmSync(agentDir, { recursive: true, force: true }));
@@ -37,7 +37,21 @@ function harness(sm = SessionManager.inMemory(process.cwd()), limit = "20") {
 	};
 }
 const report = (...taskIds) => ({ action: "report_blocker", taskIds, category: "needs_user_input", reason: "Target environment address is missing.", resumeWhen: "User supplies the address." });
+const waitFor = (taskIds, ...runIds) => ({ action: "wait_for_background", taskIds, runIds });
+const launch = (h, runId, mode = "single", extra = {}) => h.sm.appendMessage({
+	role: "toolResult", toolName: "subagent", toolCallId: runId, content: [],
+	details: { mode, runId, asyncId: runId }, timestamp: 1, ...extra,
+});
+const finish = (h, runId, status = "completed") => h.sm.appendCustomMessageEntry(
+	"subagent-notify", "Native result", true, { runs: [{ runId, status }] },
+);
 const decision = result => result?.entries.findLast(entry => entry.customType === "todo-loop-decision")?.data;
+function commit(h, result) {
+	for (const e of result.entries) {
+		if (e.type === "custom") h.sm.appendCustomEntry(e.customType, e.data);
+		else h.sm.appendCustomMessageEntry(e.customType, e.content, e.display, e.details);
+	}
+}
 
 // Regression: summaries quoted our own prompt, causing five consecutive false stops.
 {
@@ -75,8 +89,15 @@ const decision = result => result?.entries.findLast(entry => entry.customType ==
 	assert.equal(decision(h.boundary()).blocked, 1);
 	const beforeAllBlocked = h.sm.getLeafId();
 	await h.call(report("2"));
-	assert.equal(h.boundary().continue, undefined);
-	assert.deepEqual(decision(h.boundary()), { decision: "pause", reason: "all_remaining_tasks_blocked", remaining: 3, actionable: 2, blocked: 2, followups: 0, limit: 20 });
+	const review = h.boundary();
+	assert.equal(review.continue, true);
+	assert.equal(decision(review).reason, "review_external_blockers");
+	commit(h, review);
+	const pause = h.boundary();
+	assert.equal(pause.continue, undefined);
+	assert.deepEqual(decision(pause), { decision: "pause", reason: "all_remaining_tasks_blocked", remaining: 3, actionable: 2, blocked: 2, followups: 1, limit: 20 });
+	assert.match(pause.entries.at(-1).content, /1\.1, 2 \[needs_user_input\]: Target environment address is missing\.\n  Resume when: User supplies the address\./);
+	commit(h, pause);
 	assert.equal(decision(harness(h.sm).boundary()).reason, "all_remaining_tasks_blocked", "reload reconstructs tool-result state");
 	h.snapshot(structuredClone(tasks));
 	assert.equal(decision(h.boundary()).blocked, 2, "identical repeated snapshots preserve blockers");
@@ -104,6 +125,136 @@ const decision = result => result?.entries.findLast(entry => entry.customType ==
 	console.log("✓ per-leaf blockers, atomic validation, successful persistence, reload/fork, task revisions, clear and user-input invalidation");
 }
 
+// Waiting is a per-task dependency, not a stop switch for a running session.
+{
+	const h = harness(); h.snapshot([task("1"), task("2"), task("3")]);
+	launch(h, "first", "single"); launch(h, "second", "workflow");
+	assert.equal(h.boundary().continue, true, "an unbound launch must not stop any task");
+	await h.call(waitFor(["1"], "first", "second"));
+	await h.call(report("2"));
+	assert.equal(h.boundary().continue, true, "task 3 remains runnable");
+	await h.call(waitFor(["3"], "second"));
+	const paused = h.boundary();
+	assert.equal(paused.continue, undefined);
+	assert.equal(paused.entries.some(e => e.customType === "todo-loop-followup"), false);
+	assert.deepEqual(decision(paused), { decision: "pause", reason: "waiting_for_background", remaining: 3, actionable: 3, blocked: 1, waiting: 2, followups: 0, limit: 20 });
+	assert.equal(decision(harness(h.sm).boundary()).reason, "waiting_for_background", "reload restores waits");
+	h.sm.appendCustomMessageEntry("subagent-incremental-child-notify", "A child finished", true, { workflowRunId: "second", childRunId: "child", outcome: "completed" });
+	finish(h, "unrelated"); finish(h, "first");
+	const status = (await h.call({ action: "status" })).details;
+	assert.deepEqual(status.activeRunIds, ["second"]);
+	assert.deepEqual(status.waiting.map(w => [w.taskId, w.runIds]), [["1", ["second"]], ["3", ["second"]]]);
+	assert.equal(decision(h.boundary()).reason, "waiting_for_background");
+	finish(h, "second", "failed");
+	assert.equal(decision(h.boundary()).blocked, 1, "a native wake must leave external blockers alone");
+	assert.equal(h.boundary().continue, true, "a terminal failure releases the wait for parent recovery");
+	console.log("✓ runnable work continues, mixed waits pause, and exact terminal workflow notices release only their waits");
+}
+
+{
+	const h = harness(); const tasks = [task("1")]; h.snapshot(tasks);
+	launch(h, "a"); launch(h, "failed-launch", "single", { isError: true });
+	launch(h, "sync", "single", { details: { mode: "single", runId: "sync" } });
+	for (const bad of [waitFor(["unknown"], "a"), waitFor(["1"], "unknown"), waitFor(["1"], "failed-launch"),
+		waitFor(["1"], "sync"), waitFor(["1"], "a", "a"), waitFor(["1"])]) {
+		assert.equal((await h.call(bad)).isError, true);
+	}
+	await h.call(waitFor(["1"], "a"), { persist: false });
+	await h.call(waitFor(["1"], "a"), { isError: true });
+	assert.equal(h.boundary().continue, true, "only committed successful waits pause");
+	await h.call(waitFor(["1"], "a"));
+	h.sm.appendMessage({ role: "user", content: "Status?", timestamp: 1 });
+	assert.equal(decision(h.boundary()).reason, "waiting_for_background", "user questions do not change native run lifetime");
+	await h.call({ action: "clear_background_wait", taskIds: ["1"] });
+	assert.equal(h.boundary().continue, true);
+	await h.call(waitFor(["1"], "a"));
+	h.snapshot([{ ...tasks[0], subject: "Replaced task" }]);
+	h.snapshot(tasks);
+	assert.equal(h.boundary().continue, true, "changed then restored task does not resurrect its wait");
+	await h.call(waitFor(["1"], "a"));
+	const beforeCompletion = h.sm.getLeafId();
+	const draft = { type: "custom_message", customType: "subagent-notify", content: "Native result", display: true,
+		details: { runs: [{ runId: "a", status: "stopped" }] } };
+	assert.equal(h.boundary({ entries: [draft] }).continue, true);
+	assert.equal(decision(h.boundary()).reason, "waiting_for_background", "preview does not mutate persisted state");
+	finish(h, "a", "stopped");
+	h.sm.branch(beforeCompletion);
+	assert.equal(h.boundary().continue, true, "completion on a sibling path releases that run in this session");
+	assert.equal((await h.call(waitFor(["1"], "a"))).isError, true, "finished runs cannot be waited again");
+	launch(h, "new"); await h.call(waitFor(["1"], "new"));
+	h.handlers.get("session_start")({ reason: "fork" }, h.ctx);
+	assert.equal(h.boundary().continue, true, "new fork does not inherit a wake routed to its original session");
+	assert.equal((await h.call(waitFor(["1"], "new"))).isError, true);
+	console.log("✓ atomic wait validation, user input, task replacement, manual clearing, completion races and branch isolation");
+}
+
+// A native handoff followed by a blanket report must still get one actionable review.
+{
+	const h = harness(), tasks = Array.from({ length: 14 }, (_, i) => task(String(i + 1)));
+	const ids = tasks.map(t => t.id);
+	h.snapshot(tasks); launch(h, "handoff");
+	await h.call(waitFor(["1"], "handoff")); finish(h, "handoff");
+	await h.call(report(...ids));
+	const prior = h.sm.getLeafId(), review = h.boundary();
+	assert.equal(review.continue, true);
+	assert.match(review.entries.at(-1).content, /recent subagent results.*implementation, design and testing.*clear blockers/i);
+	assert.equal(review.entries.at(-1).display, true);
+	assert.equal(decision(h.boundary({ outcome: "aborted" })).reason, "outcome_aborted");
+	assert.equal(decision(h.boundary({ continue: true })).reason, "continuation_already_requested");
+	commit(h, review);
+	await h.call({ ...report("1"), reason: "Missing fixture", resumeWhen: "Fixture arrives" });
+	h.snapshot([...tasks].reverse());
+	const pause = harness(h.sm).boundary();
+	assert.equal(pause.continue, undefined);
+	const summary = pause.entries.at(-1);
+	assert.equal(summary.customType, "todo-loop-blocker-summary");
+	assert.equal(summary.display, true);
+	assert.match(summary.content, /1 \[needs_user_input\]: Missing fixture\n  Resume when: Fixture arrives/);
+	assert.equal(summary.content.split("Target environment address is missing.").length, 2);
+	assert.equal(summary.content.split("Resume when:").length, 3);
+	commit(h, pause);
+	assert.deepEqual(h.boundary().entries.map(e => e.customType), ["todo-loop-decision"]);
+	h.sm.branch(prior);
+	assert.equal(decision(h.boundary()).reason, "review_external_blockers", "sibling branch did not receive the review");
+	commit(h, h.boundary());
+	await h.call({ action: "clear_blocker", taskIds: ["1"] });
+	assert.equal(decision(h.boundary()).reason, "unfinished_tasks", "a local step resumes normal work");
+	h.sm.appendMessage({ role: "user", content: "Reassess", timestamp: 1 });
+	await h.call(report(...ids));
+	assert.equal(decision(h.boundary()).reason, "review_external_blockers");
+	const disabled = harness(h.sm, "0").boundary();
+	assert.equal(disabled.continue, undefined);
+	assert.equal(disabled.entries.at(-1).customType, "todo-loop-blocker-summary", "zero budget still explains the pause");
+	assert.equal(harness(h.sm, "1").boundary().continue, undefined, "a previous review spent the one available follow-up");
+	console.log("✓ native handoff, 14 blocked leaves, one budgeted review, grouped visible reasons, reload/branch isolation and runnable recovery");
+}
+
+// CLI --fork uses forkFrom + startup, not the interactive fork event.
+{
+	const dir = join(agentDir, "synthetic-sessions"), cwd = process.cwd();
+	const parent = harness(SessionManager.create(cwd, dir));
+	parent.sm.appendMessage({ role: "user", content: "Synthetic fork fixture", timestamp: 1 });
+	parent.snapshot([task("1")]);
+	const stampLaunch = (h, runId) => {
+		const details = { mode: "single", runId, asyncId: runId, results: [] };
+		const stamped = h.handlers.get("tool_result")({ toolName: "subagent", isError: false, details }, h.ctx).details;
+		assert.deepEqual(stamped, { ...details, todoLoopSessionId: h.sm.getSessionId() });
+		launch(h, runId, "single", { details: stamped });
+	};
+	launch(parent, "legacy-parent"); stampLaunch(parent, "owned-parent");
+	await parent.call(waitFor(["1"], "legacy-parent", "owned-parent"));
+	const child = harness(SessionManager.forkFrom(parent.sm.getSessionFile(), cwd, dir));
+	child.handlers.get("session_start")({ reason: "startup" }, child.ctx);
+	const status = (await child.call({ action: "status" })).details;
+	assert.deepEqual(status.activeRunIds, []); assert.deepEqual(status.waiting, []);
+	for (const id of ["legacy-parent", "owned-parent"]) assert.equal((await child.call(waitFor(["1"], id))).isError, true);
+	stampLaunch(child, "child-run"); await child.call(waitFor(["1"], "child-run"));
+	assert.equal(decision(child.boundary()).reason, "waiting_for_background");
+	finish(child, "child-run"); assert.equal(child.boundary().continue, true);
+	assert.equal(decision(parent.boundary()).reason, "waiting_for_background");
+	console.log("✓ CLI fork rejects inherited native IDs and accepts its own stamped launches");
+}
+
 // Alternate todo formats and authoritative resets remain supported.
 {
 	for (const source of ["todo", "todos", "plan-mode"]) {
@@ -112,7 +263,7 @@ const decision = result => result?.entries.findLast(entry => entry.customType ==
 		else h.sm.appendMessage({ role: "toolResult", toolName: source, toolCallId: "example", content: [], details: { todos: [{ id: 7, text: "Example task", done: false }] }, timestamp: 1 });
 		const id = source === "plan-mode" ? "@1" : "7";
 		assert.equal((await h.call(report(id))).isError, undefined);
-		assert.equal(decision(h.boundary()).reason, "all_remaining_tasks_blocked");
+		assert.equal(decision(h.boundary()).reason, "review_external_blockers");
 		if (source === "plan-mode") h.sm.appendCustomEntry(source, { executing: false });
 		else h.snapshot([task("7")], false);
 		assert.equal(decision(h.boundary()).reason, "no_unfinished_tasks");
@@ -217,8 +368,8 @@ const decision = result => result?.entries.findLast(entry => entry.customType ==
 // Status is a modal in the TUI and never a long, potentially muted info notification.
 {
 	const h = harness(); h.snapshot([task("1")]); await h.call(report("1"));
-	const paused = h.boundary();
-	for (const entry of paused.entries) if (entry.type === "custom") h.sm.appendCustomEntry(entry.customType, entry.data);
+	commit(h, h.boundary()); // review
+	commit(h, h.boundary()); // visible pause
 	await h.commands.get("todo-loop").handler("status", h.ctx);
 	assert.match(h.notifications.at(-1)[0], /all_remaining_tasks_blocked/);
 	assert.match(h.notifications.at(-1)[0], /User supplies the address/);

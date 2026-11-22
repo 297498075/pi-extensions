@@ -285,7 +285,7 @@ try {
 	{
 		const h = harness(); todoLoop(h.pi);
 		const pending = { type: "custom", customType: "plan-mode", data: { executing: true, todos: [{ text: "old", completed: false }] } };
-		let branch = [pending]; h.ctx.sessionManager = { getBranch: () => branch };
+		let branch = [pending]; h.ctx.sessionManager = { getBranch: () => branch, getEntries: () => branch, getSessionId: () => "fixture", getHeader: () => undefined };
 		const boundary = { outcome: "completed", entries: [], context: { contextMessages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Ready." }] }] } };
 		assert.equal((await h.emit("agent_before_settle", boundary)).continue, true);
 		for (const data of [{ executing: false, todos: [] }, { executing: false }, { executing: false, todos: [{ completed: false }] }]) {

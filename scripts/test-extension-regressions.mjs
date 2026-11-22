@@ -72,14 +72,20 @@ try {
 	const listed = await tool.execute("list-for-blocker", { action: "list" });
 	sm.appendMessage({ role: "toolResult", toolName: "todo", toolCallId: "list-for-blocker", ...listed, timestamp: 2 });
 	const blockedBoundary = await env.handlers.get("agent_before_settle")[0]({ entries: [], outcome: "completed", context: { contextMessages: [] } }, { ...ctx, hasPendingMessages: () => false });
-	assert.equal(blockedBoundary.entries.at(-1).data.reason, "all_remaining_tasks_blocked");
+	assert.equal(blockedBoundary.continue, true);
+	assert.equal(blockedBoundary.entries.find(e => e.customType === "todo-loop-decision").data.reason, "review_external_blockers");
+	const review = blockedBoundary.entries.at(-1);
+	sm.appendCustomMessageEntry(review.customType, review.content, review.display, review.details);
+	const settled = await env.handlers.get("agent_before_settle")[0]({ entries: [], outcome: "completed", context: { contextMessages: [] } }, { ...ctx, hasPendingMessages: () => false });
+	assert.equal(settled.continue, undefined);
+	assert.match(settled.entries.at(-1).content, /Missing address/);
 	console.log("✓ real todo-tree list/tool-result aliases preserve canonical revision-scoped blockers");
 
 	const loop = handlersFor(), sent = [], warnings = [];
 	todoLoop(loop.pi);
 	assert.equal(loop.handlers.has("agent_end"), false, "must not race core retry in agent_end");
 	let branch = [{ type: "message", message: { role: "toolResult", toolName: "todo", details: { tasks: [{ status: "pending" }] } } }];
-	const loopCtx = { hasPendingMessages: () => false, ui: { notify(m) { warnings.push(m); } }, sessionManager: { getBranch: () => branch } };
+	const loopCtx = { hasPendingMessages: () => false, ui: { notify(m) { warnings.push(m); } }, sessionManager: { getBranch: () => branch, getEntries: () => branch, getSessionId: () => "fixture", getHeader: () => undefined } };
 	const assistant = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Working." }] };
 	const boundary = { entries: [], outcome: "completed", context: { canContinue: false, contextMessages: [assistant] } };
 	const runBoundary = async event => {
