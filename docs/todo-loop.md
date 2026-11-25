@@ -31,7 +31,7 @@ Explicit `/reload`, `/resume`, `/new`, and fork/clone transitions start a fresh 
 
 Assistant text never pauses the loop. Quoting `cannot continue`, showing JSON in a code block, mentioning `operation aborted`, or producing a phase summary is not a control operation. This prevents summaries that quote todo-loop's old continuation prompt from accidentally stopping execution.
 
-The extension only requests continuation after core retries, compaction and queued work finish. It does not continue aborted/errored runs or assistant messages with structural `aborted` / `error` stop reasons, and it does not duplicate another boundary handler's continuation. Escape/core cancellation remains authoritative; it is not inferred from prose. To disable automatic todo work explicitly, use the todo provider's disable/clear controls or start with a zero follow-up budget.
+The extension only requests continuation after core retries, compaction and queued work finish. For runnable work, `Go on.` is the entire follow-up message. The extension does not continue aborted/errored runs or assistant messages with structural `aborted` / `error` stop reasons, and it does not duplicate another boundary handler's continuation. Escape/core cancellation remains authoritative; it is not inferred from prose. To disable automatic todo work explicitly, use the todo provider's disable/clear controls or start with a zero follow-up budget.
 
 ## Explicit blockers
 

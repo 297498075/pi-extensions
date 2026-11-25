@@ -17,11 +17,7 @@ const REVIEW_PROMPT = "Review every remaining leaf using any recent subagent res
 // Keep recognizing old user-message follow-ups without inspecting assistant prose.
 const LEGACY_CONTINUE_PROMPT =
 	"Continue working on the remaining todo items. Start with the first unfinished item, update the todo list as you progress, and do not stop while any todo remains unfinished. If you truly cannot continue, explicitly say that you cannot continue.";
-const CONTINUE_PROMPT =
-	"Continue working on the remaining actionable todo items and update the todo list as you progress. " +
-	"Use todo_loop_control status to inspect actionable task IDs and registered blockers. " +
-	"Use todo_loop_control wait_for_background with taskIds and runIds when the only next step depends on a running native subagent. " +
-	"For genuine user input, access, or external dependencies, use report_blocker with taskIds, category, reason and resumeWhen. Continue other runnable tasks; leave waiting and blocked tasks unfinished.";
+const CONTINUE_PROMPT = "Go on.";
 
 interface Task {
 	id: string;

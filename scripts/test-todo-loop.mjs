@@ -66,6 +66,7 @@ function commit(h, result) {
 		const result = h.boundary({}, [assistant(text)]);
 		assert.equal(result.continue, true, text);
 		assert.equal(result.entries.at(-1).customType, "todo-loop-followup");
+		assert.equal(result.entries.at(-1).content, "Go on.");
 		assert.equal(decision(result).reason, "unfinished_tasks");
 	}
 	console.log("✓ quoted prompts, first-person prose, abort strings and JSON cannot control settlement");
