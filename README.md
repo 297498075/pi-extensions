@@ -48,7 +48,7 @@ pi --extension ./extensions/example.ts
 
 ## 工具曝光与上下文成本
 
-Pi 每个请求都会带上所有已声明工具的 JSON Schema。低频但 schema 较大的工具（`generate_image`、`generate_video`、`image_job_status`、`timer_schedule`、`timer_cancel`、`timer_list`、`listary_search`、`ask_user_question`、`get_user_answer`、`wait_user_answer`）以 `exposure: "deferred"` 注册：schema 不进请求，模型先用 `tool_search` 搜索，匹配到的工具在下一个请求才会声明。实测这 10 个工具约占 11 KB schema（≈2.7K token）。
+Pi 每个请求都会带上所有已声明工具的 JSON Schema。低频但 schema 较大的工具（`generate_image`、`generate_video`、`image_job_status`、`timer_schedule`、`timer_cancel`、`timer_list`、`listary_search`、`ask_user_question`、`get_user_answer`、`wait_user_answer`）以 `exposure: "deferred"` 注册：schema 不进请求，模型先用 `tool_search` 搜索，匹配到的工具在下一个请求才会声明。实测这 10 个工具约占 11 KB schema（≈2.7K token）。图片保留窗口工具 `image_pager_set_keep` 也按相同方式加载。
 
 `extensions/lib/tool-exposure.ts` 的 `deferTools(pi, [...])` 依赖 Pi 1.2.0 起由 `pi.getAllTools()` 暴露的 `reachesTools` 元数据，并会在 `session_start` 时确保 `tool_search` 处于激活状态，因此无需额外配置即可生效；`deferred` 工具同时仍可被 `codemode` 脚本直接调用。若当前会话里没有任何可搜索工具（例如显式 `--tools` 允许清单排除了 `tool_search`），则改为激活这些工具本身，避免它们变成不可达。
 
@@ -328,7 +328,7 @@ pi --extension ./extensions/rolling-tools.ts
 
 ### 命令与配置
 
-Agent 可调用 `image_pager_set_keep({"keepRecentImages": 3})`，从下一次模型请求起跨轮保留最近 3 张图片。例如对比最近 3 张截图时，调用一次即可直接核对仍在上下文中的原图。`0` 会换出所有达到大小阈值的图片；窗口越大，请求体积越大。
+Agent 可先用 `tool_search` 搜索 `image_pager_set_keep`，再调用 `image_pager_set_keep({"keepRecentImages": 3})`，从下一次模型请求起跨轮保留最近 3 张图片。例如对比最近 3 张截图时，调用一次即可直接核对仍在上下文中的原图。`0` 会换出所有达到大小阈值的图片；窗口越大，请求体积越大。
 
 工具仅在当前会话内临时采用 FIFO 窗口，沿用启用开关、模型过滤与大小阈值。`/image-pager status` 显示当前窗口；执行 `keep`、`strategy`、`reload` 或重新启动会话后，恢复使用配置文件的策略和数量。
 

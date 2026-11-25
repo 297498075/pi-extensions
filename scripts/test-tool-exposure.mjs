@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import askUser from "../extensions/ask-user.ts";
+import imagePager from "../extensions/image-pager.ts";
 import listary from "../extensions/listary.ts";
 import mediaGen from "../extensions/media-gen.ts";
 import timer from "../extensions/timer.ts";
@@ -8,6 +9,7 @@ import { TOOL_SEARCH_TOOL_NAME, deferTools } from "../extensions/lib/tool-exposu
 
 const noop = () => {};
 const extensions = [
+	{ name: "image-pager", load: imagePager, tools: ["image_pager_set_keep"] },
 	{ name: "listary", load: listary, tools: ["listary_search"] },
 	{ name: "timer", load: timer, tools: ["timer_schedule", "timer_cancel", "timer_list"] },
 	{ name: "media-gen", load: mediaGen, tools: ["image_job_status", "generate_image", "generate_video"] },
@@ -57,7 +59,7 @@ console.log("=== Test 1: extensions register their tools deferred ===");
 		}
 		assert.ok(handlers > 0, `${extension.name} keeps its tools reachable on session start`);
 	}
-	console.log(`✓ ${deferredTools.length} tools deferred across 4 extensions, schema and execute intact`);
+	console.log(`✓ ${deferredTools.length} tools deferred across ${extensions.length} extensions, schema and execute intact`);
 }
 
 console.log("=== Test 2: tool_search is activated so the deferred tools stay reachable ===");

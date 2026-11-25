@@ -6,6 +6,7 @@ import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-wor
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { showStatusModal } from "./lib/status-modal.ts";
+import { deferTools } from "./lib/tool-exposure.ts";
 
 export type AgentMessage = ContextEvent["messages"][number];
 
@@ -741,8 +742,10 @@ export default function (pi: ExtensionAPI) {
 	const effectiveConfig = (): ImagePagerConfig => sessionKeep === undefined ? currentConfig :
 		{ ...currentConfig, strategy: "fifo", keepRecentImages: sessionKeep };
 
+	deferTools(pi, ["image_pager_set_keep"]);
 	pi.registerTool({
 		name: "image_pager_set_keep",
+		exposure: "deferred",
 		label: "Set image retention",
 		description: "Temporarily keep the newest N images across turns (FIFO) from the next model request. If images cycle out during a comparison, set the needed window once before re-reading. Larger windows increase payload size.",
 		parameters: Type.Object({
