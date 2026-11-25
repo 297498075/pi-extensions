@@ -69,6 +69,7 @@ const enNotice = buildSmartPointerNotice({
 assert.ok(enNotice.includes("shot_01_14.jpg"));
 assert.ok(enNotice.includes("d:/novel/shot_01_14.jpg"));
 assert.ok(enNotice.includes("paged out"));
+assert.ok(enNotice.includes("image_pager_set_keep"));
 assert.ok(enNotice.includes("invoke the 'read' tool on this path"));
 
 const zhNotice = buildSmartPointerNotice({
@@ -79,6 +80,7 @@ const zhNotice = buildSmartPointerNotice({
 	config: { ...DEFAULT_CONFIG, noticeLanguage: "zh" },
 });
 assert.ok(zhNotice.includes("已从工作上下文换出"));
+assert.ok(zhNotice.includes("image_pager_set_keep"));
 assert.ok(zhNotice.includes("d:/novel/shot_01_14.jpg"));
 assert.ok(zhNotice.includes("调用 'read' 工具将其重新换入"));
 
@@ -347,6 +349,7 @@ console.log("  ✓ Command argument autocompletions passed.");
 console.log("\n=== Test 6: Extension Lifecycle & Commands ===");
 const registeredHandlers = new Map();
 const registeredCommands = new Map();
+const registeredTools = new Map();
 let lastNotification = "";
 let currentWidgetKey = null;
 let currentWidgetLines = null;
@@ -354,6 +357,9 @@ let currentWidgetLines = null;
 const mockPi = {
 	on(event, handler) {
 		registeredHandlers.set(event, handler);
+	},
+	registerTool(tool) {
+		registeredTools.set(tool.name, tool);
 	},
 	registerCommand(name, opts) {
 		registeredCommands.set(name, opts);
@@ -434,6 +440,35 @@ assert.ok(lastNotification.includes("reset"));
 
 console.log("  ✓ CLI commands executed and verified.");
 
+
+// Adjust a live window without replaying reads or changing project settings.
+const setKeep = (count) => registeredTools.get("image_pager_set_keep").execute("test-call", { keepRecentImages: count }, undefined, undefined, mockCtx);
+const hotImages = async () => {
+	const result = await contextHandler(mockEvent, mockCtx);
+	return (result?.messages ?? mockEvent.messages).flatMap(m => Array.isArray(m.content) ? m.content.filter(b => b.type === "image") : []).length;
+};
+assert.equal(await hotImages(), 1, "configured turn-boundary keeps only the current turn");
+assert.deepEqual((await setKeep(2)).details, { keepRecentImages: 2, strategy: "fifo", active: true });
+assert.equal(await hotImages(), 2);
+await setKeep(2);
+for (const invalid of [-1, 1.5, "2", Number.MAX_SAFE_INTEGER + 1]) {
+	await assert.rejects(setKeep(invalid), /non-negative safe integer/);
+}
+assert.equal(await hotImages(), 2, "repeated or invalid calls preserve the window");
+await cmd.handler("status", mockCtx);
+assert.match(currentWidgetLines.join("\n"), /keeping 2 active \(session override\)/);
+await setKeep(0);
+assert.equal(await hotImages(), 0);
+await setKeep(3);
+assert.equal(await hotImages(), 3, "original images reappear on the next request");
+await cmd.handler("lang en", mockCtx);
+assert.equal(loadConfig(tempCwd).strategy, "turn-boundary", "unrelated saves must not persist the override");
+await cmd.handler("reload", mockCtx);
+assert.equal(await hotImages(), 1);
+await setKeep(0);
+await registeredHandlers.get("session_start")({}, mockCtx);
+assert.equal(await hotImages(), 1);
+console.log("  ✓ Runtime retention applies on the next context and resets to project settings.");
 
 // Cleanup temp directory
 try {

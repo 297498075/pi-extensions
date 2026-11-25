@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { showStatusModal } from "./lib/status-modal.ts";
 
 export type AgentMessage = ContextEvent["messages"][number];
@@ -323,12 +324,12 @@ export function buildSmartPointerNotice(
 • 原始物理路径: "${filePath}"
 • MIME 类型: ${mimeType}
 • 换出体积: ${formattedSize} (Base64)
-• 自愈唤醒指引: 本图片的原始像素已换出。如果你需要重新查看或核对上面对话中未记录的视觉微小细节，请直接对此路径调用 'read' 工具将其重新换入（Page-In）上下文。]`;
+• 自愈唤醒指引: 本图片的原始像素已换出。如果你需要重新查看或核对上面对话中未记录的视觉微小细节，可对此路径调用 'read' 工具将其重新换入。若图片反复换出，请调用一次 image_pager_set_keep 扩大窗口，再检查下一次请求中的图片。]`;
 		}
 		return `[系统提示：用户直传图片已从工作上下文换出（Page-Out）以优化显存与推理延迟。
 • MIME 类型: ${mimeType}
 • 换出体积: ${formattedSize} (Base64)
-• 说明: 该图片由用户直接上传，无本地物理路径。如需再次查看原始像素，请提示用户重新提供该图片。]`;
+• 说明: 该图片由用户直接上传，无本地物理路径。如需再次查看原始像素，请调用一次 image_pager_set_keep，将窗口扩大到包含该图；仍缺少原图时再请用户重新提供。]`;
 	}
 
 	// 默认英文模板（大模型遵从度最高）
@@ -337,13 +338,13 @@ export function buildSmartPointerNotice(
 • Original File Path: "${filePath}"
 • MIME Type: ${mimeType}
 • Paged-out Size: ${formattedSize} (Base64)
-• Self-Healing Guideline: The raw pixel data of this image is currently paged out from working memory. If you need to re-inspect or verify visual pixel details of this image that are not already documented in the conversation text above, invoke the 'read' tool on this path to page it back into context.]`;
+• Self-Healing Guideline: The raw pixel data of this image is currently paged out from working memory. If you need to re-inspect or verify visual pixel details of this image that are not already documented in the conversation text above, invoke the 'read' tool on this path. If images keep being paged out, call image_pager_set_keep once with a window large enough for the comparison, then inspect the next context before reading again.]`;
 	}
 
 	return `[System Note: User-attached image paged out from context to save memory and inference time.
 • MIME Type: ${mimeType}
 • Paged-out Size: ${formattedSize} (Base64)
-• Note: This image was directly attached by the user without a local file path. If visual pixel verification is required, please ask the user to re-attach or re-supply the image.]`;
+• Note: This image was directly attached by the user without a local file path. If pixels are needed, call image_pager_set_keep once with a window that includes this image. Only ask the user to re-attach it if it is still missing.]`;
 }
 
 /**
@@ -736,9 +737,32 @@ export function getPagerArgumentCompletions(argumentPrefix: string): Autocomplet
  */
 export default function (pi: ExtensionAPI) {
 	let currentConfig: ImagePagerConfig = loadConfig();
+	let sessionKeep: number | undefined;
+	const effectiveConfig = (): ImagePagerConfig => sessionKeep === undefined ? currentConfig :
+		{ ...currentConfig, strategy: "fifo", keepRecentImages: sessionKeep };
+
+	pi.registerTool({
+		name: "image_pager_set_keep",
+		label: "Set image retention",
+		description: "Temporarily keep the newest N images across turns (FIFO) from the next model request. If images cycle out during a comparison, set the needed window once before re-reading. Larger windows increase payload size.",
+		parameters: Type.Object({
+			keepRecentImages: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER, description: "Recent image count; 0 pages out all eligible images." }),
+		}),
+		async execute(_id, { keepRecentImages }, _signal, _onUpdate, ctx) {
+			if (!Number.isSafeInteger(keepRecentImages) || keepRecentImages < 0) {
+				throw new Error("keepRecentImages must be a non-negative safe integer");
+			}
+			sessionKeep = keepRecentImages;
+			const active = shouldEnableForModel(ctx.model?.id || ctx.model?.name, currentConfig);
+			const text = active ? `FIFO window: ${keepRecentImages} recent image(s), effective next request.` :
+				`FIFO window set to ${keepRecentImages}; paging is inactive for the current model or session.`;
+			return { content: [{ type: "text", text }], details: { keepRecentImages, strategy: "fifo", active } };
+		},
+	});
 
 	// 监听会话启动
 	pi.on("session_start", async (_event, ctx) => {
+		sessionKeep = undefined;
 		currentConfig = loadConfig(ctx.cwd);
 		if (currentConfig.debug) {
 			console.log("[image-pager] Loaded configuration:", currentConfig);
@@ -757,7 +781,7 @@ export default function (pi: ExtensionAPI) {
 			return undefined;
 		}
 
-		const result = pageOutContextImages(event.messages, currentConfig, ctx.cwd);
+		const result = pageOutContextImages(event.messages, effectiveConfig(), ctx.cwd);
 
 		// 更新遥测与统计数据
 		stats.totalContextRuns++;
@@ -820,6 +844,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("Usage: /image-pager strategy <turn-boundary|fifo>", "warning");
 					return;
 				}
+				sessionKeep = undefined;
 				currentConfig.strategy = strat;
 				saveConfig(currentConfig, getProjectConfigPath(ctx.cwd));
 				ctx.ui.notify(`image-pager: paging strategy set to ${strat} (${strat === "turn-boundary" ? "cache-friendly mode" : "FIFO mode"})`, "info");
@@ -831,6 +856,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("Usage: /image-pager keep <number> (e.g. /image-pager keep 1)", "warning");
 					return;
 				}
+				sessionKeep = undefined;
 				currentConfig.keepRecentImages = num;
 				saveConfig(currentConfig, getProjectConfigPath(ctx.cwd));
 				ctx.ui.notify(`image-pager: keeping ${num} active image(s); older history images are paged out automatically`, "info");
@@ -848,6 +874,7 @@ export default function (pi: ExtensionAPI) {
 				break;
 			}
 			case "reload": {
+				sessionKeep = undefined;
 				currentConfig = loadConfig(ctx.cwd);
 				ctx.ui.notify("image-pager: Configuration reloaded successfully.", "info");
 				break;
@@ -865,15 +892,16 @@ export default function (pi: ExtensionAPI) {
 			}
 			case "status":
 			default: {
-				const statusText = currentConfig.enabled ? "Enabled" : "Disabled";
+				const config = effectiveConfig();
+				const statusText = config.enabled ? "Enabled" : "Disabled";
 				const stratText =
-					currentConfig.strategy === "turn-boundary"
+					config.strategy === "turn-boundary"
 						? "turn-boundary (cache-friendly immutable prefix)"
 						: "fifo (count sliding window)";
 
 				// Read-only status stays in a modal instead of a muted notification or timed widget.
 				const lines = [
-					`[image-pager] status: ${statusText} · strategy: ${stratText} · keeping ${currentConfig.keepRecentImages} active`,
+					`[image-pager] status: ${statusText} · strategy: ${stratText} · keeping ${config.keepRecentImages} active${sessionKeep === undefined ? "" : " (session override)"}`,
 					`• Images: ${stats.totalImagesSeen} seen · ${stats.pagedOutImagesCount} paged out · ${stats.hotImagesRetained} active`,
 					`• Savings: ${formatBytes(stats.savedBytes)} of payload · about ${stats.estimatedTokensSaved.toLocaleString()} tokens`,
 				];

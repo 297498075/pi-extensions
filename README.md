@@ -323,10 +323,14 @@ pi --extension ./extensions/rolling-tools.ts
 • Original File Path: "d:/novel/分镜插图/第0001章_重制版/shot_01_14.jpg"
 • MIME Type: image/jpeg
 • Paged-out Size: 1.25 MB (Base64)
-• Self-Healing Guideline: The raw pixel data of this image is currently paged out from working memory. If you need to re-inspect or verify visual pixel details of this image that are not already documented in the conversation text above, invoke the 'read' tool on this path to page it back into context.]
+• Self-Healing Guideline: The raw pixel data of this image is currently paged out from working memory. If you need to re-inspect or verify visual pixel details of this image that are not already documented in the conversation text above, invoke the 'read' tool on this path. If images keep being paged out, call image_pager_set_keep once with a window large enough for the comparison, then inspect the next context before reading again.]
 ```
 
 ### 命令与配置
+
+Agent 可调用 `image_pager_set_keep({"keepRecentImages": 3})`，从下一次模型请求起跨轮保留最近 3 张图片。例如对比最近 3 张截图时，调用一次即可直接核对仍在上下文中的原图。`0` 会换出所有达到大小阈值的图片；窗口越大，请求体积越大。
+
+工具仅在当前会话内临时采用 FIFO 窗口，沿用启用开关、模型过滤与大小阈值。`/image-pager status` 显示当前窗口；执行 `keep`、`strategy`、`reload` 或重新启动会话后，恢复使用配置文件的策略和数量。
 
 提供交互式斜杠命令 `/image-pager`（别名 `/image-paging`）：
 
