@@ -11,6 +11,7 @@ const CONTROL_TOOL = "todo_loop_control";
 const DECISION_ENTRY = "todo-loop-decision";
 const BUDGET_RESET_ENTRY = "todo-loop-budget-reset";
 const FOLLOWUP = "todo-loop-followup";
+const LIMIT_WARNING = "todo-loop-limit-warning";
 const BLOCKER_SUMMARY = "todo-loop-blocker-summary";
 const REVIEW_PROMPT = "Review every remaining leaf using any recent subagent results. Separate locally feasible implementation, design and testing from acceptance work that requires external access or approval. Update the todo tree, clear blockers for runnable tasks, and do that work first. If all leaves still require external help, report the specific missing prerequisite and resume condition for each task (group only identical prerequisites).";
 
@@ -241,14 +242,17 @@ function blockerReview(ctx: ExtensionContext, drafts: readonly SessionBoundaryDr
 	return { details: { sessionId, blockerKey, leafKey }, reviewed, summarized, summary };
 }
 
-function followupCount(ctx: ExtensionContext): number {
-	let used = 0;
+function followupBudget(ctx: ExtensionContext) {
+	let used = 0, warned = false;
 	for (const entry of ctx.sessionManager.getBranch()) {
-		if (entry.type === "custom" && entry.customType === BUDGET_RESET_ENTRY) used = 0;
+		if (entry.type === "custom" && entry.customType === BUDGET_RESET_ENTRY) {
+			used = 0;
+			warned = false;
+		} else if (entry.type === "custom_message" && entry.customType === LIMIT_WARNING) warned = true;
 		else if ((entry.type === "message" && userText(entry.message) === LEGACY_CONTINUE_PROMPT) ||
 			(entry.type === "custom_message" && entry.customType === FOLLOWUP)) used++;
 	}
-	return used;
+	return { used, warned };
 }
 
 function readConfiguredLimit(): number | undefined {
@@ -356,7 +360,7 @@ export default function todoLoop(pi: ExtensionAPI): void {
 			);
 			await showStatusModal(ctx, "Todo Loop", [
 				`Unfinished: ${state?.tasks.length ?? 0}; actionable: ${actionable.length}; blocked: ${actionable.filter(task => state?.blockers.has(task.id)).length}; waiting: ${actionable.filter(task => state?.waiting.has(task.id)).length}`,
-				`Automatic follow-ups: ${followupCount(ctx)}/${maxFollowups()} (since last reset on this branch)`,
+				`Automatic follow-ups: ${followupBudget(ctx).used}/${maxFollowups()} (since last reset on this branch)`,
 				`Last boundary decision (historical): ${latestDecision?.type === "custom" ? JSON.stringify(latestDecision.data) : "none"}`,
 				...actionable.map(task => {
 					const blocker = state?.blockers.get(task.id);
@@ -376,15 +380,12 @@ export default function todoLoop(pi: ExtensionAPI): void {
 		}
 	});
 
-	let limitNotified = false;
 	pi.on("session_start", ({ reason }) => {
-		limitNotified = false;
 		// Explicit runtime transitions renew the budget, without changing tasks or blockers.
 		if (reason === "reload" || reason === "resume" || reason === "new" || reason === "fork") {
 			pi.appendEntry(BUDGET_RESET_ENTRY, { reason });
 		}
 	});
-	pi.on("session_tree", () => { limitNotified = false; });
 
 	// Only act after core retries, compaction and queued work. Do not infer
 	// control intent from text: even our own old prompt says "cannot continue".
@@ -394,7 +395,7 @@ export default function todoLoop(pi: ExtensionAPI): void {
 		const actionable = actionableTasks(state);
 		const blocked = actionable.filter(task => state.blockers.has(task.id)).length;
 		const waiting = actionable.filter(task => !state.blockers.has(task.id) && state.waiting.has(task.id)).length;
-		const used = followupCount(ctx);
+		const { used, warned } = followupBudget(ctx);
 		const limit = maxFollowups();
 		const lastAssistant = [...event.context.contextMessages].reverse().find(message => message.role === "assistant");
 		let review: ReturnType<typeof blockerReview> | undefined;
@@ -417,11 +418,13 @@ export default function todoLoop(pi: ExtensionAPI): void {
 			decision: shouldContinue ? "continue" : paused ? "pause" : "skip", reason,
 			remaining: state.tasks.length, actionable: actionable.length, blocked, ...(waiting ? { waiting } : {}), followups: used, limit,
 		};
-		if (reason === "followup_limit" && !limitNotified) {
-			ctx.ui.notify(`todo-loop paused with ${state.tasks.length} unfinished items after ${limit} automatic follow-ups.`, "warning");
-			limitNotified = true;
-		}
 		const entries: SessionBoundaryDraft[] = [...event.entries, { type: "custom", customType: DECISION_ENTRY, data: decision }];
+		if (paused && used >= limit && !warned) {
+			const budget = limit === 0 ? "Automatic follow-ups are disabled (limit 0)" : `Automatic follow-up limit reached (${used}/${limit})`;
+			const content = `Todo-loop warning: ${budget}. Unfinished todos: ${state.tasks.length}. See /todo-loop status.`;
+			entries.push({ type: "custom_message", customType: LIMIT_WARNING, content, display: true });
+			ctx.ui.notify(content, "warning");
+		}
 		if (!shouldContinue) {
 			if (review && !review.summarized) entries.push({ type: "custom_message", customType: BLOCKER_SUMMARY,
 				content: review.summary, display: true, details: { ...review.details, reviewed: review.reviewed } });

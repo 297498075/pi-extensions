@@ -122,7 +122,7 @@ Every settlement boundary with known todo state appends a `todo-loop-decision` s
 }
 ```
 
-Reasons also distinguish unfinished work, background waits, no unfinished tasks, pending messages, structural errors/aborts, a continuation already requested by another extension, and budget exhaustion. Decisions are diagnostic only and are not replayed as control state. A decision does not veto continuations requested by other extensions. `review_external_blockers` requests the one-time review. An all-blocked pause posts its grouped reasons directly in the conversation; budget pauses on runnable work show a concise warning.
+Reasons also distinguish unfinished work, background waits, no unfinished tasks, pending messages, structural errors/aborts, a continuation already requested by another extension, and budget exhaustion. Decisions are diagnostic only and are not replayed as control state. A decision does not veto continuations requested by other extensions. `review_external_blockers` requests the one-time review. An all-blocked pause posts its grouped reasons directly in the conversation. If the budget is exhausted and todos remain at settlement, the extension sends a warning notification and posts a visible `todo-loop-limit-warning` with the budget and unfinished count. This also covers blocked tasks and background waits. The warning is recorded once per budget on the active branch; a zero limit is described as disabled.
 
 There is intentionally no "todos did not change for N turns" detector: source investigation, database inspection and debugging can be real progress without any todo status change. The persisted follow-up budget is the deterministic runaway guard. No secondary model or network request is used to judge assistant intent.
 

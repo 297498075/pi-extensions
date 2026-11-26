@@ -45,6 +45,7 @@ const launch = (h, runId, mode = "single", extra = {}) => h.sm.appendMessage({
 const finish = (h, runId, status = "completed") => h.sm.appendCustomMessageEntry(
 	"subagent-notify", "Native result", true, { runs: [{ runId, status }] },
 );
+const limitWarning = result => result?.entries.find(e => e.customType === "todo-loop-limit-warning");
 const decision = result => result?.entries.findLast(entry => entry.customType === "todo-loop-decision")?.data;
 function commit(h, result) {
 	for (const e of result.entries) {
@@ -225,6 +226,7 @@ function commit(h, result) {
 	assert.equal(decision(h.boundary()).reason, "review_external_blockers");
 	const disabled = harness(h.sm, "0").boundary();
 	assert.equal(disabled.continue, undefined);
+	assert.match(limitWarning(disabled).content, /disabled \(limit 0\)/);
 	assert.equal(disabled.entries.at(-1).customType, "todo-loop-blocker-summary", "zero budget still explains the pause");
 	assert.equal(harness(h.sm, "1").boundary().continue, undefined, "a previous review spent the one available follow-up");
 	console.log("✓ native handoff, 14 blocked leaves, one budgeted review, grouped visible reasons, reload/branch isolation and runnable recovery");
@@ -303,12 +305,19 @@ function commit(h, result) {
 		h.sm.appendCustomMessageEntry("todo-loop-followup", "persisted followup", true);
 		h.sm.appendMessage({ role: "user", content: legacyPrompt, timestamp: i });
 	}
-	assert.equal(decision(h.boundary()).reason, "followup_limit");
-	assert.equal(decision(h.boundary()).followups, 20);
-	h.boundary(); assert.equal(h.notifications.length, 1, "budget warning is not repeated");
+	const capped = h.boundary(), warning = limitWarning(capped);
+	assert.equal(decision(capped).reason, "followup_limit");
+	assert.equal(capped.continue, undefined);
+	assert.equal(warning.display, true);
+	assert.match(warning.content, /limit reached \(20\/20\).*Unfinished todos: 1\b/);
+	assert.deepEqual(h.notifications, [[warning.content, "warning"]]);
+	commit(h, capped);
+	assert.equal(limitWarning(h.boundary()), undefined);
+	assert.equal(h.notifications.length, 1, "budget warning is not repeated");
 	const rehydrated = harness(h.sm);
 	rehydrated.handlers.get("session_start")({ reason: "startup" }, rehydrated.ctx);
 	assert.equal(decision(rehydrated.boundary()).reason, "followup_limit", "automatic startup preserves budget");
+	assert.deepEqual(rehydrated.notifications, [], "the visible warning survives restart");
 	assert.equal(decision(harness(h.sm, "0").boundary()).reason, "followup_limit");
 	assert.equal(decision(harness(h.sm, "invalid").boundary()).limit, 20);
 	for (const done of [{ status: "cancelled" }, { status: "completed" }, { status: "deleted" }, { status: "done" }, { done: true }, { completed: true }]) {
@@ -316,6 +325,37 @@ function commit(h, result) {
 		assert.equal(decision(empty.boundary()).reason, "no_unfinished_tasks");
 	}
 	console.log("✓ structural stop reasons, pending work, composed boundaries, persisted limits and decisions");
+}
+
+// Only warn once the last permitted follow-up has settled with unfinished work.
+{
+	for (const state of ["finished", "runnable", "blocked", "waiting"]) {
+		const h = harness(SessionManager.inMemory(process.cwd()), "1");
+		h.snapshot([task("1"), task("2")]);
+		const last = h.boundary();
+		assert.equal(last.continue, true);
+		assert.equal(limitWarning(last), undefined);
+		commit(h, last);
+		if (state === "finished") h.snapshot([task("1", { status: "completed" }), task("2", { status: "completed" })]);
+		if (state === "blocked") await h.call(report("1", "2"));
+		if (state === "waiting") { launch(h, "native"); await h.call(waitFor(["1", "2"], "native")); }
+		const result = h.boundary();
+		assert.equal(result.continue, undefined);
+		if (state === "finished") {
+			assert.equal(limitWarning(result), undefined);
+			assert.deepEqual(h.notifications, []);
+			continue;
+		}
+		assert.match(limitWarning(result).content, /limit reached \(1\/1\).*Unfinished todos: 2\b/);
+		assert.equal(decision(result).reason, { runnable: "followup_limit", blocked: "all_remaining_tasks_blocked", waiting: "waiting_for_background" }[state]);
+		commit(h, result);
+		if (state === "runnable") {
+			h.handlers.get("session_start")({ reason: "reload" }, h.ctx);
+			commit(h, h.boundary());
+			assert.ok(limitWarning(h.boundary()), "a renewed budget can warn again");
+		}
+	}
+	console.log("✓ final follow-up warns on unfinished runnable, blocked and waiting tasks, but not completed work");
 }
 
 // Explicit session transitions reset only the budget, persisting the reset in the active branch.
@@ -336,7 +376,6 @@ function commit(h, result) {
 		rehydrated.handlers.get("session_start")({ reason: "startup" }, rehydrated.ctx);
 		assert.equal(decision(rehydrated.boundary()).followups, 1);
 		h.sm.branch(oldLeaf);
-		rehydrated.handlers.get("session_tree")();
 		assert.equal(decision(rehydrated.boundary()).reason, "followup_limit");
 		h.sm.branch(newLeaf);
 		assert.equal(decision(rehydrated.boundary()).followups, 1);
